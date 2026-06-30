@@ -1,0 +1,73 @@
+# 基于 PhysicsNeMo MeshGraphNet 的人工心脏瓣膜固体动力学模型改造计划
+
+## Summary
+将 Abaqus 得到的瓣膜壳/膜单元动力学结果转成图时序数据，用 PhysicsNeMo 的 `HybridMeshGraphNet` 训练 surrogate：输入当前瓣膜状态、固定边界、心室侧动态跨瓣压差和接触候选边，预测下一时间步的节点位移/速度增量，并辅助预测加速度和应力。
+
+参考接口：NVIDIA [MeshGraphNet](https://github.com/NVIDIA/physicsnemo/blob/main/physicsnemo/models/meshgraphnet/meshgraphnet.py)、[HybridMeshGraphNet](https://github.com/NVIDIA/physicsnemo/blob/main/physicsnemo/models/meshgraphnet/hybrid_meshgraphnet.py)。
+
+## Key Changes
+- 数据管线从 Abaqus `ODB` 导出为统一 `HDF5/Zarr`：
+  - mesh: reference nodes、shell elements、mesh edges、node sets、pressure surface、leaflet id。
+  - time series: `U, V, A, S`，统一 `dt`，已知 `p(t)`。
+  - 几何条件: shell normal、nodal area、thickness、fixed mask、pressure-side mask。
+- 图构建：
+  - mesh edges 来自壳单元连接，双向存储。
+  - world/contact edges 每帧按当前变形坐标在不同瓣叶/限位面之间搜索近邻，排除已有 mesh edge。
+  - `graph.edge_index = concat(mesh_edge_index, world_edge_index)`，并分别传入 `mesh_edge_features` 和 `world_edge_features`。
+- 节点特征：
+  - `X0, U_k, V_k, A_k`。
+  - fixed mask、pressure mask、leaflet id、normal、area/thickness。
+  - 压力条件广播到节点：`p_k, p_{k+1}, dp/dt, phase_sin, phase_cos`，并在心室侧节点加入 `traction = p * normal * nodal_area`。
+- 边特征：
+  - mesh edge: reference relative vector/length + current relative vector/length + normal relation。
+  - world edge: current relative vector/distance/gap + normal alignment + reference relation，占位维度与 mesh edge 一致。
+- 模型：
+  - 使用 `HybridMeshGraphNet(input_dim_nodes, input_dim_edges, output_dim)`。
+  - 输出主状态：`delta_U, delta_V`。
+  - 输出辅助量：`A_{k+1}` 和 nodal stress components 或 von Mises stress。
+  - rollout 时对 fixed nodes 硬约束：`delta_U = 0, delta_V = 0`。
+- 损失：
+  - 主损失为面积/质量加权的 `delta_U, delta_V` 误差。
+  - 辅助损失为 `A` 和 stress，单独归一化。
+  - 加入 5-20 步 rollout loss 与轻微状态噪声，提高长期稳定性。
+  - fixed nodes 不计入状态损失，但必须通过硬约束保持为零。
+
+## Public Interfaces
+- 新增数据样本接口：
+  - `node_features: [N, Dn]`
+  - `mesh_edge_features: [Em, De]`
+  - `world_edge_features: [Ew, De]`
+  - `graph: PyG Data(edge_index=[2, Em+Ew], num_nodes=N)`
+  - `target: {delta_u, delta_v, accel, stress}`
+  - `masks: {fixed, pressure, stress_valid}`
+- 新增配置项：
+  - `contact_radius_factor`
+  - `rollout_steps`
+  - `loss_weights`
+  - `pressure_sign`
+  - `stress_representation`
+  - `normalize_by_train_split_only`
+- 数据划分必须按“瓣膜设计 case”划分，不能按时间帧随机划分，避免同一设计泄漏到验证/测试集。
+
+## Test Plan
+- ODB 导出校验：节点数、单元数、node set、pressure surface、时间帧、`U/V/A/S` 维度一致。
+- 图构建测试：mesh edges 双向且无重复，world edges 不包含 mesh edges，fixed/pressure masks 非空。
+- 物理 sanity check：
+  - fixed attachment 节点 rollout 后位移和速度始终为零。
+  - 压差符号翻转时主变形方向反转。
+  - 零压差且零初速样本应近似静止。
+- 训练 smoke test：用 1-2 个 case 过拟合，one-step loss 明显下降。
+- 验证指标：
+  - displacement/velocity/acceleration RMSE。
+  - peak stress 和 von Mises stress 误差。
+  - 多步 rollout 稳定性。
+  - contact 区域穿透/间隙误差。
+- 可视化对比：导出预测序列为 VTK/VTU，与 Abaqus 结果逐帧对比位移云图、应力云图和闭合区域。
+
+## Assumptions
+- 仿真使用壳/膜单元。
+- 不同样本是不同瓣膜设计，材料参数基本固定。
+- Abaqus 输出时间步 `dt` 统一。
+- 跨瓣压差 `p(t)` 已知，并作用在瓣膜心室侧。
+- 存在瓣叶间接触/限位行为，因此优先使用 `HybridMeshGraphNet`；普通 `MeshGraphNet` 只作为无接触 baseline。
+- 当前本地工作区没有可见源码或数据文件，本计划面向后续实现落地。

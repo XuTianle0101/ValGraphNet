@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+data/raw/
+data/processed/
+outputs/
+checkpoints/
+
+*.odb
+*.sim
+*.sta
+*.msg
+*.dat
+*.prt
+

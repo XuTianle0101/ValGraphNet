@@ -1,0 +1,53 @@
+seed: 42
+
+data:
+  root: data/processed
+  split_file: configs/splits.json
+  train_split: train
+  val_split: val
+  pressure_sign: 1.0
+  require_pressure_mask: true
+  require_fixed_mask: true
+  max_train_samples_for_stats: 512
+
+contact:
+  enabled: true
+  radius: null
+  radius_factor: 2.5
+  max_edges: 200000
+  different_leaflets_only: true
+
+normalization:
+  enabled: true
+  eps: 1.0e-8
+
+model:
+  type: hybrid
+  processor_size: 15
+  hidden_dim_processor: 128
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+
+training:
+  epochs: 100
+  batch_size: 1
+  num_workers: 0
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  grad_clip_norm: 1.0
+  output_dir: outputs/valve_hybrid
+  save_every: 10
+  device: auto
+
+loss:
+  delta_u: 1.0
+  delta_v: 0.5
+  accel: 0.1
+  stress: 0.05
+
+rollout:
+  steps: null
+

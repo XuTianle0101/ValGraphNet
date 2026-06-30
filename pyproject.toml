@@ -1,0 +1,24 @@
+[project]
+name = "valgraphnet"
+version = "0.1.0"
+description = "Hybrid MeshGraphNet surrogate for dynamic solid simulation of prosthetic heart valves."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "torch>=2.1",
+  "torch-geometric>=2.4",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+physicsnemo = ["physicsnemo"]
+test = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+

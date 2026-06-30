@@ -1,0 +1,102 @@
+# ValGraphNet
+
+ValGraphNet 是一个把 Abaqus 人工心脏瓣膜固体动力学结果转换为图时序数据，并用 NVIDIA PhysicsNeMo `HybridMeshGraphNet` 训练 surrogate model 的起步代码库。
+
+目标场景：
+
+- 瓣膜附着边固定。
+- 心室侧表面施加动态跨瓣压差 `p(t)`。
+- Abaqus 已有大量壳/膜单元动力学结果。
+- 不同样本对应不同瓣膜设计，材料参数暂按固定处理。
+- 训练逐步自回归模型：当前状态和当前边界条件 -> 下一步节点状态增量。
+
+## 目录结构
+
+```text
+configs/valve_hybrid.yaml      # 默认训练配置
+scripts/abaqus_export_odb.py   # 在 Abaqus Python 中运行，导出 case 数据
+scripts/train.py               # 训练入口
+scripts/rollout.py             # 自回归推理入口
+valgraphnet/                   # 数据、模型、损失和训练代码
+tests/                         # 不依赖 Abaqus/PhysicsNeMo 的基础测试
+```
+
+## 数据格式
+
+每个 Abaqus case 导出为一个目录：
+
+```text
+data/processed/case_001/
+  metadata.json
+  nodes.npy          # [N, 3], reference coordinates
+  elements.npy       # [M, K], zero-based node ids, padded by -1
+  times.npy          # [T]
+  pressure.npy       # [T], transvalvular pressure
+  U.npy              # [T, N, 3]
+  V.npy              # [T, N, 3]
+  A.npy              # [T, N, 3]
+  S.npy              # [T, N, C], optional nodal stress
+  fixed_mask.npy     # [N], attachment boundary
+  pressure_mask.npy  # [N], ventricular-side pressure surface
+  leaflet_id.npy     # [N], different ids for different leaflets
+  thickness.npy      # [N] or scalar
+```
+
+`elements.npy` 使用 0-based 节点索引，方便直接构图。`S.npy` 可以是 6 分量应力，也可以是 von Mises 单分量；维度由数据自动推断。
+
+## Abaqus 导出
+
+在 Abaqus 命令行中运行：
+
+```bash
+abaqus python scripts/abaqus_export_odb.py -- \
+  --odb path/to/case.odb \
+  --out data/processed/case_001 \
+  --instance VALVE \
+  --fixed-set ATTACHMENT \
+  --pressure-surface VENTRICULAR_SURFACE \
+  --leaflet-sets LEAFLET_1,LEAFLET_2,LEAFLET_3 \
+  --pressure-csv path/to/pressure.csv
+```
+
+`pressure.csv` 建议两列：`time,pressure`。如果 ODB 内字段命名不是 Abaqus 默认的 `U/V/A/S`，可以用脚本参数覆盖。
+
+## 训练
+
+安装依赖后运行：
+
+```bash
+python scripts/train.py --config configs/valve_hybrid.yaml
+```
+
+训练代码默认使用 `HybridMeshGraphNet`，把 mesh edges 和 world/contact edges 分开编码。划分数据时建议提供 `splits.json`：
+
+```json
+{
+  "train": ["case_001", "case_002"],
+  "val": ["case_003"],
+  "test": ["case_004"]
+}
+```
+
+注意：必须按 case/design 划分，不能把同一个 case 的不同时间帧随机分到训练和验证里。
+
+## 自回归推理
+
+```bash
+python scripts/rollout.py \
+  --config configs/valve_hybrid.yaml \
+  --checkpoint outputs/valve_hybrid/best.pt \
+  --case data/processed/case_003 \
+  --out outputs/valve_hybrid/rollout_case_003
+```
+
+输出包括 `U_pred.npy`、`V_pred.npy`、`A_pred.npy`、`S_pred.npy`，可再转换为 VTK/VTU 与 Abaqus 云图对比。
+
+## 重要约定
+
+- fixed nodes 在训练和 rollout 中被硬约束为零增量。
+- 压力条件以 `p_k, p_{k+1}, dp/dt, phase` 和 nodal traction 形式进入节点特征。
+- contact/world edges 每一帧按当前变形坐标搜索不同 leaflet 之间的近邻。
+- 默认不引入材料参数输入；如果后续材料参数变化，把厚度、密度、超弹性参数加入节点或全局条件。
+
