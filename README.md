@@ -125,19 +125,28 @@ See `examples/deforming_plate/README.md` for data layout and dependency notes.
 
 ## Environment Setup
 
-Recommended on Windows/PowerShell:
+Recommended on Linux/macOS/WSL:
 
-```powershell
-cd "D:\课题组资料\文章2\ValGraphNet"
+```bash
+cd /path/to/ValGraphNet
+bash scripts/setup_env.sh --torch-backend auto --profile dev
+source .venv/bin/activate
+```
 
-# GPU machine with CUDA 12.6 PyTorch wheels.
-.\scripts\setup_env.ps1 -TorchBackend cu126 -Profile dev
+The default `--torch-backend auto` mode checks `nvidia-smi`, selects the highest
+supported PyTorch CUDA wheel from the script's known backends, and falls back to
+CPU wheels when a compatible NVIDIA GPU/CUDA version cannot be detected.
 
-# Or CPU-only environment.
-.\scripts\setup_env.ps1 -TorchBackend cpu -Profile dev
+Manual overrides:
 
-# Activate after installation.
-.\.venv\Scripts\Activate.ps1
+```bash
+# Force CPU wheels.
+bash scripts/setup_env.sh --torch-backend cpu --profile dev
+
+# Force a specific PyTorch CUDA wheel when auto detection is not appropriate.
+bash scripts/setup_env.sh --torch-backend cu118 --profile dev
+bash scripts/setup_env.sh --torch-backend cu126 --profile dev
+bash scripts/setup_env.sh --torch-backend cu128 --profile dev
 ```
 
 Profiles:
@@ -148,26 +157,21 @@ Profiles:
 
 Manual installation:
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 
-# Choose one PyTorch command.
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-# pip install torch torchvision torchaudio
-
+# Install PyTorch first. Choose the command from the official PyTorch selector
+# for your driver/CUDA/CPU environment, then install the remaining dependencies.
 pip install -r requirements/dev.txt
 pip install -e . --no-deps
 ```
 
 Verify:
 
-```powershell
+```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 python -c "import torch_geometric, physicsnemo; print(torch_geometric.__version__, physicsnemo.__version__)"
 pytest -q
 ```
-
-If the machine uses another CUDA wheel, pass `-TorchBackend cu118`, `cu126`,
-`cu128`, or `cpu` to `scripts/setup_env.ps1`.

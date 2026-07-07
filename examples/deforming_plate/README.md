@@ -74,14 +74,15 @@ changing the shell/quad element convention used by valve data.
 
 Recommended setup from the repository root:
 
-```powershell
-.\scripts\setup_env.ps1 -TorchBackend cu126 -Profile dev
-.\.venv\Scripts\Activate.ps1
+```bash
+bash scripts/setup_env.sh --torch-backend auto --profile dev
+source .venv/bin/activate
 ```
 
-Use `-TorchBackend cpu` for a CPU-only environment. The setup script installs
-PyTorch first, then the pinned text requirements in `requirements/dev.txt`, and
-finally installs this repository in editable mode.
+Use `--torch-backend cpu` for a CPU-only environment, or pass `cu118`, `cu126`,
+or `cu128` when you need to override automatic CUDA detection. The setup script
+installs PyTorch first, then the pinned text requirements in
+`requirements/dev.txt`, and finally installs this repository in editable mode.
 
 Manual dependency files:
 
