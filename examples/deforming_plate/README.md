@@ -18,12 +18,19 @@ The directory should contain:
 ```text
 meta.json
 train.tfrecord
-eval.tfrecord
+valid.tfrecord
 test.tfrecord
 ```
 
-The original PhysicsNeMo example downloads it through DeepMind's
-`deepmind-research/meshgraphnets/download_dataset.sh deforming_plate` helper.
+From the repository root, download the dataset with:
+
+```bash
+bash scripts/download_deforming_plate.sh
+```
+
+This writes files to `raw_dataset/deforming_plate/deforming_plate`, matching
+`data.data_dir` in `examples/deforming_plate/config.yaml`. The original
+PhysicsNeMo example downloads the same DeepMind MeshGraphNets dataset.
 
 ## Native Training And Evaluation
 

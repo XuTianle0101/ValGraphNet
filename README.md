@@ -108,6 +108,7 @@ This repository also includes a PhysicsNeMo-style deforming-plate example under
 Native path:
 
 ```bash
+bash scripts/download_deforming_plate.sh
 python -m examples.deforming_plate.preprocess --config examples/deforming_plate/config.yaml
 python -m examples.deforming_plate.train --config examples/deforming_plate/config.yaml
 python -m examples.deforming_plate.rollout_eval --config examples/deforming_plate/config.yaml --checkpoint outputs/deforming_plate/best.pt

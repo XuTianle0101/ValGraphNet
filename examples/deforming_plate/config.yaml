@@ -1,14 +1,14 @@
 # Native deforming_plate example defaults.
 #
 # Data is expected in DeepMind MeshGraphNets TFRecord format with:
-#   train.tfrecord, eval.tfrecord, test.tfrecord, meta.json
+#   train.tfrecord, valid.tfrecord, test.tfrecord, meta.json
 seed: 42
 
 data:
   data_dir: raw_dataset/deforming_plate/deforming_plate
   preprocess_output_dir: preprocessed_dataset/deforming_plate
   train_split: train
-  val_split: eval
+  val_split: valid
   test_split: test
   num_training_samples: 1000
   num_validation_samples: 100

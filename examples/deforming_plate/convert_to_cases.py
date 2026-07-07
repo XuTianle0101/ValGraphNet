@@ -31,7 +31,7 @@ def convert_to_cases(cfg: dict[str, Any], out_dir: str | Path) -> Path:
         ),
         (
             "val",
-            str(get_cfg(cfg, "data.val_split", "eval")),
+            str(get_cfg(cfg, "data.val_split", "valid")),
             int(get_cfg(cfg, "data.num_validation_samples", 100)),
             int(get_cfg(cfg, "data.num_validation_time_steps", 200)),
         ),

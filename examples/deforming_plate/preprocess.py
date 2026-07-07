@@ -50,7 +50,7 @@ def run_preprocess(cfg: dict[str, Any]) -> Path:
     _write_split_cache(
         cfg=cfg,
         split_name="val",
-        source_split=str(get_cfg(cfg, "data.val_split", "eval")),
+        source_split=str(get_cfg(cfg, "data.val_split", "valid")),
         sequences=None,
         edge_stats=edge_stats,
         node_stats=node_stats,
