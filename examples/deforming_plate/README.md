@@ -72,11 +72,22 @@ changing the shell/quad element convention used by valve data.
 
 ## Dependencies
 
-Install the core project dependencies plus:
+Recommended setup from the repository root:
 
-```bash
-pip install -e ".[physicsnemo,deforming_plate,test]"
+```powershell
+.\scripts\setup_env.ps1 -TorchBackend cu126 -Profile dev
+.\.venv\Scripts\Activate.ps1
 ```
+
+Use `-TorchBackend cpu` for a CPU-only environment. The setup script installs
+PyTorch first, then the pinned text requirements in `requirements/dev.txt`, and
+finally installs this repository in editable mode.
+
+Manual dependency files:
+
+- `requirements/base.txt`
+- `requirements/deforming_plate.txt`
+- `requirements/dev.txt`
 
 The native example requires PyTorch, PyTorch Geometric, PhysicsNeMo, `tfrecord`,
 SciPy, and optionally Matplotlib for gif generation.

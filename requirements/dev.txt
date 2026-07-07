@@ -1,0 +1,3 @@
+# Developer/test environment.
+-r deforming_plate.txt
+pytest>=7.0

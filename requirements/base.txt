@@ -1,0 +1,9 @@
+# Base runtime dependencies for ValGraphNet.
+#
+# Install PyTorch first with the CUDA/CPU wheel that matches your machine.
+# The setup script in scripts/setup_env.ps1 does that automatically.
+numpy>=1.24
+pyyaml>=6.0
+tqdm>=4.66
+torch-geometric>=2.4
+nvidia-physicsnemo

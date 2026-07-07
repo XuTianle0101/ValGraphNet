@@ -122,3 +122,52 @@ python scripts/rollout.py --config configs/deforming_plate_case.yaml --checkpoin
 ```
 
 See `examples/deforming_plate/README.md` for data layout and dependency notes.
+
+## Environment Setup
+
+Recommended on Windows/PowerShell:
+
+```powershell
+cd "D:\课题组资料\文章2\ValGraphNet"
+
+# GPU machine with CUDA 12.6 PyTorch wheels.
+.\scripts\setup_env.ps1 -TorchBackend cu126 -Profile dev
+
+# Or CPU-only environment.
+.\scripts\setup_env.ps1 -TorchBackend cpu -Profile dev
+
+# Activate after installation.
+.\.venv\Scripts\Activate.ps1
+```
+
+Profiles:
+
+- `base`: ValGraphNet training/rollout dependencies.
+- `deforming_plate`: `base` plus TFRecord, SciPy, Matplotlib, and TensorBoard.
+- `dev`: `deforming_plate` plus pytest.
+
+Manual installation:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+
+# Choose one PyTorch command.
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+# pip install torch torchvision torchaudio
+
+pip install -r requirements/dev.txt
+pip install -e . --no-deps
+```
+
+Verify:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -c "import torch_geometric, physicsnemo; print(torch_geometric.__version__, physicsnemo.__version__)"
+pytest -q
+```
+
+If the machine uses another CUDA wheel, pass `-TorchBackend cu118`, `cu126`,
+`cu128`, or `cpu` to `scripts/setup_env.ps1`.

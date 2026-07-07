@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-physicsnemo = ["physicsnemo"]
+physicsnemo = ["nvidia-physicsnemo"]
 deforming_plate = [
   "tfrecord",
   "scipy>=1.10",
