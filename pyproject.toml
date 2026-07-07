@@ -13,6 +13,12 @@ dependencies = [
 
 [project.optional-dependencies]
 physicsnemo = ["physicsnemo"]
+deforming_plate = [
+  "tfrecord",
+  "scipy>=1.10",
+  "matplotlib>=3.8",
+  "tensorboard",
+]
 test = ["pytest>=7.0"]
 
 [tool.pytest.ini_options]
@@ -21,4 +27,3 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
-

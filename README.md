@@ -100,3 +100,25 @@ python scripts/rollout.py \
 - contact/world edges 每一帧按当前变形坐标搜索不同 leaflet 之间的近邻。
 - 默认不引入材料参数输入；如果后续材料参数变化，把厚度、密度、超弹性参数加入节点或全局条件。
 
+## Deforming Plate Example
+
+This repository also includes a PhysicsNeMo-style deforming-plate example under
+`examples/deforming_plate`.
+
+Native path:
+
+```bash
+python -m examples.deforming_plate.preprocess --config examples/deforming_plate/config.yaml
+python -m examples.deforming_plate.train --config examples/deforming_plate/config.yaml
+python -m examples.deforming_plate.rollout_eval --config examples/deforming_plate/config.yaml --checkpoint outputs/deforming_plate/best.pt
+```
+
+ValGraphNet case conversion path:
+
+```bash
+python -m examples.deforming_plate.convert_to_cases --config examples/deforming_plate/config.yaml --out data/deforming_plate_cases
+python scripts/train.py --config configs/deforming_plate_case.yaml
+python scripts/rollout.py --config configs/deforming_plate_case.yaml --checkpoint outputs/deforming_plate_case/best.pt --case data/deforming_plate_cases/test_00000 --out outputs/deforming_plate_case/rollout_test_00000
+```
+
+See `examples/deforming_plate/README.md` for data layout and dependency notes.

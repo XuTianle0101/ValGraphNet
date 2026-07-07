@@ -1,0 +1,52 @@
+# Native deforming_plate example defaults.
+#
+# Data is expected in DeepMind MeshGraphNets TFRecord format with:
+#   train.tfrecord, eval.tfrecord, test.tfrecord, meta.json
+seed: 42
+
+data:
+  data_dir: raw_dataset/deforming_plate/deforming_plate
+  preprocess_output_dir: preprocessed_dataset/deforming_plate
+  train_split: train
+  val_split: eval
+  test_split: test
+  num_training_samples: 1000
+  num_validation_samples: 100
+  num_test_samples: 5
+  num_training_time_steps: 200
+  num_validation_time_steps: 200
+  num_test_time_steps: 200
+  noise_std: 0.003
+
+graph:
+  world_edge_radius: 0.03
+
+model:
+  processor_size: 15
+  hidden_dim_processor: 128
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  do_concat_trick: false
+  num_processor_checkpoint_segments: 0
+  recompute_activation: false
+
+training:
+  batch_size: 1
+  epochs: 30
+  lr: 1.0e-4
+  lr_decay_rate: 0.9999917
+  weight_decay: 0.0
+  num_workers: 8
+  output_dir: outputs/deforming_plate
+  save_every: 5
+  device: auto
+  amp: false
+
+rollout:
+  output_dir: outputs/deforming_plate/rollout_eval
+  frame_skip: 20
+  make_gif: false
+  gif_name: animation.gif

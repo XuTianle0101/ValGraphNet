@@ -1,0 +1,52 @@
+seed: 42
+
+data:
+  root: data/deforming_plate_cases
+  split_file: data/deforming_plate_cases/splits.json
+  train_split: train
+  val_split: val
+  pressure_sign: 0.0
+  require_pressure_mask: false
+  require_fixed_mask: true
+  max_train_samples_for_stats: 512
+
+contact:
+  enabled: true
+  radius: 0.03
+  radius_factor: 2.5
+  max_edges: 200000
+  different_leaflets_only: false
+
+normalization:
+  enabled: true
+  eps: 1.0e-8
+
+model:
+  type: hybrid
+  processor_size: 15
+  hidden_dim_processor: 128
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+
+training:
+  epochs: 30
+  batch_size: 1
+  num_workers: 0
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  output_dir: outputs/deforming_plate_case
+  save_every: 5
+  device: auto
+
+loss:
+  delta_u: 1.0
+  delta_v: 0.0
+  accel: 0.0
+  stress: 0.0
+
+rollout:
+  steps: null
