@@ -21,6 +21,9 @@ deforming_plate = [
 ]
 test = ["pytest>=7.0"]
 
+[tool.setuptools.packages.find]
+include = ["valgraphnet*", "examples*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

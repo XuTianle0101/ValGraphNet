@@ -1,0 +1,48 @@
+seed: 42
+
+data:
+  data_dir: raw_dataset/deforming_plate/deforming_plate
+  preprocess_output_dir: preprocessed_dataset/deforming_plate_quick
+  train_split: train
+  val_split: valid
+  test_split: test
+  num_training_samples: 4
+  num_validation_samples: 1
+  num_test_samples: 1
+  num_training_time_steps: 20
+  num_validation_time_steps: 20
+  num_test_time_steps: 20
+  noise_std: 0.003
+
+graph:
+  world_edge_radius: 0.03
+
+model:
+  processor_size: 1
+  hidden_dim_processor: 32
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  do_concat_trick: false
+  num_processor_checkpoint_segments: 0
+  recompute_activation: false
+
+training:
+  batch_size: 1
+  epochs: 1
+  lr: 1.0e-4
+  lr_decay_rate: 0.9999917
+  weight_decay: 0.0
+  num_workers: 0
+  output_dir: outputs/deforming_plate_quick
+  save_every: 1
+  device: auto
+  amp: false
+
+rollout:
+  output_dir: outputs/deforming_plate_quick/rollout_eval
+  frame_skip: 5
+  make_gif: false
+  gif_name: animation.gif
