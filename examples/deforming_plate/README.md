@@ -44,7 +44,30 @@ python -m examples.deforming_plate.rollout_eval \
 
 The default config follows the full example scale: 1000 training samples,
 200 time steps, batch size 1, and 30 epochs. For a quick local sanity check,
-override the sample and epoch counts in a copy of the config.
+use the checked-in quick config:
+
+```bash
+python -m examples.deforming_plate.preprocess \
+  --config examples/deforming_plate/config.quick.yaml
+python -m examples.deforming_plate.train \
+  --config examples/deforming_plate/config.quick.yaml
+python -m examples.deforming_plate.rollout_eval \
+  --config examples/deforming_plate/config.quick.yaml \
+  --checkpoint outputs/deforming_plate_quick/best.pt
+```
+
+The full native and converted-case experiment is resumable and can be launched
+with one command:
+
+```bash
+python scripts/run_deforming_plate_full_experiment.py
+```
+
+It creates the case dataset when needed, trains both routes, evaluates every
+configured test case, and writes the comparison to
+`outputs/deforming_plate_full_experiment/comparison.json`. The full 30-epoch
+run contains millions of optimizer steps and is intended as a long-running
+experiment; use the quick route above for installation and pipeline checks.
 
 `rollout_eval.py` writes per-sequence `.npz` artifacts and a `metrics.json` with:
 
@@ -76,6 +99,38 @@ The converter maps `world_pos - mesh_pos` to `U.npy`, finite differences to
 tetrahedral cells are converted into unique two-node edge elements so the
 existing ValGraphNet graph builder can preserve mesh connectivity without
 changing the shell/quad element convention used by valve data.
+
+A quick converted-case check uses the corresponding small split:
+
+```bash
+python -m examples.deforming_plate.convert_to_cases \
+  --config examples/deforming_plate/config.quick.yaml \
+  --out data/deforming_plate_cases_quick
+python scripts/train.py --config configs/deforming_plate_case.quick.yaml
+python scripts/rollout.py \
+  --config configs/deforming_plate_case.quick.yaml \
+  --checkpoint outputs/deforming_plate_case_quick/best.pt \
+  --case data/deforming_plate_cases_quick/test_00000 \
+  --out outputs/deforming_plate_case_quick/rollout_test_00000
+```
+
+## GPU Memory Settings
+
+The full configs are tuned for a local CUDA GPU with 8 GB of memory:
+
+- `graph.max_world_neighbors: 32` prevents a dense contact frame from turning
+  into an almost fully connected world graph while retaining each node's
+  nearest world-space contacts.
+- `training.amp: true` with `amp_dtype: bfloat16` uses tensor-core mixed
+  precision without FP16's narrow numeric range.
+- `model.num_processor_checkpoint_segments: 3` recomputes processor
+  activations during backward to reduce the training peak.
+
+Set `training.device: cuda` to require a GPU. The default `auto` selects CUDA
+when it is available and otherwise falls back to CPU. Checkpoints include the
+optimizer, scheduler where applicable, AMP scaler, epoch, and config. Set
+`training.resume_from: auto` together with `training.save_latest: true` to
+continue from `latest.pt` after an interrupted full run.
 
 ## Dependencies
 
