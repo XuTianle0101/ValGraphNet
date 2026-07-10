@@ -68,8 +68,20 @@ def run_training(cfg: dict[str, Any]) -> Path:
     best_path = output_dir / "best.pt"
     epochs = int(get_cfg(cfg, "training.epochs", 100))
     save_every = int(get_cfg(cfg, "training.save_every", 10))
+    save_latest = bool(get_cfg(cfg, "training.save_latest", False))
+    start_epoch = 1
+    resume_path = _resolve_resume_path(cfg, output_dir)
+    if resume_path is not None:
+        checkpoint = _torch_load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_loss = float(checkpoint.get("score", best_loss))
+        if best_path.exists():
+            best_loss = float(_torch_load(best_path, map_location="cpu").get("score", best_loss))
+        print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, cfg)
         val_metrics = evaluate(model, val_loader, device, cfg) if val_loader is not None else None
         score = val_metrics["total"] if val_metrics else train_metrics["total"]
@@ -78,6 +90,17 @@ def run_training(cfg: dict[str, Any]) -> Path:
         if score < best_loss:
             best_loss = score
             save_checkpoint(best_path, model, optimizer, cfg, normalizers, train_dataset.output_dim, epoch, best_loss)
+        if save_latest:
+            save_checkpoint(
+                output_dir / "latest.pt",
+                model,
+                optimizer,
+                cfg,
+                normalizers,
+                train_dataset.output_dim,
+                epoch,
+                score,
+            )
         if save_every > 0 and epoch % save_every == 0:
             save_checkpoint(
                 output_dir / f"epoch_{epoch:04d}.pt",
@@ -91,6 +114,21 @@ def run_training(cfg: dict[str, Any]) -> Path:
             )
 
     return best_path
+
+
+def _resolve_resume_path(cfg: dict[str, Any], output_dir: Path) -> Path | None:
+    resume_from = get_cfg(cfg, "training.resume_from", None)
+    if not resume_from:
+        return None
+    path = output_dir / "latest.pt" if str(resume_from).lower() == "auto" else Path(resume_from)
+    return path if path.exists() else None
+
+
+def _torch_load(path: str | Path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 def build_datasets(cfg: dict[str, Any]) -> tuple[ValveGraphDataset, ValveGraphDataset | None]:

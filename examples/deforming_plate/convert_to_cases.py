@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from valgraphnet.config import get_cfg, load_config
 
-from .dataset import NODE_TYPE_CLAMPED, cells_to_edges, load_sequences
+from .dataset import NODE_TYPE_CLAMPED, SequenceDataset, cells_to_edges
 
 
 def convert_to_cases(cfg: dict[str, Any], out_dir: str | Path) -> Path:
@@ -44,13 +44,15 @@ def convert_to_cases(cfg: dict[str, Any], out_dir: str | Path) -> Path:
     ]
 
     for target_split, source_split, num_samples, num_steps in split_specs:
-        sequences = load_sequences(
+        sequences = SequenceDataset(
             data_dir=get_cfg(cfg, "data.data_dir"),
             split=source_split,
             num_samples=num_samples,
             num_steps=num_steps,
         )
-        for idx, sequence in enumerate(tqdm(sequences, desc=f"convert {target_split}")):
+        for idx, sequence in enumerate(
+            tqdm(sequences, desc=f"convert {target_split}", total=num_samples)
+        ):
             case_id = f"{target_split}_{idx:05d}"
             _write_case(root / case_id, case_id, sequence)
             splits[target_split].append(case_id)

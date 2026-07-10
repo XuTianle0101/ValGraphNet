@@ -56,20 +56,32 @@ def load_case(case_dir: str | Path) -> ValveCase:
         with metadata_path.open("r", encoding="utf-8") as f:
             metadata = json.load(f)
 
-    nodes = _load_required(root, "nodes.npy").astype(np.float32)
-    elements = _load_required(root, "elements.npy").astype(np.int64)
-    times = _load_required(root, "times.npy").astype(np.float32)
-    pressure = _load_required(root, "pressure.npy").astype(np.float32)
-    displacement = _load_required(root, "U.npy").astype(np.float32)
-    velocity = _load_required(root, "V.npy").astype(np.float32)
-    acceleration = _load_required(root, "A.npy").astype(np.float32)
+    nodes = _load_required(root, "nodes.npy").astype(np.float32, copy=False)
+    elements = _load_required(root, "elements.npy").astype(np.int64, copy=False)
+    times = _load_required(root, "times.npy").astype(np.float32, copy=False)
+    pressure = _load_required(root, "pressure.npy").astype(np.float32, copy=False)
+    displacement = _load_required(root, "U.npy").astype(np.float32, copy=False)
+    velocity = _load_required(root, "V.npy").astype(np.float32, copy=False)
+    acceleration = _load_required(root, "A.npy").astype(np.float32, copy=False)
     stress = _load_optional(root, "S.npy", np.zeros((*displacement.shape[:2], 0), dtype=np.float32))
-    fixed_mask = _load_optional(root, "fixed_mask.npy", np.zeros(nodes.shape[0], dtype=bool)).astype(bool)
-    pressure_mask = _load_optional(root, "pressure_mask.npy", np.zeros(nodes.shape[0], dtype=bool)).astype(bool)
-    leaflet_id = _load_optional(root, "leaflet_id.npy", np.zeros(nodes.shape[0], dtype=np.int64)).astype(np.int64)
-    thickness = _load_optional(root, "thickness.npy", np.ones(nodes.shape[0], dtype=np.float32)).astype(np.float32)
+    fixed_mask = _load_optional(
+        root, "fixed_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
+    ).astype(bool, copy=False)
+    pressure_mask = _load_optional(
+        root, "pressure_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
+    ).astype(bool, copy=False)
+    leaflet_id = _load_optional(
+        root, "leaflet_id.npy", np.zeros(nodes.shape[0], dtype=np.int64)
+    ).astype(np.int64, copy=False)
+    thickness = _load_optional(
+        root, "thickness.npy", np.ones(nodes.shape[0], dtype=np.float32)
+    ).astype(np.float32, copy=False)
     if thickness.ndim == 0:
         thickness = np.full(nodes.shape[0], float(thickness), dtype=np.float32)
+    fixed_mask = np.array(fixed_mask, dtype=bool, copy=True)
+    pressure_mask = np.array(pressure_mask, dtype=bool, copy=True)
+    leaflet_id = np.array(leaflet_id, dtype=np.int64, copy=True)
+    thickness = np.array(thickness, dtype=np.float32, copy=True)
 
     _validate_case(root, nodes, times, pressure, displacement, velocity, acceleration, stress)
     mesh_edge_index = mesh_edges_from_elements(elements)
@@ -86,7 +98,7 @@ def load_case(case_dir: str | Path) -> ValveCase:
         displacement=displacement,
         velocity=velocity,
         acceleration=acceleration,
-        stress=stress.astype(np.float32),
+        stress=stress.astype(np.float32, copy=False),
         fixed_mask=fixed_mask,
         pressure_mask=pressure_mask,
         leaflet_id=leaflet_id,
@@ -122,13 +134,13 @@ def _load_required(root: Path, name: str) -> np.ndarray:
     path = root / name
     if not path.exists():
         raise FileNotFoundError(f"Missing required case file: {path}")
-    return np.load(path, allow_pickle=False)
+    return np.load(path, allow_pickle=False, mmap_mode="r")
 
 
 def _load_optional(root: Path, name: str, default: np.ndarray) -> np.ndarray:
     path = root / name
     if path.exists():
-        return np.load(path, allow_pickle=False)
+        return np.load(path, allow_pickle=False, mmap_mode="r")
     return default
 
 

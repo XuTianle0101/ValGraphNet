@@ -1,0 +1,55 @@
+seed: 42
+
+data:
+  data_dir: raw_dataset/deforming_plate/deforming_plate
+  case_dir: data/deforming_plate_cases
+  case_split_file: data/deforming_plate_cases/splits.json
+  train_case_split: train
+  val_case_split: val
+  test_case_split: test
+  preprocess_output_dir: preprocessed_dataset/deforming_plate_full_case_backed
+  train_split: train
+  val_split: valid
+  test_split: test
+  num_training_samples: 1000
+  num_validation_samples: 100
+  num_test_samples: 5
+  num_training_time_steps: 200
+  num_validation_time_steps: 200
+  num_test_time_steps: 200
+  noise_std: 0.003
+
+graph:
+  world_edge_radius: 0.03
+
+model:
+  processor_size: 15
+  hidden_dim_processor: 128
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  do_concat_trick: false
+  num_processor_checkpoint_segments: 0
+  recompute_activation: false
+
+training:
+  batch_size: 1
+  epochs: 30
+  lr: 1.0e-4
+  lr_decay_rate: 0.9999917
+  weight_decay: 0.0
+  num_workers: 0
+  output_dir: outputs/deforming_plate_full_case_backed
+  save_every: 1
+  save_latest: true
+  resume_from: auto
+  device: auto
+  amp: false
+
+rollout:
+  output_dir: outputs/deforming_plate_full_case_backed/rollout_eval
+  frame_skip: 20
+  make_gif: false
+  gif_name: animation.gif

@@ -15,8 +15,16 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from valgraphnet.config import get_cfg, load_config
+from valgraphnet.data.case import read_split_file
 from valgraphnet.train import resolve_device
 
+from .dataset import (
+    DeformingPlateSequence,
+    fit_stats,
+    load_stats,
+    make_graph_sample,
+    save_stats,
+)
 from .preprocess import run_preprocess
 
 
@@ -57,22 +65,93 @@ def collate_one(items: list[dict[str, Any]]) -> dict[str, Any]:
     return items[0]
 
 
+class CaseBackedDeformingPlateDataset(Dataset):
+    """Lazy dataset over converted ValGraphNet deforming-plate cases."""
+
+    def __init__(
+        self,
+        case_root: str | Path,
+        split_file: str | Path,
+        split: str,
+        edge_stats: dict[str, torch.Tensor],
+        node_stats: dict[str, torch.Tensor],
+        cfg: dict[str, Any],
+        add_noise: bool,
+    ) -> None:
+        self.case_root = Path(case_root)
+        self.case_ids = read_split_file(split_file, split)
+        self.edge_stats = edge_stats
+        self.node_stats = node_stats
+        self.world_edge_radius = float(get_cfg(cfg, "graph.world_edge_radius", 0.03))
+        self.add_noise = bool(add_noise)
+        self.noise_std = float(get_cfg(cfg, "data.noise_std", 0.003))
+        self.samples: list[tuple[Path, int]] = []
+        for case_id in self.case_ids:
+            case_dir = self.case_root / case_id
+            times = np.load(case_dir / "times.npy", allow_pickle=False, mmap_mode="r")
+            for step in range(int(times.shape[0]) - 1):
+                self.samples.append((case_dir, step))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        case_dir, step = self.samples[index]
+        sequence = _load_case_sequence(str(case_dir))
+        sample = make_graph_sample(
+            sequence=sequence,
+            step=step,
+            edge_stats=self.edge_stats,
+            node_stats=self.node_stats,
+            world_edge_radius=self.world_edge_radius,
+            add_noise=self.add_noise,
+            noise_std=self.noise_std,
+        )
+        return {
+            "graph": sample.graph,
+            "mesh_edge_features": sample.mesh_edge_features,
+            "world_edge_features": sample.world_edge_features,
+        }
+
+
+@lru_cache(maxsize=32)
+def _load_case_sequence(path: str) -> DeformingPlateSequence:
+    case_dir = Path(path)
+    mesh_pos = np.load(case_dir / "nodes.npy", allow_pickle=False, mmap_mode="r")
+    displacement = np.load(case_dir / "U.npy", allow_pickle=False, mmap_mode="r")
+    cells = np.load(case_dir / "cells.npy", allow_pickle=False, mmap_mode="r")
+    node_type = np.load(case_dir / "node_type.npy", allow_pickle=False, mmap_mode="r")
+    stress = np.load(case_dir / "S.npy", allow_pickle=False, mmap_mode="r")
+    world_pos = np.asarray(mesh_pos[None, :, :] + displacement, dtype=np.float32)
+    return DeformingPlateSequence(
+        sample_id=case_dir.name,
+        mesh_pos=np.array(mesh_pos, dtype=np.float32, copy=True),
+        world_pos=world_pos,
+        cells=np.array(cells, dtype=np.int64, copy=True),
+        node_type=np.array(node_type, dtype=np.int64, copy=True).reshape(-1),
+        stress=np.array(stress, dtype=np.float32, copy=True),
+    )
+
+
 def run_training(cfg: dict[str, Any]) -> Path:
     """Train native deforming_plate model and return the best checkpoint path."""
 
     _set_seed(int(cfg.get("seed", 42)))
-    cache_dir = Path(
-        get_cfg(cfg, "data.preprocess_output_dir", "preprocessed_dataset/deforming_plate")
-    )
-    if not (cache_dir / "train" / "manifest.json").exists():
-        run_preprocess(cfg)
-
     device = resolve_device(str(get_cfg(cfg, "training.device", "auto")))
     output_dir = Path(get_cfg(cfg, "training.output_dir", "outputs/deforming_plate"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_dataset = CachedDeformingPlateDataset(cache_dir, "train")
-    val_dataset = CachedDeformingPlateDataset(cache_dir, "val")
+    cache_dir = Path(
+        get_cfg(cfg, "data.preprocess_output_dir", "preprocessed_dataset/deforming_plate")
+    )
+    if get_cfg(cfg, "data.case_dir", None):
+        train_dataset, val_dataset = _build_case_backed_datasets(cfg, cache_dir)
+    else:
+        if not (cache_dir / "train" / "manifest.json").exists():
+            run_preprocess(cfg)
+        train_dataset = CachedDeformingPlateDataset(cache_dir, "train")
+        val_dataset = CachedDeformingPlateDataset(cache_dir, "val")
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
@@ -106,13 +185,29 @@ def run_training(cfg: dict[str, Any]) -> Path:
     best_path = output_dir / "best.pt"
     epochs = int(get_cfg(cfg, "training.epochs", 30))
     save_every = int(get_cfg(cfg, "training.save_every", 5))
-    for epoch in range(1, epochs + 1):
+    save_latest = bool(get_cfg(cfg, "training.save_latest", False))
+    start_epoch = 1
+    resume_path = _resolve_resume_path(cfg, output_dir)
+    if resume_path is not None:
+        checkpoint = _torch_load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_loss = float(checkpoint.get("score", best_loss))
+        if best_path.exists():
+            best_loss = float(_torch_load(best_path, map_location="cpu").get("score", best_loss))
+        print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
+
+    for epoch in range(start_epoch, epochs + 1):
         train_loss = _train_epoch(model, train_loader, optimizer, scheduler, criterion, device, cfg)
         val_loss = _evaluate(model, val_loader, criterion, device)
         print(f"epoch {epoch:04d} | train={train_loss:.6g} | val={val_loss:.6g}")
         if val_loss < best_loss:
             best_loss = val_loss
             save_checkpoint(best_path, model, optimizer, scheduler, cfg, epoch, best_loss)
+        if save_latest:
+            save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, cfg, epoch, val_loss)
         if save_every > 0 and epoch % save_every == 0:
             save_checkpoint(
                 output_dir / f"epoch_{epoch:04d}.pt",
@@ -124,6 +219,75 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 val_loss,
             )
     return best_path
+
+
+def _resolve_resume_path(cfg: dict[str, Any], output_dir: Path) -> Path | None:
+    resume_from = get_cfg(cfg, "training.resume_from", None)
+    if not resume_from:
+        return None
+    path = output_dir / "latest.pt" if str(resume_from).lower() == "auto" else Path(resume_from)
+    return path if path.exists() else None
+
+
+def _torch_load(path: str | Path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _build_case_backed_datasets(
+    cfg: dict[str, Any],
+    cache_dir: Path,
+) -> tuple[CaseBackedDeformingPlateDataset, CaseBackedDeformingPlateDataset]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    edge_path = cache_dir / "edge_stats.pt"
+    node_path = cache_dir / "node_stats.pt"
+    if edge_path.exists() and node_path.exists():
+        edge_stats = load_stats(edge_path)
+        node_stats = load_stats(node_path)
+    else:
+        edge_stats, node_stats = _fit_case_backed_stats(cfg)
+        save_stats(edge_path, edge_stats)
+        save_stats(node_path, node_stats)
+
+    case_root = Path(get_cfg(cfg, "data.case_dir"))
+    split_file = Path(get_cfg(cfg, "data.case_split_file", case_root / "splits.json"))
+    train_dataset = CaseBackedDeformingPlateDataset(
+        case_root=case_root,
+        split_file=split_file,
+        split=str(get_cfg(cfg, "data.train_case_split", "train")),
+        edge_stats=edge_stats,
+        node_stats=node_stats,
+        cfg=cfg,
+        add_noise=True,
+    )
+    val_dataset = CaseBackedDeformingPlateDataset(
+        case_root=case_root,
+        split_file=split_file,
+        split=str(get_cfg(cfg, "data.val_case_split", "val")),
+        edge_stats=edge_stats,
+        node_stats=node_stats,
+        cfg=cfg,
+        add_noise=False,
+    )
+    return train_dataset, val_dataset
+
+
+def _fit_case_backed_stats(
+    cfg: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    case_root = Path(get_cfg(cfg, "data.case_dir"))
+    split_file = Path(get_cfg(cfg, "data.case_split_file", case_root / "splits.json"))
+    train_ids = read_split_file(split_file, str(get_cfg(cfg, "data.train_case_split", "train")))
+    sequences = (
+        _load_case_sequence(str(case_root / case_id))
+        for case_id in tqdm(train_ids, desc="load case-backed stats")
+    )
+    return fit_stats(
+        sequences,
+        world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
+    )
 
 
 def build_deforming_plate_model(cfg: dict[str, Any]):

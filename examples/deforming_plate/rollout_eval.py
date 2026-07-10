@@ -15,7 +15,7 @@ from valgraphnet.train import resolve_device
 
 from .dataset import denormalize, load_sequences, load_stats, make_graph_sample, rollout_masks
 from .preprocess import run_preprocess
-from .train import build_deforming_plate_model
+from .train import _build_case_backed_datasets, _load_case_sequence, build_deforming_plate_model
 
 
 @torch.no_grad()
@@ -29,7 +29,9 @@ def run_rollout_eval(
     cache_dir = Path(
         get_cfg(cfg, "data.preprocess_output_dir", "preprocessed_dataset/deforming_plate")
     )
-    if not (cache_dir / "edge_stats.pt").exists():
+    if get_cfg(cfg, "data.case_dir", None) and not (cache_dir / "edge_stats.pt").exists():
+        _build_case_backed_datasets(cfg, cache_dir)
+    elif not (cache_dir / "edge_stats.pt").exists():
         run_preprocess(cfg)
 
     edge_stats = load_stats(cache_dir / "edge_stats.pt")
@@ -48,12 +50,7 @@ def run_rollout_eval(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    sequences = load_sequences(
-        data_dir=get_cfg(ckpt_cfg, "data.data_dir"),
-        split=str(get_cfg(ckpt_cfg, "data.test_split", "test")),
-        num_samples=int(get_cfg(ckpt_cfg, "data.num_test_samples", 5)),
-        num_steps=int(get_cfg(ckpt_cfg, "data.num_test_time_steps", 200)),
-    )
+    sequences = _load_rollout_sequences(ckpt_cfg)
 
     all_metrics = []
     for seq_idx, sequence in enumerate(sequences):
@@ -89,6 +86,23 @@ def run_rollout_eval(
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump({"summary": summary, "sequences": all_metrics}, f, indent=2)
     return output_dir
+
+
+def _load_rollout_sequences(cfg: dict[str, Any]):
+    if get_cfg(cfg, "data.case_dir", None):
+        from valgraphnet.data.case import read_split_file
+
+        case_root = Path(get_cfg(cfg, "data.case_dir"))
+        split_file = Path(get_cfg(cfg, "data.case_split_file", case_root / "splits.json"))
+        case_ids = read_split_file(split_file, str(get_cfg(cfg, "data.test_case_split", "test")))
+        limit = int(get_cfg(cfg, "data.num_test_samples", len(case_ids)))
+        return [_load_case_sequence(str(case_root / case_id)) for case_id in case_ids[:limit]]
+    return load_sequences(
+        data_dir=get_cfg(cfg, "data.data_dir"),
+        split=str(get_cfg(cfg, "data.test_split", "test")),
+        num_samples=int(get_cfg(cfg, "data.num_test_samples", 5)),
+        num_steps=int(get_cfg(cfg, "data.num_test_time_steps", 200)),
+    )
 
 
 def _rollout_sequence(
