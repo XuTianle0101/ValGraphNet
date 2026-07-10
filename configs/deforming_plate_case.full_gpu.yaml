@@ -36,7 +36,9 @@ model:
   recompute_activation: false
 
 training:
-  epochs: 30
+  epochs: 12
+  steps_per_trajectory_per_epoch: 1
+  validation_steps_per_trajectory: 3
   batch_size: 1
   num_workers: 0
   lr: 1.0e-4

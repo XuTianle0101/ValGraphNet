@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from valgraphnet.config import get_cfg
-from valgraphnet.data import ValveGraphDataset, collate_valve_graphs
+from valgraphnet.data import PerTrajectoryStepSampler, ValveGraphDataset, collate_valve_graphs
 from valgraphnet.losses import valve_loss
 from valgraphnet.model import build_model
 from valgraphnet.normalization import fit_normalizers
@@ -59,10 +60,17 @@ def run_training(cfg: dict[str, Any]) -> Path:
         f" ({str(amp_dtype).removeprefix('torch.') if amp_enabled else 'disabled'})"
     )
 
+    train_sampler = _build_step_sampler(train_dataset, cfg, training=True)
+    val_sampler = (
+        _build_step_sampler(val_dataset, cfg, training=False)
+        if val_dataset is not None
+        else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=int(get_cfg(cfg, "training.num_workers", 0)),
         collate_fn=collate_valve_graphs,
     )
@@ -72,6 +80,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
             val_dataset,
             batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
             shuffle=False,
+            sampler=val_sampler,
             num_workers=int(get_cfg(cfg, "training.num_workers", 0)),
             collate_fn=collate_valve_graphs,
         )
@@ -82,6 +91,8 @@ def run_training(cfg: dict[str, Any]) -> Path:
     save_every = int(get_cfg(cfg, "training.save_every", 10))
     save_latest = bool(get_cfg(cfg, "training.save_latest", False))
     start_epoch = 1
+    history_path = output_dir / "history.json"
+    history = _load_history(history_path)
     resume_path = _resolve_resume_path(cfg, output_dir)
     if resume_path is not None:
         checkpoint = _torch_load(resume_path, map_location=device)
@@ -96,11 +107,27 @@ def run_training(cfg: dict[str, Any]) -> Path:
         print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
 
     for epoch in range(start_epoch, epochs + 1):
+        epoch_start = time.perf_counter()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_metrics = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg)
         val_metrics = evaluate(model, val_loader, device, cfg) if val_loader is not None else None
         score = val_metrics["total"] if val_metrics else train_metrics["total"]
 
         print(_format_epoch(epoch, train_metrics, val_metrics))
+        history = [item for item in history if int(item["epoch"]) != epoch]
+        history.append(
+            {
+                "epoch": epoch,
+                "train": train_metrics,
+                "val": val_metrics,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "seconds": time.perf_counter() - epoch_start,
+                "train_steps": len(train_loader),
+                "val_steps": len(val_loader) if val_loader is not None else 0,
+            }
+        )
+        _save_history(history_path, history)
         if score < best_loss:
             best_loss = score
             save_checkpoint(
@@ -142,6 +169,23 @@ def run_training(cfg: dict[str, Any]) -> Path:
     return best_path
 
 
+def _build_step_sampler(dataset, cfg: dict[str, Any], training: bool):
+    key = (
+        "training.steps_per_trajectory_per_epoch"
+        if training
+        else "training.validation_steps_per_trajectory"
+    )
+    steps = get_cfg(cfg, key, None)
+    if steps is None:
+        return None
+    return PerTrajectoryStepSampler(
+        dataset.trajectory_index_groups,
+        steps_per_trajectory=int(steps),
+        shuffle=training,
+        seed=int(cfg.get("seed", 42)) + (0 if training else 1_000_000),
+    )
+
+
 def _resolve_resume_path(cfg: dict[str, Any], output_dir: Path) -> Path | None:
     resume_from = get_cfg(cfg, "training.resume_from", None)
     if not resume_from:
@@ -155,6 +199,18 @@ def _torch_load(path: str | Path, map_location=None):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def _load_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as f:
+        return list(json.load(f))
+
+
+def _save_history(path: Path, history: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(sorted(history, key=lambda item: int(item["epoch"])), f, indent=2)
 
 
 def build_datasets(cfg: dict[str, Any]) -> tuple[ValveGraphDataset, ValveGraphDataset | None]:

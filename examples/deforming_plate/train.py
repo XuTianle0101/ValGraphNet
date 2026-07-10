@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from valgraphnet.config import get_cfg, load_config
+from valgraphnet.data import PerTrajectoryStepSampler
 from valgraphnet.data.case import read_split_file
 from valgraphnet.train import resolve_device
 
@@ -39,6 +41,10 @@ class CachedDeformingPlateDataset(Dataset):
         with manifest_path.open("r", encoding="utf-8") as f:
             manifest = json.load(f)
         self.entries = manifest["entries"]
+        groups: dict[str, list[int]] = {}
+        for index, entry in enumerate(self.entries):
+            groups.setdefault(str(entry["file"]), []).append(index)
+        self.trajectory_index_groups = list(groups.values())
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -87,11 +93,14 @@ class CaseBackedDeformingPlateDataset(Dataset):
         self.add_noise = bool(add_noise)
         self.noise_std = float(get_cfg(cfg, "data.noise_std", 0.003))
         self.samples: list[tuple[Path, int]] = []
+        self.trajectory_index_groups: list[range] = []
         for case_id in self.case_ids:
             case_dir = self.case_root / case_id
             times = np.load(case_dir / "times.npy", allow_pickle=False, mmap_mode="r")
+            start = len(self.samples)
             for step in range(int(times.shape[0]) - 1):
                 self.samples.append((case_dir, step))
+            self.trajectory_index_groups.append(range(start, len(self.samples)))
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -154,10 +163,13 @@ def run_training(cfg: dict[str, Any]) -> Path:
         train_dataset = CachedDeformingPlateDataset(cache_dir, "train")
         val_dataset = CachedDeformingPlateDataset(cache_dir, "val")
 
+    train_sampler = _build_step_sampler(train_dataset, cfg, training=True)
+    val_sampler = _build_step_sampler(val_dataset, cfg, training=False)
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=int(get_cfg(cfg, "training.num_workers", 0)),
         collate_fn=collate_one,
     )
@@ -165,6 +177,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
         val_dataset,
         batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
         shuffle=False,
+        sampler=val_sampler,
         num_workers=int(get_cfg(cfg, "training.num_workers", 0)),
         collate_fn=collate_one,
     )
@@ -200,6 +213,8 @@ def run_training(cfg: dict[str, Any]) -> Path:
     save_every = int(get_cfg(cfg, "training.save_every", 5))
     save_latest = bool(get_cfg(cfg, "training.save_latest", False))
     start_epoch = 1
+    history_path = output_dir / "history.json"
+    history = _load_history(history_path)
     resume_path = _resolve_resume_path(cfg, output_dir)
     if resume_path is not None:
         checkpoint = _torch_load(resume_path, map_location=device)
@@ -215,6 +230,9 @@ def run_training(cfg: dict[str, Any]) -> Path:
         print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
 
     for epoch in range(start_epoch, epochs + 1):
+        epoch_start = time.perf_counter()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_loss = _train_epoch(
             model,
             train_loader,
@@ -227,6 +245,19 @@ def run_training(cfg: dict[str, Any]) -> Path:
         )
         val_loss = _evaluate(model, val_loader, criterion, device, cfg)
         print(f"epoch {epoch:04d} | train={train_loss:.6g} | val={val_loss:.6g}")
+        history = [item for item in history if int(item["epoch"]) != epoch]
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "seconds": time.perf_counter() - epoch_start,
+                "train_steps": len(train_loader),
+                "val_steps": len(val_loader),
+            }
+        )
+        _save_history(history_path, history)
         if val_loss < best_loss:
             best_loss = val_loss
             save_checkpoint(best_path, model, optimizer, scheduler, scaler, cfg, epoch, best_loss)
@@ -255,6 +286,23 @@ def run_training(cfg: dict[str, Any]) -> Path:
     return best_path
 
 
+def _build_step_sampler(dataset, cfg: dict[str, Any], training: bool):
+    key = (
+        "training.steps_per_trajectory_per_epoch"
+        if training
+        else "training.validation_steps_per_trajectory"
+    )
+    steps = get_cfg(cfg, key, None)
+    if steps is None:
+        return None
+    return PerTrajectoryStepSampler(
+        dataset.trajectory_index_groups,
+        steps_per_trajectory=int(steps),
+        shuffle=training,
+        seed=int(cfg.get("seed", 42)) + (0 if training else 1_000_000),
+    )
+
+
 def _resolve_resume_path(cfg: dict[str, Any], output_dir: Path) -> Path | None:
     resume_from = get_cfg(cfg, "training.resume_from", None)
     if not resume_from:
@@ -268,6 +316,18 @@ def _torch_load(path: str | Path, map_location=None):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def _load_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as f:
+        return list(json.load(f))
+
+
+def _save_history(path: Path, history: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(sorted(history, key=lambda item: int(item["epoch"])), f, indent=2)
 
 
 def _build_case_backed_datasets(

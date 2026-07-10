@@ -59,7 +59,7 @@ def ensure_cases() -> None:
 
 
 def run_native() -> None:
-    if checkpoint_complete(NATIVE_OUT / "best.pt", target_epoch=30):
+    if checkpoint_complete(NATIVE_OUT / "latest.pt", target_epoch=configured_epochs(NATIVE_CFG)):
         return
     run_step(
         "native_train",
@@ -92,7 +92,7 @@ def run_native_rollout() -> None:
 
 
 def run_case_path() -> None:
-    if checkpoint_complete(CASE_OUT / "best.pt", target_epoch=30):
+    if checkpoint_complete(CASE_OUT / "latest.pt", target_epoch=configured_epochs(CASE_CFG)):
         return
     run_step(
         "case_train",
@@ -143,6 +143,10 @@ def write_comparison() -> None:
         "native": native_metrics["summary"],
         "valgraphnet_case": aggregate(case_metrics),
         "valgraphnet_case_sequences": case_metrics,
+        "training_history": {
+            "native": read_json(NATIVE_OUT / "history.json"),
+            "valgraphnet_case": read_json(CASE_OUT / "history.json"),
+        },
     }
     write_json(EXP_DIR / "comparison.json", comparison)
 
@@ -181,6 +185,14 @@ def checkpoint_complete(path: Path, target_epoch: int) -> bool:
         return int(checkpoint.get("epoch", 0)) >= int(target_epoch)
     except Exception:
         return False
+
+
+def configured_epochs(path: Path) -> int:
+    import yaml
+
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return int(cfg["training"]["epochs"])
 
 
 def run_step(name: str, command: list[str]) -> None:

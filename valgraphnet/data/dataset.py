@@ -43,9 +43,12 @@ class ValveGraphDataset(Dataset):
 
         self.cases = [load_case(path) for path in case_dirs]
         self.samples: list[tuple[int, int]] = []
+        self.trajectory_index_groups: list[range] = []
         for case_idx, case in enumerate(self.cases):
+            start = len(self.samples)
             for step in range(case.num_steps - 1):
                 self.samples.append((case_idx, step))
+            self.trajectory_index_groups.append(range(start, len(self.samples)))
 
         if not self.samples:
             raise ValueError("No one-step samples were found. Each case needs at least two frames.")

@@ -38,7 +38,10 @@ model:
 
 training:
   batch_size: 1
-  epochs: 30
+  epochs: 12
+  # Cover every trajectory each epoch while sampling a different time step.
+  steps_per_trajectory_per_epoch: 1
+  validation_steps_per_trajectory: 3
   lr: 1.0e-4
   lr_decay_rate: 0.9999917
   weight_decay: 0.0
