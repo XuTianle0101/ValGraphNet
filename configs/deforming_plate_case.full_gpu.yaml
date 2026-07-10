@@ -55,9 +55,9 @@ training:
 
 loss:
   delta_u: 1.0
-  delta_v: 0.0
-  accel: 0.0
-  stress: 0.0
+  delta_v: 0.1
+  accel: 0.05
+  stress: 0.1
 
 rollout:
   steps: null
