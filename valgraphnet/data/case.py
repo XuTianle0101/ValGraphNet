@@ -99,7 +99,15 @@ def load_case(case_dir: str | Path) -> ValveCase:
     thickness = np.array(thickness, dtype=np.float32, copy=True)
 
     _validate_case(root, nodes, times, pressure, displacement, velocity, acceleration, stress)
-    mesh_edge_index = mesh_edges_from_elements(elements)
+    if (
+        elements.ndim == 2
+        and elements.shape[1] == 2
+        and metadata.get("element_representation")
+        == "unique two-node mesh edges derived from tetrahedral cells"
+    ):
+        mesh_edge_index = np.asarray(elements, dtype=np.int64).T
+    else:
+        mesh_edge_index = mesh_edges_from_elements(elements)
     if elements.ndim == 2 and elements.shape[1] >= 3:
         normals, nodal_area = compute_node_normals_areas(nodes, elements)
     else:
