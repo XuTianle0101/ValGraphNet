@@ -83,6 +83,7 @@ def make_graph_sample(
     node_stats: dict[str, torch.Tensor] | None = None,
     world_pos_override: torch.Tensor | None = None,
     world_edge_radius: float = 0.03,
+    max_world_neighbors: int | None = None,
     add_noise: bool = False,
     noise_std: float = 0.003,
 ) -> DeformingPlateGraphSample:
@@ -124,6 +125,7 @@ def make_graph_sample(
         world_pos=world_pos,
         radius=float(world_edge_radius),
         mesh_edge_index=edge_index,
+        max_neighbors=max_world_neighbors,
     )
     world_base_features = edge_features(world_edge_index, world_pos)
     world_edge_features = torch.cat([world_base_features, world_base_features], dim=1)
@@ -209,8 +211,14 @@ def radius_world_edges(
     world_pos: torch.Tensor,
     radius: float,
     mesh_edge_index: torch.Tensor,
+    max_neighbors: int | None = None,
 ) -> torch.Tensor:
-    """Build directed world edges within a radius, excluding self and mesh edges."""
+    """Build directed world edges within a radius, excluding self and mesh edges.
+
+    When ``max_neighbors`` is positive, retain the nearest world-space neighbors
+    for every source node. Dense contact frames can otherwise approach a fully
+    connected graph and exhaust GPU memory even with a batch size of one.
+    """
 
     if radius <= 0.0 or world_pos.shape[0] < 2:
         return torch.zeros((2, 0), dtype=torch.long)
@@ -224,6 +232,12 @@ def radius_world_edges(
             directed.append((j, i))
     if not directed:
         return torch.zeros((2, 0), dtype=torch.long)
+    if max_neighbors is not None and int(max_neighbors) > 0:
+        directed = _nearest_neighbors(
+            directed,
+            world_pos=world_pos,
+            max_neighbors=int(max_neighbors),
+        )
     return torch.as_tensor(directed, dtype=torch.long).t().contiguous()
 
 
@@ -254,6 +268,7 @@ def rollout_masks(node_type: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, 
 def fit_stats(
     sequences: list[DeformingPlateSequence],
     world_edge_radius: float,
+    max_world_neighbors: int | None = None,
     max_steps: int | None = None,
     eps: float = 1.0e-8,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -275,6 +290,7 @@ def fit_stats(
                 edge_stats=None,
                 node_stats=None,
                 world_edge_radius=world_edge_radius,
+                max_world_neighbors=max_world_neighbors,
             )
             edge_moments.update(sample.mesh_edge_features)
             if sample.world_edge_features.numel() > 0:
@@ -393,6 +409,26 @@ def _radius_pairs(points: torch.Tensor, radius: float) -> list[tuple[int, int]]:
         dist = torch.cdist(points.float(), points.float())
         src, dst = torch.where((dist <= float(radius)) & (dist > 0.0))
         return [(int(i), int(j)) for i, j in zip(src.tolist(), dst.tolist(), strict=False) if i < j]
+
+
+def _nearest_neighbors(
+    directed: list[tuple[int, int]],
+    world_pos: torch.Tensor,
+    max_neighbors: int,
+) -> list[tuple[int, int]]:
+    """Return a deterministic per-source nearest-neighbor subset."""
+
+    edges = np.asarray(directed, dtype=np.int64)
+    points = world_pos.detach().cpu().numpy()
+    delta = points[edges[:, 0]] - points[edges[:, 1]]
+    distance_sq = np.einsum("ij,ij->i", delta, delta)
+    order = np.lexsort((edges[:, 1], distance_sq, edges[:, 0]))
+    sorted_edges = edges[order]
+    source = sorted_edges[:, 0]
+    group_start = np.r_[True, source[1:] != source[:-1]]
+    starts = np.maximum.accumulate(np.where(group_start, np.arange(source.size), 0))
+    keep = np.arange(source.size) - starts < int(max_neighbors)
+    return [tuple(edge) for edge in sorted_edges[keep].tolist()]
 
 
 class _Moments:

@@ -33,6 +33,7 @@ def run_preprocess(cfg: dict[str, Any]) -> Path:
     edge_stats, node_stats = fit_stats(
         train_sequences,
         world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
+        max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
     )
     save_stats(out_dir / "edge_stats.pt", edge_stats)
     save_stats(out_dir / "node_stats.pt", node_stats)
@@ -101,6 +102,7 @@ def _write_split_cache(
                 edge_stats=edge_stats,
                 node_stats=node_stats,
                 world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
+                max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
                 add_noise=add_noise,
                 noise_std=float(get_cfg(cfg, "data.noise_std", 0.003)),
             )

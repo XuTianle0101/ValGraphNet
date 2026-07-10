@@ -83,6 +83,7 @@ class CaseBackedDeformingPlateDataset(Dataset):
         self.edge_stats = edge_stats
         self.node_stats = node_stats
         self.world_edge_radius = float(get_cfg(cfg, "graph.world_edge_radius", 0.03))
+        self.max_world_neighbors = get_cfg(cfg, "graph.max_world_neighbors", None)
         self.add_noise = bool(add_noise)
         self.noise_std = float(get_cfg(cfg, "data.noise_std", 0.003))
         self.samples: list[tuple[Path, int]] = []
@@ -104,6 +105,7 @@ class CaseBackedDeformingPlateDataset(Dataset):
             edge_stats=self.edge_stats,
             node_stats=self.node_stats,
             world_edge_radius=self.world_edge_radius,
+            max_world_neighbors=self.max_world_neighbors,
             add_noise=self.add_noise,
             noise_std=self.noise_std,
         )
@@ -287,6 +289,7 @@ def _fit_case_backed_stats(
     return fit_stats(
         sequences,
         world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
+        max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
     )
 
 

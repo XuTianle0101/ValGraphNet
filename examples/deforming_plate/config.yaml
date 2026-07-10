@@ -20,6 +20,8 @@ data:
 
 graph:
   world_edge_radius: 0.03
+  # Bound dense contact frames while retaining the nearest world-space links.
+  max_world_neighbors: 32
 
 model:
   processor_size: 15

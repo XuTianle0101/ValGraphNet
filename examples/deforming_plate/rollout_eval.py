@@ -130,6 +130,7 @@ def _rollout_sequence(
             node_stats=node_stats,
             world_pos_override=current_pos,
             world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
+            max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
         )
         graph = sample.graph.to(device)
         pred_norm = model(
