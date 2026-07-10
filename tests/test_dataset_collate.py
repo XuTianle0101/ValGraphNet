@@ -42,8 +42,12 @@ def test_dataset_and_collate_keep_hybrid_edge_order(tmp_path):
     np.save(case / "fixed_mask.npy", np.array([1, 1, 0, 1, 1, 0], dtype=bool))
     np.save(case / "pressure_mask.npy", np.array([0, 0, 0, 1, 1, 1], dtype=bool))
     np.save(case / "leaflet_id.npy", leaflet_id)
+    np.save(case / "node_type.npy", np.array([0, 0, 3, 1, 1, 1], dtype=np.int64))
     np.save(case / "thickness.npy", np.ones(6, dtype=np.float32))
-    (case / "metadata.json").write_text(json.dumps({"case_id": "case_001"}), encoding="utf-8")
+    (case / "metadata.json").write_text(
+        json.dumps({"case_id": "case_001", "source": "DeepMind deforming_plate"}),
+        encoding="utf-8",
+    )
 
     cfg = {"contact": {"enabled": True, "radius": 0.08, "different_leaflets_only": True}}
     dataset = ValveGraphDataset(tmp_path, cfg=cfg)
@@ -60,4 +64,5 @@ def test_dataset_and_collate_keep_hybrid_edge_order(tmp_path):
     assert batch.mesh_edge_features.shape[0] == batch.mesh_edge_count
     assert batch.world_edge_features.shape[0] == batch.world_edge_count
     assert batch.target.shape[1] == 10
+    assert int(batch.prescribed_mask.sum()) == 6
 

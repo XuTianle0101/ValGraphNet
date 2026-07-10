@@ -23,6 +23,7 @@ def collate_valve_graphs(items: list):
     world_edge_features = []
     targets = []
     fixed_masks = []
+    prescribed_masks = []
     pressure_masks = []
     nodal_areas = []
     batch_vec = []
@@ -43,6 +44,7 @@ def collate_valve_graphs(items: list):
         world_edge_features.append(item.world_edge_features)
         targets.append(item.target)
         fixed_masks.append(item.fixed_mask)
+        prescribed_masks.append(item.prescribed_mask)
         pressure_masks.append(item.pressure_mask)
         nodal_areas.append(item.nodal_area)
         batch_vec.append(torch.full((item.num_nodes,), batch_id, dtype=torch.long))
@@ -61,6 +63,7 @@ def collate_valve_graphs(items: list):
     data.world_edge_features = _cat_features(world_edge_features, items[0].world_edge_features)
     data.target = torch.cat(targets, dim=0)
     data.fixed_mask = torch.cat(fixed_masks, dim=0)
+    data.prescribed_mask = torch.cat(prescribed_masks, dim=0)
     data.pressure_mask = torch.cat(pressure_masks, dim=0)
     data.nodal_area = torch.cat(nodal_areas, dim=0)
     data.batch = torch.cat(batch_vec, dim=0)

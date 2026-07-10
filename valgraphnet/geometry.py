@@ -15,6 +15,7 @@ class ContactConfig:
     radius: float | None = None
     radius_factor: float = 2.5
     max_edges: int = 200_000
+    max_neighbors: int | None = None
     different_leaflets_only: bool = True
 
 
@@ -148,11 +149,19 @@ def build_contact_edges(
             continue
         directed.append((int(i), int(j)))
         directed.append((int(j), int(i)))
-        if len(directed) >= cfg.max_edges:
+        if not cfg.max_neighbors and len(directed) >= cfg.max_edges:
             break
 
     if not directed:
         return np.zeros((2, 0), dtype=np.int64)
+    if cfg.max_neighbors is not None and int(cfg.max_neighbors) > 0:
+        directed = _nearest_neighbors(
+            directed,
+            current_pos=current_pos,
+            max_neighbors=int(cfg.max_neighbors),
+        )
+    if len(directed) > cfg.max_edges:
+        directed = directed[: cfg.max_edges]
     return np.asarray(directed, dtype=np.int64).T
 
 
@@ -166,6 +175,25 @@ def _radius_pairs(points: np.ndarray, radius: float) -> list[tuple[int, int]]:
         return [(int(i), int(j)) for i, j in tree.query_pairs(radius)]
     except Exception:
         return _radius_pairs_chunked(points, radius)
+
+
+def _nearest_neighbors(
+    directed: list[tuple[int, int]],
+    current_pos: np.ndarray,
+    max_neighbors: int,
+) -> list[tuple[int, int]]:
+    """Return the deterministic nearest world edges for each source node."""
+
+    edges = np.asarray(directed, dtype=np.int64)
+    delta = current_pos[edges[:, 0]] - current_pos[edges[:, 1]]
+    distance_sq = np.einsum("ij,ij->i", delta, delta)
+    order = np.lexsort((edges[:, 1], distance_sq, edges[:, 0]))
+    sorted_edges = edges[order]
+    source = sorted_edges[:, 0]
+    group_start = np.r_[True, source[1:] != source[:-1]]
+    starts = np.maximum.accumulate(np.where(group_start, np.arange(source.size), 0))
+    keep = np.arange(source.size) - starts < int(max_neighbors)
+    return [tuple(edge) for edge in sorted_edges[keep].tolist()]
 
 
 def _radius_pairs_chunked(points: np.ndarray, radius: float, chunk_size: int = 1024) -> list[tuple[int, int]]:

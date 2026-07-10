@@ -26,6 +26,7 @@ class ValveCase:
     acceleration: np.ndarray
     stress: np.ndarray
     fixed_mask: np.ndarray
+    prescribed_mask: np.ndarray
     pressure_mask: np.ndarray
     leaflet_id: np.ndarray
     thickness: np.ndarray
@@ -67,25 +68,43 @@ def load_case(case_dir: str | Path) -> ValveCase:
     fixed_mask = _load_optional(
         root, "fixed_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
     ).astype(bool, copy=False)
+    prescribed_path = root / "prescribed_mask.npy"
+    node_type_path = root / "node_type.npy"
+    if prescribed_path.exists():
+        prescribed_mask = np.load(
+            prescribed_path, allow_pickle=False, mmap_mode="r"
+        ).astype(bool, copy=False)
+    elif node_type_path.exists():
+        node_type = np.load(node_type_path, allow_pickle=False, mmap_mode="r")
+        prescribed_mask = np.asarray(node_type).reshape(-1) == 1
+    else:
+        prescribed_mask = np.zeros(nodes.shape[0], dtype=bool)
     pressure_mask = _load_optional(
         root, "pressure_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
     ).astype(bool, copy=False)
     leaflet_id = _load_optional(
         root, "leaflet_id.npy", np.zeros(nodes.shape[0], dtype=np.int64)
     ).astype(np.int64, copy=False)
+    if metadata.get("source") == "DeepMind deforming_plate" and node_type_path.exists():
+        leaflet_id = np.load(node_type_path, allow_pickle=False, mmap_mode="r").reshape(-1)
     thickness = _load_optional(
         root, "thickness.npy", np.ones(nodes.shape[0], dtype=np.float32)
     ).astype(np.float32, copy=False)
     if thickness.ndim == 0:
         thickness = np.full(nodes.shape[0], float(thickness), dtype=np.float32)
     fixed_mask = np.array(fixed_mask, dtype=bool, copy=True)
+    prescribed_mask = np.array(prescribed_mask, dtype=bool, copy=True)
     pressure_mask = np.array(pressure_mask, dtype=bool, copy=True)
     leaflet_id = np.array(leaflet_id, dtype=np.int64, copy=True)
     thickness = np.array(thickness, dtype=np.float32, copy=True)
 
     _validate_case(root, nodes, times, pressure, displacement, velocity, acceleration, stress)
     mesh_edge_index = mesh_edges_from_elements(elements)
-    normals, nodal_area = compute_node_normals_areas(nodes, elements)
+    if elements.ndim == 2 and elements.shape[1] >= 3:
+        normals, nodal_area = compute_node_normals_areas(nodes, elements)
+    else:
+        normals = np.zeros_like(nodes, dtype=np.float32)
+        nodal_area = np.ones(nodes.shape[0], dtype=np.float32)
 
     return ValveCase(
         case_id=metadata.get("case_id", root.name),
@@ -100,6 +119,7 @@ def load_case(case_dir: str | Path) -> ValveCase:
         acceleration=acceleration,
         stress=stress.astype(np.float32, copy=False),
         fixed_mask=fixed_mask,
+        prescribed_mask=prescribed_mask,
         pressure_mask=pressure_mask,
         leaflet_id=leaflet_id,
         thickness=thickness,

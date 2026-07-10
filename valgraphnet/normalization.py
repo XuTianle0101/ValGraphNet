@@ -89,7 +89,11 @@ def fit_normalizers(dataset, max_samples: int | None = None, eps: float = 1.0e-8
     target_scale_acc = _SecondMoment()
 
     count = len(dataset) if max_samples is None else min(len(dataset), int(max_samples))
-    for idx in range(count):
+    if count == len(dataset):
+        indices = range(count)
+    else:
+        indices = torch.linspace(0, len(dataset) - 1, steps=count).round().long().tolist()
+    for idx in indices:
         sample = dataset[idx]
         node_acc.update(sample.node_features)
         mesh_acc.update(sample.mesh_edge_features)

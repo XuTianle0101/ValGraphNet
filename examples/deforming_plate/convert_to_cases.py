@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from valgraphnet.config import get_cfg, load_config
 
-from .dataset import NODE_TYPE_CLAMPED, SequenceDataset, cells_to_edges
+from .dataset import NODE_TYPE_CLAMPED, NODE_TYPE_OBJECT, SequenceDataset, cells_to_edges
 
 
 def convert_to_cases(cfg: dict[str, Any], out_dir: str | Path) -> Path:
@@ -80,8 +80,9 @@ def _write_case(case_dir: Path, case_id: str, sequence) -> None:
 
     edge_elements = cells_to_edges(sequence.cells).t().cpu().numpy().astype(np.int64)
     fixed_mask = (sequence.node_type == NODE_TYPE_CLAMPED).astype(bool)
+    prescribed_mask = (sequence.node_type == NODE_TYPE_OBJECT).astype(bool)
     pressure_mask = np.zeros(sequence.num_nodes, dtype=bool)
-    leaflet_id = np.zeros(sequence.num_nodes, dtype=np.int64)
+    leaflet_id = sequence.node_type.astype(np.int64)
     thickness = np.ones(sequence.num_nodes, dtype=np.float32)
     pressure = np.zeros(sequence.num_steps, dtype=np.float32)
 
@@ -94,6 +95,7 @@ def _write_case(case_dir: Path, case_id: str, sequence) -> None:
     np.save(case_dir / "A.npy", acceleration)
     np.save(case_dir / "S.npy", stress)
     np.save(case_dir / "fixed_mask.npy", fixed_mask)
+    np.save(case_dir / "prescribed_mask.npy", prescribed_mask)
     np.save(case_dir / "pressure_mask.npy", pressure_mask)
     np.save(case_dir / "leaflet_id.npy", leaflet_id)
     np.save(case_dir / "thickness.npy", thickness)

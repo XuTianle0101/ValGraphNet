@@ -17,7 +17,8 @@ def valve_loss(
     """Compute weighted one-step loss."""
 
     target = split_target(data.target)
-    free_mask = (~data.fixed_mask).float()[:, None]
+    prescribed_mask = getattr(data, "prescribed_mask", torch.zeros_like(data.fixed_mask))
+    free_mask = (~(data.fixed_mask | prescribed_mask)).float()[:, None]
     weights = data.nodal_area.float()[:, None].clamp_min(1.0e-12)
     weights = weights / weights.mean().clamp_min(1.0e-12)
 

@@ -64,3 +64,23 @@ def test_contact_edges_skip_mesh_edges_and_same_leaflet():
     assert (0, 1) not in directed
     assert (2, 3) not in directed
 
+
+def test_contact_edges_limit_neighbors_per_source():
+    nodes = np.stack(
+        [np.arange(8, dtype=np.float32) * 0.01, np.zeros(8), np.zeros(8)],
+        axis=1,
+    )
+    edge_index = build_contact_edges(
+        current_pos=nodes,
+        leaflet_id=np.zeros(8, dtype=np.int64),
+        mesh_edge_index=np.zeros((2, 0), dtype=np.int64),
+        cfg=ContactConfig(
+            radius=1.0,
+            max_neighbors=2,
+            different_leaflets_only=False,
+        ),
+    )
+
+    counts = np.bincount(edge_index[0], minlength=nodes.shape[0])
+    assert counts.max() <= 2
+

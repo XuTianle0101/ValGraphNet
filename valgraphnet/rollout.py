@@ -71,6 +71,10 @@ def run_rollout(
         u = u + du
         v = v + dv
         a = next_a
+        if case.prescribed_mask.any():
+            u[case.prescribed_mask] = case.displacement[step + 1, case.prescribed_mask]
+            v[case.prescribed_mask] = case.velocity[step + 1, case.prescribed_mask]
+            a[case.prescribed_mask] = case.acceleration[step + 1, case.prescribed_mask]
         u_pred.append(u.copy())
         v_pred.append(v.copy())
         a_pred.append(a.copy())

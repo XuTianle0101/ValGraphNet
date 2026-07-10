@@ -15,6 +15,7 @@ contact:
   radius: 0.03
   radius_factor: 2.5
   max_edges: 200000
+  max_neighbors: 32
   different_leaflets_only: false
 
 normalization:

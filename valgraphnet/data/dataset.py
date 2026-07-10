@@ -118,6 +118,7 @@ class ValveGraphDataset(Dataset):
             radius=get_cfg(self.cfg, "contact.radius", None),
             radius_factor=float(get_cfg(self.cfg, "contact.radius_factor", 2.5)),
             max_edges=int(get_cfg(self.cfg, "contact.max_edges", 200_000)),
+            max_neighbors=get_cfg(self.cfg, "contact.max_neighbors", None),
             different_leaflets_only=bool(get_cfg(self.cfg, "contact.different_leaflets_only", True)),
         )
         world_edge_index = build_contact_edges(
@@ -162,6 +163,7 @@ class ValveGraphDataset(Dataset):
         data.world_edge_features = torch.as_tensor(world_edge_features, dtype=torch.float32)
         data.target = torch.as_tensor(target, dtype=torch.float32)
         data.fixed_mask = torch.as_tensor(case.fixed_mask, dtype=torch.bool)
+        data.prescribed_mask = torch.as_tensor(case.prescribed_mask, dtype=torch.bool)
         data.pressure_mask = torch.as_tensor(case.pressure_mask, dtype=torch.bool)
         data.nodal_area = torch.as_tensor(case.nodal_area, dtype=torch.float32)
         data.case_id = case.case_id
