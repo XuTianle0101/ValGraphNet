@@ -15,7 +15,12 @@ from valgraphnet.train import resolve_device
 
 from .dataset import denormalize, load_sequences, load_stats, make_graph_sample, rollout_masks
 from .preprocess import run_preprocess
-from .train import _build_case_backed_datasets, _load_case_sequence, build_deforming_plate_model
+from .train import (
+    _build_case_backed_datasets,
+    _load_case_sequence,
+    autocast_context,
+    build_deforming_plate_model,
+)
 
 
 @torch.no_grad()
@@ -133,12 +138,13 @@ def _rollout_sequence(
             max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
         )
         graph = sample.graph.to(device)
-        pred_norm = model(
-            graph.x,
-            sample.mesh_edge_features.to(device),
-            sample.world_edge_features.to(device),
-            graph,
-        )
+        with autocast_context(cfg, device):
+            pred_norm = model(
+                graph.x,
+                sample.mesh_edge_features.to(device),
+                sample.world_edge_features.to(device),
+                graph,
+            )
         pred_delta = denormalize(
             pred_norm[:, 0:3],
             node_stats["velocity_mean"],

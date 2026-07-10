@@ -28,6 +28,7 @@ model:
   decoder_layers: 2
   do_concat_trick: false
   num_processor_checkpoint_segments: 0
+  checkpoint_offloading: false
   recompute_activation: false
 
 training:
@@ -40,7 +41,8 @@ training:
   output_dir: outputs/deforming_plate_quick
   save_every: 1
   device: auto
-  amp: false
+  amp: true
+  amp_dtype: bfloat16
 
 rollout:
   output_dir: outputs/deforming_plate_quick/rollout_eval

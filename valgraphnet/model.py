@@ -45,6 +45,12 @@ class ValveGraphNet(nn.Module):
             "num_layers_edge_processor": int(model_cfg.get("edge_layers", 2)),
             "num_layers_node_decoder": int(model_cfg.get("decoder_layers", 2)),
             "aggregation": str(model_cfg.get("aggregation", "sum")),
+            "do_concat_trick": bool(model_cfg.get("do_concat_trick", False)),
+            "num_processor_checkpoint_segments": int(
+                model_cfg.get("num_processor_checkpoint_segments", 0)
+            ),
+            "checkpoint_offloading": bool(model_cfg.get("checkpoint_offloading", False)),
+            "recompute_activation": bool(model_cfg.get("recompute_activation", False)),
         }
         self.net = Net(**kwargs)
 

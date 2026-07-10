@@ -12,7 +12,7 @@ from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
 from valgraphnet.model import build_model
 from valgraphnet.normalization import Normalizers, split_target
-from valgraphnet.train import resolve_device
+from valgraphnet.train import autocast_context, resolve_device
 
 
 @torch.no_grad()
@@ -54,7 +54,8 @@ def run_rollout(
         if normalizers is not None:
             graph = normalizers.transform_data(graph)
         graph = graph.to(device)
-        pred = model(graph)
+        with autocast_context(ckpt_cfg, device):
+            pred = model(graph)
         pred_concat = torch.cat([pred["delta_u"], pred["delta_v"], pred["accel"], pred["stress"]], dim=1)
         if normalizers is not None:
             pred_concat = normalizers.inverse_target(pred_concat)

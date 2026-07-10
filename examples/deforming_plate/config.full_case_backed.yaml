@@ -32,7 +32,8 @@ model:
   edge_layers: 2
   decoder_layers: 2
   do_concat_trick: false
-  num_processor_checkpoint_segments: 0
+  num_processor_checkpoint_segments: 3
+  checkpoint_offloading: false
   recompute_activation: false
 
 training:
@@ -47,7 +48,8 @@ training:
   save_latest: true
   resume_from: auto
   device: auto
-  amp: false
+  amp: true
+  amp_dtype: bfloat16
 
 rollout:
   output_dir: outputs/deforming_plate_full_case_backed/rollout_eval

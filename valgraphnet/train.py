@@ -45,6 +45,18 @@ def run_training(cfg: dict[str, Any]) -> Path:
         model.parameters(),
         lr=float(get_cfg(cfg, "training.lr", 1.0e-4)),
         weight_decay=float(get_cfg(cfg, "training.weight_decay", 1.0e-6)),
+        fused=device.type == "cuda",
+    )
+    amp_enabled, amp_dtype = amp_settings(cfg, device)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled and amp_dtype == torch.float16,
+    )
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+    print(
+        f"device: {device} | amp: {amp_enabled}"
+        f" ({str(amp_dtype).removeprefix('torch.') if amp_enabled else 'disabled'})"
     )
 
     train_loader = DataLoader(
@@ -75,6 +87,8 @@ def run_training(cfg: dict[str, Any]) -> Path:
         checkpoint = _torch_load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if checkpoint.get("scaler"):
+            scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_loss = float(checkpoint.get("score", best_loss))
         if best_path.exists():
@@ -82,19 +96,30 @@ def run_training(cfg: dict[str, Any]) -> Path:
         print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
 
     for epoch in range(start_epoch, epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, cfg)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg)
         val_metrics = evaluate(model, val_loader, device, cfg) if val_loader is not None else None
         score = val_metrics["total"] if val_metrics else train_metrics["total"]
 
         print(_format_epoch(epoch, train_metrics, val_metrics))
         if score < best_loss:
             best_loss = score
-            save_checkpoint(best_path, model, optimizer, cfg, normalizers, train_dataset.output_dim, epoch, best_loss)
+            save_checkpoint(
+                best_path,
+                model,
+                optimizer,
+                scaler,
+                cfg,
+                normalizers,
+                train_dataset.output_dim,
+                epoch,
+                best_loss,
+            )
         if save_latest:
             save_checkpoint(
                 output_dir / "latest.pt",
                 model,
                 optimizer,
+                scaler,
                 cfg,
                 normalizers,
                 train_dataset.output_dim,
@@ -106,6 +131,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 output_dir / f"epoch_{epoch:04d}.pt",
                 model,
                 optimizer,
+                scaler,
                 cfg,
                 normalizers,
                 train_dataset.output_dim,
@@ -156,20 +182,31 @@ def build_datasets(cfg: dict[str, Any]) -> tuple[ValveGraphDataset, ValveGraphDa
     return train_dataset, None
 
 
-def train_one_epoch(model, loader, optimizer, device, cfg: dict[str, Any]) -> dict[str, float]:
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    cfg: dict[str, Any],
+) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
     count = 0
     for batch in tqdm(loader, desc="train", leave=False):
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(batch)
-        loss, metrics = valve_loss(pred, batch, cfg)
-        loss.backward()
+        with autocast_context(cfg, device):
+            pred = model(batch)
+            loss, metrics = valve_loss(pred, batch, cfg)
+        scaler.scale(loss).backward()
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
         clip_norm = get_cfg(cfg, "training.grad_clip_norm", None)
         if clip_norm:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(clip_norm))
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         _accumulate(totals, metrics)
         count += 1
     return _average(totals, count)
@@ -184,8 +221,9 @@ def evaluate(model, loader, device, cfg: dict[str, Any]) -> dict[str, float]:
     count = 0
     for batch in tqdm(loader, desc="val", leave=False):
         batch = batch.to(device)
-        pred = model(batch)
-        _, metrics = valve_loss(pred, batch, cfg)
+        with autocast_context(cfg, device):
+            pred = model(batch)
+            _, metrics = valve_loss(pred, batch, cfg)
         _accumulate(totals, metrics)
         count += 1
     return _average(totals, count)
@@ -195,6 +233,7 @@ def save_checkpoint(
     path: Path,
     model,
     optimizer,
+    scaler,
     cfg: dict[str, Any],
     normalizers,
     output_dim: int,
@@ -204,6 +243,7 @@ def save_checkpoint(
     state = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
         "cfg": cfg,
         "normalizers": normalizers.state_dict() if normalizers is not None else None,
         "output_dim": int(output_dim),
@@ -225,6 +265,30 @@ def resolve_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+def autocast_context(cfg: dict[str, Any], device: torch.device):
+    """Return the configured CUDA autocast context."""
+
+    enabled, dtype = amp_settings(cfg, device)
+    return torch.autocast(device_type=device.type, dtype=dtype, enabled=enabled)
+
+
+def amp_settings(
+    cfg: dict[str, Any],
+    device: torch.device,
+) -> tuple[bool, torch.dtype]:
+    enabled = bool(get_cfg(cfg, "training.amp", False)) and device.type == "cuda"
+    dtype_name = str(get_cfg(cfg, "training.amp_dtype", "float16")).lower()
+    dtypes = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if dtype_name not in dtypes:
+        raise ValueError("training.amp_dtype must be float16/fp16 or bfloat16/bf16")
+    return enabled, dtypes[dtype_name]
 
 
 def _accumulate(totals: dict[str, float], metrics: dict[str, float]) -> None:

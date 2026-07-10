@@ -30,6 +30,10 @@ model:
   node_layers: 2
   edge_layers: 2
   decoder_layers: 2
+  do_concat_trick: false
+  num_processor_checkpoint_segments: 3
+  checkpoint_offloading: false
+  recompute_activation: false
 
 training:
   epochs: 30
@@ -41,6 +45,8 @@ training:
   output_dir: outputs/deforming_plate_case
   save_every: 5
   device: auto
+  amp: true
+  amp_dtype: bfloat16
 
 loss:
   delta_u: 1.0
