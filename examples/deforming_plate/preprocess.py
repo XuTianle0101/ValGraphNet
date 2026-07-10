@@ -15,6 +15,48 @@ from valgraphnet.config import get_cfg, load_config
 from .dataset import fit_stats, load_sequences, load_stats, make_graph_sample, save_stats
 
 
+def preprocess_cache_is_compatible(cfg: dict[str, Any], out_dir: str | Path) -> bool:
+    """Return whether every cached split matches graph and data settings."""
+
+    root = Path(out_dir)
+    expected = {
+        "train": (
+            str(get_cfg(cfg, "data.train_split", "train")),
+            int(get_cfg(cfg, "data.num_training_samples", 1000)),
+            int(get_cfg(cfg, "data.num_training_time_steps", 200)),
+        ),
+        "val": (
+            str(get_cfg(cfg, "data.val_split", "valid")),
+            int(get_cfg(cfg, "data.num_validation_samples", 100)),
+            int(get_cfg(cfg, "data.num_validation_time_steps", 200)),
+        ),
+        "test": (
+            str(get_cfg(cfg, "data.test_split", "test")),
+            int(get_cfg(cfg, "data.num_test_samples", 5)),
+            int(get_cfg(cfg, "data.num_test_time_steps", 200)),
+        ),
+    }
+    signature = _cache_signature(cfg)
+    for split_name, (source_split, num_sequences, num_steps) in expected.items():
+        manifest_path = root / split_name / "manifest.json"
+        if not manifest_path.exists():
+            return False
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if manifest.get("source_split") != source_split:
+            return False
+        if int(manifest.get("num_sequences", -1)) != num_sequences:
+            return False
+        if int(manifest.get("num_samples", -1)) != num_sequences * (num_steps - 1):
+            return False
+        if manifest.get("cache_signature") != signature:
+            return False
+    return (root / "edge_stats.pt").exists() and (root / "node_stats.pt").exists()
+
+
 def run_preprocess(cfg: dict[str, Any]) -> Path:
     """Create cached native deforming_plate graph samples and stats."""
 
@@ -121,6 +163,7 @@ def _write_split_cache(
         "source_split": source_split,
         "num_sequences": len(sequences),
         "num_samples": len(entries),
+        "cache_signature": _cache_signature(cfg),
         "entries": entries,
     }
     with (split_dir / "manifest.json").open("w", encoding="utf-8") as f:
@@ -134,6 +177,15 @@ def read_preprocess_stats(
 
     cache = Path(cache_dir)
     return load_stats(cache / "edge_stats.pt"), load_stats(cache / "node_stats.pt")
+
+
+def _cache_signature(cfg: dict[str, Any]) -> dict[str, float | int | None]:
+    max_neighbors = get_cfg(cfg, "graph.max_world_neighbors", None)
+    return {
+        "world_edge_radius": float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
+        "max_world_neighbors": None if max_neighbors is None else int(max_neighbors),
+        "noise_std": float(get_cfg(cfg, "data.noise_std", 0.003)),
+    }
 
 
 def main() -> None:

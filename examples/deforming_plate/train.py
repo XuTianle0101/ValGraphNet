@@ -25,7 +25,7 @@ from .dataset import (
     make_graph_sample,
     save_stats,
 )
-from .preprocess import run_preprocess
+from .preprocess import preprocess_cache_is_compatible, run_preprocess
 
 
 class CachedDeformingPlateDataset(Dataset):
@@ -149,7 +149,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
     if get_cfg(cfg, "data.case_dir", None):
         train_dataset, val_dataset = _build_case_backed_datasets(cfg, cache_dir)
     else:
-        if not (cache_dir / "train" / "manifest.json").exists():
+        if not preprocess_cache_is_compatible(cfg, cache_dir):
             run_preprocess(cfg)
         train_dataset = CachedDeformingPlateDataset(cache_dir, "train")
         val_dataset = CachedDeformingPlateDataset(cache_dir, "val")

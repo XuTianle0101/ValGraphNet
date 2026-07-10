@@ -14,7 +14,7 @@ from valgraphnet.config import get_cfg, load_config
 from valgraphnet.train import resolve_device
 
 from .dataset import denormalize, load_sequences, load_stats, make_graph_sample, rollout_masks
-from .preprocess import run_preprocess
+from .preprocess import preprocess_cache_is_compatible, run_preprocess
 from .train import (
     _build_case_backed_datasets,
     _load_case_sequence,
@@ -36,7 +36,7 @@ def run_rollout_eval(
     )
     if get_cfg(cfg, "data.case_dir", None) and not (cache_dir / "edge_stats.pt").exists():
         _build_case_backed_datasets(cfg, cache_dir)
-    elif not (cache_dir / "edge_stats.pt").exists():
+    elif not preprocess_cache_is_compatible(cfg, cache_dir):
         run_preprocess(cfg)
 
     edge_stats = load_stats(cache_dir / "edge_stats.pt")
