@@ -19,6 +19,15 @@ from valgraphnet.losses import valve_loss
 from valgraphnet.gpu_graph import update_state
 from valgraphnet.model import build_model
 from valgraphnet.normalization import Normalizers, fit_normalizers, split_target
+from valgraphnet.physical_evaluation import validate_reference_protocol
+
+
+ROLLOUT_METRIC_KEYS = (
+    "moving_displacement_relative_rmse",
+    "final_displacement_relative_rmse",
+    "stress_relative_rmse",
+    "stress_p95_relative_rmse",
+)
 
 
 def run_training(cfg: dict[str, Any]) -> Path:
@@ -496,7 +505,10 @@ def evaluate_rollout_metric(
     stress_reference = torch.zeros((), device=device)
     stress_count = torch.zeros((), device=device)
     final_error = torch.zeros((), device=device)
+    final_reference = torch.zeros((), device=device)
     final_count = torch.zeros((), device=device)
+    stress_p95_error = torch.zeros((), device=device)
+    stress_p95_reference = torch.zeros((), device=device)
     max_evaluated_steps = 1
 
     for case_index in tqdm(case_indices, desc="rollout-val", leave=False):
@@ -534,20 +546,30 @@ def evaluate_rollout_metric(
                 stress_error += (stress_residual * stress_residual).sum()
                 stress_reference += (truth_stress * truth_stress).sum()
                 stress_count += stress_residual.numel()
+                threshold = torch.quantile(truth_stress.abs().reshape(-1), 0.95)
+                peak = truth_stress.abs() >= threshold
+                stress_p95_error += (stress_residual[peak] ** 2).sum()
+                stress_p95_reference += (truth_stress[peak] ** 2).sum()
         final_residual = state["U"][free] - tensors["U"][steps, free]
         final_error += (final_residual * final_residual).sum()
+        final_reference += (tensors["U"][steps, free] ** 2).sum()
         final_count += final_residual.numel()
 
     eps = torch.tensor(1.0e-12, device=device)
     displacement_rmse = torch.sqrt(u_error / u_count.clamp_min(1.0))
     displacement_relative = torch.sqrt(u_error / u_reference.clamp_min(eps))
     final_rmse = torch.sqrt(final_error / final_count.clamp_min(1.0))
+    final_relative = torch.sqrt(final_error / final_reference.clamp_min(eps))
     if bool((stress_count > 0).item()):
         stress_rmse = torch.sqrt(stress_error / stress_count)
         stress_relative = torch.sqrt(stress_error / stress_reference.clamp_min(eps))
+        stress_p95_relative = torch.sqrt(
+            stress_p95_error / stress_p95_reference.clamp_min(eps)
+        )
     else:
         stress_rmse = torch.zeros((), device=device)
         stress_relative = torch.zeros((), device=device)
+        stress_p95_relative = torch.zeros((), device=device)
     stress_weight = float(
         get_cfg(cfg, "training.rollout_checkpoint_stress_weight", 0.1)
     )
@@ -568,18 +590,85 @@ def evaluate_rollout_metric(
         reference_u_rms, rollout_scale.clamp_min(eps)
     )
     stress_normalized = stress_rmse / stress_scale.clamp_min(eps)
-    score = displacement_normalized + stress_weight * stress_normalized
-    return {
-        "score": float(score.item()),
+    weighted_score = displacement_normalized + stress_weight * stress_normalized
+    result = {
         "displacement_rmse": float(displacement_rmse.item()),
         "displacement_relative_rmse": float(displacement_relative.item()),
+        "moving_displacement_relative_rmse": float(displacement_relative.item()),
         "displacement_normalized_rmse": float(displacement_normalized.item()),
         "final_displacement_rmse": float(final_rmse.item()),
+        "final_displacement_relative_rmse": float(final_relative.item()),
         "stress_rmse": float(stress_rmse.item()),
         "stress_relative_rmse": float(stress_relative.item()),
+        "stress_p95_relative_rmse": float(stress_p95_relative.item()),
         "stress_normalized_rmse": float(stress_normalized.item()),
         "cases": float(case_count),
     }
+    score_mode = str(
+        get_cfg(cfg, "training.rollout_checkpoint_score_mode", "weighted_sum")
+    ).lower()
+    if score_mode == "four_metric_native_ratio_minimax":
+        reference = _load_rollout_native_reference(cfg)
+        ratios = {
+            key: result[key] / reference[key] for key in ROLLOUT_METRIC_KEYS
+        }
+        result.update({f"native_ratio_{key}": value for key, value in ratios.items()})
+        result["score"] = max(ratios.values())
+    elif score_mode == "weighted_sum":
+        result["score"] = float(weighted_score.item())
+    else:
+        raise ValueError(
+            "training.rollout_checkpoint_score_mode must be weighted_sum or "
+            "four_metric_native_ratio_minimax"
+        )
+    return result
+
+
+def _load_rollout_native_reference(cfg: dict[str, Any]) -> dict[str, float]:
+    """Load the exact validation-only native artifact used for checkpointing."""
+
+    path = get_cfg(cfg, "validation.native_reference_file", None)
+    if not path:
+        raise ValueError(
+            "four_metric_native_ratio_minimax requires "
+            "validation.native_reference_file"
+        )
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    steps = get_cfg(cfg, "training.rollout_validation_steps", None)
+    validate_reference_protocol(
+        payload,
+        split_file=get_cfg(cfg, "data.split_file"),
+        split=str(get_cfg(cfg, "data.val_split", "val")),
+        case_count=int(get_cfg(cfg, "training.rollout_validation_cases", 20)),
+        frame_count=None if steps is None else int(steps) + 1,
+        case_selection="even",
+    )
+    values: Any = payload
+    for container in ("summary", "aggregate", "rollout"):
+        if isinstance(values, dict) and isinstance(values.get(container), dict):
+            values = values[container]
+            break
+    aliases = {
+        "moving_displacement_relative_rmse": ("displacement_relative_rmse",),
+        "final_displacement_relative_rmse": ("final_relative_rmse",),
+        "stress_p95_relative_rmse": ("p95_stress_relative_rmse",),
+    }
+    reference: dict[str, float] = {}
+    for key in ROLLOUT_METRIC_KEYS:
+        value = values.get(key)
+        for alias in aliases.get(key, ()):
+            if value is None:
+                value = values.get(alias)
+        if value is None:
+            raise KeyError(f"native validation reference is missing {key}")
+        numeric = float(value)
+        if not np.isfinite(numeric) or numeric <= 0.0:
+            raise ValueError(
+                f"native validation reference {key} must be finite and positive"
+            )
+        reference[key] = numeric
+    return reference
 
 
 def _rollout_validation_due(

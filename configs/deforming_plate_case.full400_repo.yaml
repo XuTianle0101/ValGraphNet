@@ -55,7 +55,7 @@ training:
   rollout_validation_cases: 20
   rollout_validation_steps: 399
   rollout_validation_every: 3
-  rollout_checkpoint_stress_weight: 1.0
+  rollout_checkpoint_score_mode: four_metric_native_ratio_minimax
   checkpoint_metric: rollout
   batch_size: 1
   num_workers: 0
@@ -71,6 +71,9 @@ training:
   device: cuda
   amp: true
   amp_dtype: bfloat16
+
+validation:
+  native_reference_file: outputs/deforming_plate_chp_evidence/native_val20/metrics.json
 
 loss:
   delta_u: 1.0
