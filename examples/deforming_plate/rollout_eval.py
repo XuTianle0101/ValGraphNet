@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from valgraphnet.config import get_cfg, load_config
+from valgraphnet.physical_evaluation import select_case_ids
 from valgraphnet.train import resolve_device
 
 from .dataset import denormalize, load_sequences, load_stats, make_graph_sample, rollout_masks
@@ -30,6 +31,10 @@ def run_rollout_eval(
     cfg: dict[str, Any],
     checkpoint_path: str | Path,
     out_dir: str | Path | None = None,
+    *,
+    split: str | None = None,
+    max_cases: int | None = None,
+    case_selection: str = "head",
 ) -> Path:
     """Run native deforming_plate rollout evaluation and write metrics/artifacts."""
 
@@ -74,7 +79,12 @@ def run_rollout_eval(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    sequences = _load_rollout_sequences(ckpt_cfg)
+    sequences = _load_rollout_sequences(
+        ckpt_cfg,
+        split=split,
+        max_cases=max_cases,
+        case_selection=case_selection,
+    )
     print(f"rollout sequences loaded: {len(sequences)}", flush=True)
 
     all_metrics = []
@@ -113,19 +123,32 @@ def run_rollout_eval(
     return output_dir
 
 
-def _load_rollout_sequences(cfg: dict[str, Any]):
+def _load_rollout_sequences(
+    cfg: dict[str, Any],
+    *,
+    split: str | None = None,
+    max_cases: int | None = None,
+    case_selection: str = "head",
+):
     if get_cfg(cfg, "data.case_dir", None):
         from valgraphnet.data.case import read_split_file
 
         case_root = Path(get_cfg(cfg, "data.case_dir"))
         split_file = Path(get_cfg(cfg, "data.case_split_file", case_root / "splits.json"))
-        case_ids = read_split_file(split_file, str(get_cfg(cfg, "data.test_case_split", "test")))
-        limit = int(get_cfg(cfg, "data.num_test_samples", len(case_ids)))
-        return [_load_case_sequence(str(case_root / case_id)) for case_id in case_ids[:limit]]
+        selected_split = split or str(get_cfg(cfg, "data.test_case_split", "test"))
+        case_ids = read_split_file(split_file, selected_split)
+        configured_limit = int(get_cfg(cfg, "data.num_test_samples", len(case_ids)))
+        limit = configured_limit if max_cases is None else int(max_cases)
+        case_ids = select_case_ids(case_ids, limit, case_selection)
+        return [_load_case_sequence(str(case_root / case_id)) for case_id in case_ids]
+    selected_split = split or str(get_cfg(cfg, "data.test_split", "test"))
+    limit = int(get_cfg(cfg, "data.num_test_samples", 5))
+    if max_cases is not None:
+        limit = int(max_cases)
     return load_sequences(
         data_dir=get_cfg(cfg, "data.data_dir"),
-        split=str(get_cfg(cfg, "data.test_split", "test")),
-        num_samples=int(get_cfg(cfg, "data.num_test_samples", 5)),
+        split=selected_split,
+        num_samples=limit,
         num_steps=int(get_cfg(cfg, "data.num_test_time_steps", 200)),
     )
 
@@ -297,9 +320,19 @@ def main() -> None:
     parser.add_argument("--config", default="examples/deforming_plate/config.yaml")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--split", default=None)
+    parser.add_argument("--max-cases", type=int, default=None)
+    parser.add_argument("--case-selection", choices=("head", "even"), default="head")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    out = run_rollout_eval(cfg, args.checkpoint, args.out)
+    out = run_rollout_eval(
+        cfg,
+        args.checkpoint,
+        args.out,
+        split=args.split,
+        max_cases=args.max_cases,
+        case_selection=args.case_selection,
+    )
     print(f"rollout evaluation written to: {out}")
 
 

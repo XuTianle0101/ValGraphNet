@@ -152,4 +152,7 @@ validation:
   divergence_position: 10.0
   minimum_predicted_j: 1.0e-4
   maximum_predicted_i2_bar: 1.0e6
-  native_reference_file: outputs/deforming_plate_chp_evidence/native/metrics.json
+  require_native_reference_provenance: true
+  native_reference_split: val
+  native_reference_case_selection: even
+  native_reference_file: outputs/deforming_plate_chp_evidence/native_val20/metrics.json

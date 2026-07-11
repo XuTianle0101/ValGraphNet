@@ -1,11 +1,15 @@
 from types import SimpleNamespace
+import json
 
 import numpy as np
+import pytest
 
 from valgraphnet.physical_evaluation import (
     ErrorSums,
     compare_experiments,
     evaluate_prediction,
+    select_case_ids,
+    validate_reference_protocol,
 )
 
 
@@ -103,3 +107,56 @@ def test_paired_bootstrap_requires_every_metric_to_improve():
         interval["ci95_low"] > 0
         for interval in comparison["paired_bootstrap"].values()
     )
+
+
+def test_native_reference_protocol_requires_same_even_validation_subset(tmp_path):
+    split_file = tmp_path / "splits.json"
+    val_ids = [f"val_{index:05d}" for index in range(100)]
+    split_file.write_text(
+        json.dumps({"val": val_ids, "test": ["test_00000"]}),
+        encoding="utf-8",
+    )
+    expected = select_case_ids(val_ids, 20, "even")
+    payload = {
+        "evaluation": {"split": "val"},
+        "per_case": [
+            {"case_id": case_id, "evaluated_frames": 400}
+            for case_id in expected
+        ],
+    }
+    validate_reference_protocol(
+        payload,
+        split_file=split_file,
+        split="val",
+        case_count=20,
+        frame_count=400,
+        case_selection="even",
+    )
+
+    leaked = {**payload, "evaluation": {"split": "test"}}
+    with pytest.raises(ValueError, match="split mismatch"):
+        validate_reference_protocol(
+            leaked,
+            split_file=split_file,
+            split="val",
+            case_count=20,
+            frame_count=400,
+            case_selection="even",
+        )
+
+    wrong_subset = {
+        **payload,
+        "per_case": [
+            {"case_id": case_id, "evaluated_frames": 400}
+            for case_id in val_ids[:20]
+        ],
+    }
+    with pytest.raises(ValueError, match="case set"):
+        validate_reference_protocol(
+            wrong_subset,
+            split_file=split_file,
+            split="val",
+            case_count=20,
+            frame_count=400,
+            case_selection="even",
+        )

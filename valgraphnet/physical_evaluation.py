@@ -21,6 +21,26 @@ PRIMARY_METRICS = (
 )
 
 
+def select_case_ids(
+    case_ids: list[str],
+    max_cases: int | None,
+    selection: str = "head",
+) -> list[str]:
+    """Select a deterministic trajectory subset for protocol-aligned evaluation."""
+
+    if max_cases is None or int(max_cases) >= len(case_ids):
+        return list(case_ids)
+    count = max(int(max_cases), 0)
+    if count == 0:
+        return []
+    if selection == "head":
+        return list(case_ids[:count])
+    if selection == "even":
+        indices = np.linspace(0, len(case_ids) - 1, num=count).round().astype(np.int64)
+        return [case_ids[int(index)] for index in indices]
+    raise ValueError(f"unsupported case selection: {selection}")
+
+
 @dataclass
 class ErrorSums:
     u_error: float = 0.0
@@ -156,12 +176,15 @@ def evaluate_prediction_directory(
     prediction_root: str | Path,
     *,
     output_path: str | Path | None = None,
+    max_cases: int | None = None,
+    case_selection: str = "head",
 ) -> dict[str, Any]:
     """Evaluate standardized ``<case>/U_pred.npy,S_pred.npy`` artifacts."""
 
     case_root = Path(case_root)
     prediction_root = Path(prediction_root)
     case_ids = read_split_file(split_file, split)
+    case_ids = select_case_ids(case_ids, max_cases, case_selection)
     total = ErrorSums()
     per_case: list[dict[str, float]] = []
     raw_sums: list[ErrorSums] = []
@@ -185,6 +208,12 @@ def evaluate_prediction_directory(
     summary["missing_cases"] = float(len(missing))
     result: dict[str, Any] = {
         "schema_version": 1,
+        "evaluation": {
+            "split": str(split),
+            "case_selection": str(case_selection),
+            "requested_case_ids": list(case_ids),
+            "evaluated_case_ids": [value["case_id"] for value in per_case],
+        },
         "metric_definition": {
             "displacement_mask": "~(fixed|prescribed)",
             "stress_mask": "~prescribed",
@@ -199,6 +228,48 @@ def evaluate_prediction_directory(
     if output_path is not None:
         _write_json(Path(output_path), result)
     return result
+
+
+def validate_reference_protocol(
+    payload: dict[str, Any],
+    *,
+    split_file: str | Path,
+    split: str,
+    case_count: int,
+    frame_count: int | None = None,
+    case_selection: str = "even",
+) -> None:
+    """Reject checkpoint references evaluated on a different development set."""
+
+    evaluation = payload.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ValueError("native reference is missing evaluation provenance")
+    actual_split = str(evaluation.get("split", ""))
+    if actual_split != str(split):
+        raise ValueError(
+            f"native reference split mismatch: expected {split!r}, got {actual_split!r}"
+        )
+    expected_ids = select_case_ids(
+        read_split_file(split_file, split),
+        case_count,
+        case_selection,
+    )
+    actual_ids = [str(value.get("case_id")) for value in payload.get("per_case", [])]
+    if actual_ids != expected_ids:
+        raise ValueError(
+            "native reference case set does not match the ordered validation subset"
+        )
+    if frame_count is not None:
+        wrong_frames = [
+            value.get("case_id")
+            for value in payload.get("per_case", [])
+            if int(value.get("evaluated_frames", -1)) != int(frame_count)
+        ]
+        if wrong_frames:
+            raise ValueError(
+                "native reference frame count does not match validation: "
+                + ", ".join(map(str, wrong_frames[:3]))
+            )
 
 
 def compare_experiments(

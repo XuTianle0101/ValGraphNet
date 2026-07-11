@@ -210,5 +210,6 @@ def run_chp_rollouts(
         selected_split,
         output,
         output_path=output / "metrics.json",
+        max_cases=max_cases,
     )
     return {"manifest": manifest, "metrics": metrics}

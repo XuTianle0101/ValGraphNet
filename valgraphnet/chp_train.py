@@ -30,6 +30,7 @@ from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
 from valgraphnet.data.case import ValveCase
 from valgraphnet.mechanics import deformation_gradient, invariants
+from valgraphnet.physical_evaluation import validate_reference_protocol
 from valgraphnet.stress_transform import AsinhStressTransform, robust_stress_loss
 
 
@@ -722,13 +723,33 @@ def load_native_reference(cfg: dict[str, Any]) -> dict[str, float] | None:
     if path:
         with Path(path).open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        for container in ("rollout", "summary", "aggregate"):
-            if container in payload and isinstance(payload[container], dict):
-                payload = payload[container]
-                break
         inline = payload
     if not inline:
         return None
+    source_payload = inline
+    if bool(get_cfg(cfg, "validation.require_native_reference_provenance", False)):
+        steps = get_cfg(cfg, "validation.steps", None)
+        validate_reference_protocol(
+            source_payload,
+            split_file=get_cfg(cfg, "data.split_file"),
+            split=str(
+                get_cfg(
+                    cfg,
+                    "validation.native_reference_split",
+                    get_cfg(cfg, "data.val_split", "val"),
+                )
+            ),
+            case_count=int(get_cfg(cfg, "validation.cases", 20)),
+            frame_count=None if steps is None else int(steps) + 1,
+            case_selection=str(
+                get_cfg(cfg, "validation.native_reference_case_selection", "even")
+            ),
+        )
+    inline = source_payload
+    for container in ("rollout", "summary", "aggregate"):
+        if container in inline and isinstance(inline[container], dict):
+            inline = inline[container]
+            break
     missing = [key for key in ROLLOUT_METRIC_KEYS if key not in inline]
     if missing:
         raise ValueError(f"native checkpoint reference is missing: {missing}")

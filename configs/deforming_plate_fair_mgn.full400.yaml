@@ -63,8 +63,10 @@ validation:
   cases: 20
   steps: 399
   divergence_position: 10.0
-  # The frozen experiment fails fast until the full-400 native reference is
-  # provided, preventing a raw weighted/checkpoint score from being reported as
-  # the required native-ratio minimax score.
+  # Checkpoint selection must use the same evenly spaced val20 trajectories as
+  # this evaluator. Test metrics are rejected as development references.
   require_native_reference: true
-  native_reference_file: outputs/deforming_plate_chp_evidence/native/metrics.json
+  require_native_reference_provenance: true
+  native_reference_split: val
+  native_reference_case_selection: even
+  native_reference_file: outputs/deforming_plate_chp_evidence/native_val20/metrics.json

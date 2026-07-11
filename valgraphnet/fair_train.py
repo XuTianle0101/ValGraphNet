@@ -27,6 +27,7 @@ from valgraphnet.fair_baseline import (
     integrate_position_delta,
 )
 from valgraphnet.normalization import Normalizers, fit_normalizers
+from valgraphnet.physical_evaluation import validate_reference_protocol
 from valgraphnet.stress_transform import AsinhStressTransform, robust_stress_loss
 from valgraphnet.train import build_datasets
 
@@ -429,6 +430,25 @@ def load_native_reference(cfg: dict[str, Any]) -> dict[str, float]:
         if bool(get_cfg(cfg, "validation.require_native_reference", False)):
             raise ValueError("validation.native_reference(_file) is required")
         payload = {key: 1.0 for key in ROLLOUT_METRIC_KEYS}
+    source_payload = payload
+    if bool(get_cfg(cfg, "validation.require_native_reference_provenance", False)):
+        steps = get_cfg(cfg, "validation.steps", None)
+        validate_reference_protocol(
+            source_payload,
+            split_file=get_cfg(cfg, "data.split_file"),
+            split=str(
+                get_cfg(
+                    cfg,
+                    "validation.native_reference_split",
+                    get_cfg(cfg, "data.val_split", "val"),
+                )
+            ),
+            case_count=int(get_cfg(cfg, "validation.cases", 20)),
+            frame_count=None if steps is None else int(steps) + 1,
+            case_selection=str(
+                get_cfg(cfg, "validation.native_reference_case_selection", "even")
+            ),
+        )
     for container in ("summary", "aggregate", "rollout"):
         if container in payload and isinstance(payload[container], dict):
             payload = payload[container]
