@@ -100,6 +100,21 @@ def test_native_reference_loads_shared_evaluator_summary(tmp_path):
     ) == values
 
 
+def test_absolute_validation_mode_rejects_native_reference_leakage():
+    assert load_native_reference(
+        {"validation": {"checkpoint_reference_mode": "absolute_validation"}}
+    ) is None
+    with pytest.raises(ValueError, match="forbids native references"):
+        load_native_reference(
+            {
+                "validation": {
+                    "checkpoint_reference_mode": "absolute_validation",
+                    "native_reference": {"moving_relative_rmse": 1.0},
+                }
+            }
+        )
+
+
 def test_normalizers_are_finite_invertible_and_do_not_clip_stress():
     displacement = np.zeros((5, 4, 3), dtype=np.float32)
     for frame in range(5):

@@ -50,6 +50,7 @@ class CHPNormalizers:
     velocity_scale: torch.Tensor
     stress: AsinhStressTransform
     acceleration_scale: torch.Tensor | None = None
+    cell_stress: AsinhStressTransform | None = None
 
     def __post_init__(self) -> None:
         if self.acceleration_scale is None:
@@ -61,6 +62,9 @@ class CHPNormalizers:
             velocity_scale=self.velocity_scale.to(device),
             stress=self.stress.to(device),
             acceleration_scale=self.acceleration_scale.to(device),
+            cell_stress=(
+                self.cell_stress.to(device) if self.cell_stress is not None else None
+            ),
         )
 
     def state_dict(self) -> dict[str, Any]:
@@ -69,6 +73,9 @@ class CHPNormalizers:
             "velocity_scale": self.velocity_scale.cpu(),
             "acceleration_scale": self.acceleration_scale.cpu(),
             "stress": self.stress.state_dict(),
+            "cell_stress": (
+                self.cell_stress.state_dict() if self.cell_stress is not None else None
+            ),
         }
 
     @classmethod
@@ -81,6 +88,11 @@ class CHPNormalizers:
             acceleration_scale=state.get(
                 "acceleration_scale", velocity_scale
             ).float(),
+            cell_stress=(
+                AsinhStressTransform.from_state_dict(state["cell_stress"])
+                if state.get("cell_stress") is not None
+                else None
+            ),
         )
 
 
@@ -94,6 +106,7 @@ class CHPDeviceCase:
     displacement: torch.Tensor
     velocity: torch.Tensor
     stress: torch.Tensor
+    cell_stress: torch.Tensor
     normals: torch.Tensor
     nodal_area: torch.Tensor
     pressure_mask: torch.Tensor
@@ -169,6 +182,9 @@ class CHPCaseCache:
             ),
             velocity=self._tensor(case.velocity[frame_slice], self.device, torch.float32),
             stress=self._tensor(case.stress[frame_slice], self.device, torch.float32),
+            cell_stress=self._tensor(
+                case.cell_stress[frame_slice], self.device, torch.float32
+            ),
             normals=self._tensor(case.normals, self.device, torch.float32),
             nodal_area=self._tensor(case.nodal_area, self.device, torch.float32),
             pressure_mask=self._tensor(case.pressure_mask, self.device, torch.bool),
@@ -249,12 +265,25 @@ def fit_chp_normalizers(
     velocity_samples: list[torch.Tensor] = []
     acceleration_samples: list[torch.Tensor] = []
     stress_samples: list[torch.Tensor] = []
+    cell_stress_samples: list[torch.Tensor] = []
     for case_index in case_indices:
         case = cases[int(case_index)]
         frame_count = min(max(int(frames_per_case), 1), case.num_steps - 1)
         frames = np.linspace(0, case.num_steps - 2, frame_count).round().astype(int)
         node_count = min(max(int(nodes_per_frame), 1), case.num_nodes)
         nodes = np.linspace(0, case.num_nodes - 1, node_count).round().astype(int)
+        raw_cell_stress = np.asarray(
+            getattr(case, "cell_stress", np.empty((case.num_steps, 0, 0))),
+            dtype=np.float32,
+        )
+        has_cell_stress = _case_has_cell_stress_tensor(case)
+        if has_cell_stress:
+            cell_count = min(max(int(nodes_per_frame), 1), raw_cell_stress.shape[1])
+            cells = (
+                np.linspace(0, raw_cell_stress.shape[1] - 1, cell_count)
+                .round()
+                .astype(int)
+            )
         moving = ~(
             np.asarray(
                 getattr(case, "fixed_mask", np.zeros(case.num_nodes, dtype=bool)),
@@ -311,6 +340,12 @@ def fit_chp_normalizers(
                         np.array(case.stress[frame + 1, nodes, :1], copy=True)
                     ).float()
                 )
+            if has_cell_stress:
+                cell_stress_samples.append(
+                    torch.from_numpy(
+                        np.array(raw_cell_stress[frame + 1, cells, :], copy=True)
+                    ).float()
+                )
     if not stress_samples:
         raise ValueError("CHP-GNS requires at least one nodal stress label channel")
     if not acceleration_samples:
@@ -323,11 +358,42 @@ def fit_chp_normalizers(
     # A scalar scale preserves rotational invariance of the acceleration loss.
     acceleration_scale = acceleration_values.square().mean().sqrt().clamp_min(1.0e-8)
     stress = AsinhStressTransform.fit(stress_samples)
+    cell_stress = (
+        AsinhStressTransform.fit(cell_stress_samples)
+        if cell_stress_samples
+        else None
+    )
     return CHPNormalizers(
         displacement_scale=displacement_scale,
         velocity_scale=velocity_scale,
         stress=stress,
         acceleration_scale=acceleration_scale,
+        cell_stress=cell_stress,
+    )
+
+
+def _case_has_cell_stress_tensor(case: ValveCase | Any) -> bool:
+    """Return whether a case carries canonical ``[T, M, 6]`` stress labels."""
+
+    cell_stress = np.asarray(
+        getattr(case, "cell_stress", np.empty((0, 0, 0))),
+    )
+    num_steps = int(getattr(case, "num_steps", cell_stress.shape[0] or 0))
+    if hasattr(case, "num_cells"):
+        num_cells = int(case.num_cells)
+    else:
+        cells = np.asarray(getattr(case, "cells", np.empty((0, 4))))
+        num_cells = int(cells.shape[0])
+    return cell_stress.shape == (num_steps, num_cells, 6) and num_cells > 0
+
+
+def _trajectory_has_cell_stress_tensor(trajectory: CHPDeviceCase) -> bool:
+    return (
+        trajectory.cell_stress.ndim == 3
+        and trajectory.cell_stress.shape[0] == trajectory.times.shape[0]
+        and trajectory.cell_stress.shape[1] == trajectory.static.cells.shape[0]
+        and trajectory.cell_stress.shape[2] == 6
+        and trajectory.cell_stress.shape[1] > 0
     )
 
 
@@ -596,29 +662,15 @@ def chp_step_loss(
     stress_mask = ~static.prescribed_mask
     if not bool(stress_mask.any().item()):
         stress_mask = torch.ones_like(static.prescribed_mask)
-    stress_target = trajectory.stress[next_step, stress_mask, :1]
-    stress_prediction = output.nodal_stress[stress_mask, :1]
-    transformed_prediction = normalizers.stress.transform(stress_prediction)
-    transformed_target = normalizers.stress.transform(stress_target)
-    stress_loss, stress_parts = robust_stress_loss(
-        transformed_prediction,
-        transformed_target,
-        ranking_target=stress_target,
-        peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
-        peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
-        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    stress_loss, stress_parts = _supervised_constitutive_loss(
+        output.nodal_stress,
+        output.cell_stress_tensor,
+        trajectory,
+        next_step,
+        normalizers,
+        cfg,
+        nodal_mask=stress_mask,
     )
-    physical_scale = normalizers.stress.reference_scale.to(
-        stress_prediction.device, stress_prediction.dtype
-    ).clamp_min(1.0e-8)
-    stress_physical = F.huber_loss(
-        (stress_prediction - stress_target) / physical_scale,
-        torch.zeros_like(stress_prediction),
-        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
-    )
-    stress_loss = stress_loss + float(
-        get_cfg(cfg, "loss.stress_physical_weight", 0.25)
-    ) * stress_physical
 
     diagnostics = output.energy_diagnostics
     work_scale = (
@@ -663,7 +715,14 @@ def chp_step_loss(
         "stress": stress_loss.detach(),
         "stress_base": stress_parts["stress_base"],
         "stress_peak": stress_parts["stress_peak"],
-        "stress_physical": stress_physical.detach(),
+        "stress_physical": stress_parts["stress_physical"],
+        "stress_tensor_supervision": stress_parts["stress_tensor_supervision"],
+        "stress_tensor_relative_rmse": stress_parts.get(
+            "stress_tensor_relative_rmse", stress_loss.new_zeros(())
+        ),
+        "stress_tensor_vm_relative_rmse": stress_parts.get(
+            "stress_tensor_vm_relative_rmse", stress_loss.new_zeros(())
+        ),
         "work_energy": work_loss.detach(),
         "penetration": penetration_loss.detach(),
         "residual": residual_loss.detach(),
@@ -720,11 +779,29 @@ def minimax_checkpoint_score(
 def load_native_reference(cfg: dict[str, Any]) -> dict[str, float] | None:
     inline = get_cfg(cfg, "validation.native_reference", None)
     path = get_cfg(cfg, "validation.native_reference_file", None)
+    reference_mode = str(
+        get_cfg(cfg, "validation.checkpoint_reference_mode", "auto")
+    ).lower()
+    if reference_mode == "absolute_validation":
+        if inline or path:
+            raise ValueError(
+                "absolute_validation checkpoint selection forbids native references"
+            )
+        return None
+    if reference_mode not in {"auto", "native_validation"}:
+        raise ValueError(
+            "validation.checkpoint_reference_mode must be auto, "
+            "absolute_validation, or native_validation"
+        )
     if path:
         with Path(path).open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         inline = payload
     if not inline:
+        if reference_mode == "native_validation":
+            raise ValueError(
+                "native_validation checkpoint selection requires a validation reference artifact"
+            )
         return None
     source_payload = inline
     if bool(get_cfg(cfg, "validation.require_native_reference_provenance", False)):
@@ -772,7 +849,7 @@ def calibrate_constitutive_modulus(
     cases: list[ValveCase],
     cache: CHPCaseCache,
     cfg: dict[str, Any],
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Fit the train-only physical modulus by a closed-form least-squares step."""
 
     model.eval()
@@ -790,6 +867,8 @@ def calibrate_constitutive_modulus(
     frame_moments: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     admissible_frames = 0
     requested_frames = 0
+    tensor_frames = 0
+    scalar_frames = 0
     for case_index_value in tqdm(
         case_indices, desc="constitutive-scale", leave=False
     ):
@@ -810,14 +889,20 @@ def calibrate_constitutive_modulus(
                 trajectory.static, exact_position, cfg
             ):
                 continue
-            prediction, _ = model.nodal_stress_at(
+            nodal_prediction, cell_prediction = model.nodal_stress_at(
                 trajectory.static, exact_position
             )
             mask = ~trajectory.static.prescribed_mask
             if not bool(mask.any().item()):
                 mask = torch.ones_like(mask)
-            prediction = prediction[mask, :1].float()
-            target = trajectory.stress[frame, mask, :1].float()
+            if _trajectory_has_cell_stress_tensor(trajectory):
+                prediction = _cauchy_to_tensor6(cell_prediction).float()
+                target = trajectory.cell_stress[frame].float()
+                tensor_frames += 1
+            else:
+                prediction = nodal_prediction[mask, :1].float()
+                target = trajectory.stress[frame, mask, :1].float()
+                scalar_frames += 1
             if not bool(
                 (torch.isfinite(prediction).all() & torch.isfinite(target).all()).item()
             ):
@@ -899,6 +984,12 @@ def calibrate_constitutive_modulus(
         "admissible_frames": float(admissible_frames),
         "requested_frames": float(requested_frames),
         "admissible_coverage": float(admissible_frames / max(requested_frames, 1)),
+        "stress_source": (
+            "cell_tensor" if tensor_frames else "nodal_scalar_vm_fallback"
+        ),
+        "cell_tensor_frames": float(tensor_frames),
+        "nodal_scalar_frames": float(scalar_frames),
+        "cell_tensor_coverage": float(tensor_frames / max(admissible_frames, 1)),
     }
 
 
@@ -932,9 +1023,158 @@ def _exact_constitutive_loss(
     return total, {
         "loss": total.detach(),
         "stress_transformed": transformed.detach(),
+        "stress_base": parts["stress_base"],
         "stress_physical": physical.detach(),
         "stress_peak": parts["stress_peak"],
+        "stress_tensor_supervision": total.new_zeros(()).detach(),
     }
+
+
+def _cauchy_to_tensor6(stress: torch.Tensor) -> torch.Tensor:
+    """Convert ``[..., 3, 3]`` stress to canonical 11,22,33,12,13,23 order."""
+
+    if stress.shape[-2:] != (3, 3):
+        raise ValueError(f"cell stress must end in [3, 3], got {tuple(stress.shape)}")
+    return torch.stack(
+        (
+            stress[..., 0, 0],
+            stress[..., 1, 1],
+            stress[..., 2, 2],
+            0.5 * (stress[..., 0, 1] + stress[..., 1, 0]),
+            0.5 * (stress[..., 0, 2] + stress[..., 2, 0]),
+            0.5 * (stress[..., 1, 2] + stress[..., 2, 1]),
+        ),
+        dim=-1,
+    )
+
+
+def _tensor6_von_mises(stress: torch.Tensor) -> torch.Tensor:
+    """Von-Mises stress for canonical 11,22,33,12,13,23 tensors."""
+
+    if stress.shape[-1] != 6:
+        raise ValueError(f"canonical cell stress must end in 6, got {tuple(stress.shape)}")
+    s11, s22, s33, s12, s13, s23 = stress.unbind(dim=-1)
+    squared = (
+        0.5
+        * ((s11 - s22).square() + (s22 - s33).square() + (s33 - s11).square())
+        + 3.0 * (s12.square() + s13.square() + s23.square())
+    )
+    squared = squared.clamp_min(0.0)
+    eps = squared.new_tensor(torch.finfo(squared.dtype).eps)
+    return torch.sqrt(squared + eps) - torch.sqrt(eps)
+
+
+def _cell_tensor_constitutive_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Signed tensor loss with a derived, constitutively consistent VM auxiliary."""
+
+    if normalizers.cell_stress is None:
+        raise ValueError("cell tensor labels require a fitted cell-stress normalizer")
+    prediction6 = _cauchy_to_tensor6(prediction)
+    if target.shape != prediction6.shape:
+        raise ValueError(
+            "cell tensor target must match the predicted canonical tensor: "
+            f"{tuple(target.shape)} != {tuple(prediction6.shape)}"
+        )
+    target = target.to(prediction6.dtype)
+    target_vm = _tensor6_von_mises(target)
+    prediction_vm = _tensor6_von_mises(prediction6)
+    tensor_transform = normalizers.cell_stress
+    transformed_prediction = tensor_transform.transform(prediction6)
+    transformed_target = tensor_transform.transform(target)
+    huber_delta = float(get_cfg(cfg, "loss.huber_delta", 1.0))
+    tensor_base = F.huber_loss(
+        transformed_prediction,
+        transformed_target,
+        delta=huber_delta,
+    )
+    peak_fraction = float(get_cfg(cfg, "loss.peak_fraction", 0.1))
+    peak_weight = float(get_cfg(cfg, "loss.peak_weight", 0.5))
+    if target.shape[0] and peak_fraction > 0.0 and peak_weight > 0.0:
+        peak_count = max(1, min(target.shape[0], round(target.shape[0] * peak_fraction)))
+        peak_cells = target_vm.detach().abs().topk(int(peak_count)).indices
+        tensor_peak = F.huber_loss(
+            transformed_prediction[peak_cells],
+            transformed_target[peak_cells],
+            delta=huber_delta,
+        )
+    else:
+        tensor_peak = tensor_base.new_zeros(())
+    tensor_transformed = tensor_base + peak_weight * tensor_peak
+    tensor_scale = tensor_transform.reference_scale.to(
+        prediction6.device, prediction6.dtype
+    ).clamp_min(1.0e-8)
+    tensor_physical = F.huber_loss(
+        (prediction6 - target) / tensor_scale,
+        torch.zeros_like(prediction6),
+        delta=huber_delta,
+    )
+    tensor_loss = tensor_transformed + float(
+        get_cfg(cfg, "loss.stress_physical_weight", 0.25)
+    ) * tensor_physical
+
+    vm_prediction = prediction_vm[:, None]
+    vm_target = target_vm[:, None]
+    vm_loss, _ = robust_stress_loss(
+        normalizers.stress.transform(vm_prediction),
+        normalizers.stress.transform(vm_target),
+        ranking_target=vm_target,
+        peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
+        peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    total = tensor_loss + float(get_cfg(cfg, "loss.cell_vm_weight", 0.25)) * vm_loss
+    eps = prediction6.new_tensor(1.0e-12)
+    tensor_relative = torch.sqrt(
+        (prediction6 - target).square().sum() / target.square().sum().clamp_min(eps)
+    )
+    vm_relative = torch.sqrt(
+        (prediction_vm - target_vm).square().sum()
+        / target_vm.square().sum().clamp_min(eps)
+    )
+    return total, {
+        "loss": total.detach(),
+        "stress_transformed": tensor_transformed.detach(),
+        "stress_base": tensor_base.detach(),
+        "stress_physical": tensor_physical.detach(),
+        "stress_peak": tensor_peak.detach(),
+        "stress_tensor": tensor_loss.detach(),
+        "stress_tensor_vm": vm_loss.detach(),
+        "stress_tensor_relative_rmse": tensor_relative.detach(),
+        "stress_tensor_vm_relative_rmse": vm_relative.detach(),
+        "stress_tensor_supervision": total.new_ones(()).detach(),
+    }
+
+
+def _supervised_constitutive_loss(
+    nodal_prediction: torch.Tensor,
+    cell_prediction: torch.Tensor,
+    trajectory: CHPDeviceCase,
+    frame: int,
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+    *,
+    nodal_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prefer complete cell tensors, with an explicit nodal-VM fallback."""
+
+    if _trajectory_has_cell_stress_tensor(trajectory):
+        return _cell_tensor_constitutive_loss(
+            cell_prediction,
+            trajectory.cell_stress[int(frame)],
+            normalizers,
+            cfg,
+        )
+    return _exact_constitutive_loss(
+        nodal_prediction[nodal_mask, :1],
+        trajectory.stress[int(frame), nodal_mask, :1],
+        normalizers,
+        cfg,
+    )
 
 
 def train_constitutive_epoch(
@@ -983,17 +1223,20 @@ def train_constitutive_epoch(
             ):
                 skipped_frames += 1
                 continue
-            prediction, _ = model.nodal_stress_at(
+            nodal_prediction, cell_prediction = model.nodal_stress_at(
                 trajectory.static, exact_position
             )
             mask = ~trajectory.static.prescribed_mask
             if not bool(mask.any().item()):
                 mask = torch.ones_like(mask)
-            loss, metrics = _exact_constitutive_loss(
-                prediction[mask, :1],
-                trajectory.stress[frame, mask, :1],
+            loss, metrics = _supervised_constitutive_loss(
+                nodal_prediction,
+                cell_prediction,
+                trajectory,
+                frame,
                 normalizers,
                 cfg,
+                nodal_mask=mask,
             )
             if not bool(torch.isfinite(loss).item()):
                 skipped_frames += 1
@@ -1058,6 +1301,7 @@ def run_constitutive_pretraining(
     best_metric = float(
         initial_validation.get("teacher_stress_relative_rmse", float("inf"))
     )
+    best_validation = dict(initial_validation)
     best_state = {
         key: value.detach().cpu().clone() for key, value in model.state_dict().items()
     }
@@ -1087,6 +1331,7 @@ def run_constitutive_pretraining(
         metric = float(validation.get("teacher_stress_relative_rmse", float("inf")))
         if metric < best_metric:
             best_metric = metric
+            best_validation = dict(validation)
             best_state = {
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
@@ -1096,6 +1341,13 @@ def run_constitutive_pretraining(
         )
     model.load_state_dict(best_state)
     history["selected_teacher_stress_relative_rmse"] = best_metric
+    history["selected_teacher_stress_source"] = best_validation.get(
+        "teacher_stress_source", "unavailable"
+    )
+    history["selected_teacher_stress_label_coverage"] = best_validation.get(
+        "teacher_stress_label_coverage", 0.0
+    )
+    history["selected_validation"] = best_validation
     _save_json(output_dir / "constitutive_pretraining.json", history)
     return history
 
@@ -1157,15 +1409,14 @@ def exact_dynamics_loss(
     stress_mask = ~static.prescribed_mask
     if not bool(stress_mask.any().item()):
         stress_mask = torch.ones_like(static.prescribed_mask)
-    stress_target = trajectory.stress[next_step, stress_mask, :1]
-    stress_prediction = output.nodal_stress[stress_mask, :1]
-    stress_loss, _ = robust_stress_loss(
-        normalizers.stress.transform(stress_prediction),
-        normalizers.stress.transform(stress_target),
-        ranking_target=stress_target,
-        peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
-        peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
-        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    stress_loss, stress_metrics = _supervised_constitutive_loss(
+        output.nodal_stress,
+        output.cell_stress_tensor,
+        trajectory,
+        next_step,
+        normalizers,
+        cfg,
+        nodal_mask=stress_mask,
     )
     projection_free = (
         (output.energy_diagnostics["integration_update_scale"] >= 1.0 - 1.0e-7)
@@ -1247,6 +1498,9 @@ def exact_dynamics_loss(
         "direction": direction_loss.detach(),
         "quiet": quiet_loss.detach(),
         "stress": stress_loss.detach(),
+        "stress_tensor_supervision": stress_metrics[
+            "stress_tensor_supervision"
+        ],
         "residual": residual_loss.detach(),
         "integration_backtrack": (1.0 - projection_free).detach(),
     }
@@ -1715,11 +1969,18 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
         case.material_features.shape[1]
         for case in train_dataset.cases + (val_dataset.cases if val_dataset else [])
     )
+    requires_cell_stress_normalizer = any(
+        _case_has_cell_stress_tensor(case) for case in train_dataset.cases
+    )
 
     normalizer_path = output_dir / "normalizers.pt"
     if normalizer_path.exists():
         normalizer_state = _torch_load(normalizer_path, "cpu")
-        if "acceleration_scale" in normalizer_state:
+        normalizer_is_current = "acceleration_scale" in normalizer_state and (
+            not requires_cell_stress_normalizer
+            or normalizer_state.get("cell_stress") is not None
+        )
+        if normalizer_is_current:
             normalizers = CHPNormalizers.from_state_dict(normalizer_state)
         else:
             normalizers = fit_chp_normalizers(
@@ -1841,7 +2102,17 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                     "selected_teacher_stress_relative_rmse", float("inf")
                 )
             )
-            print(f"constitutive pretraining selected teacher rRMSE={selected:.4g}")
+            selected_source = str(
+                pretraining.get("selected_teacher_stress_source", "unavailable")
+            )
+            selected_coverage = float(
+                pretraining.get("selected_teacher_stress_label_coverage", 0.0)
+            )
+            print(
+                "constitutive pretraining selected teacher "
+                f"rRMSE={selected:.4g} source={selected_source} "
+                f"coverage={selected_coverage:.3f}"
+            )
             teacher_threshold = float(
                 get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
             )
@@ -1858,6 +2129,8 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                 failure = {
                     "stage": "constitutive_pretraining",
                     "teacher_stress_relative_rmse": selected,
+                    "teacher_stress_source": selected_source,
+                    "teacher_stress_label_coverage": selected_coverage,
                     "threshold": teacher_threshold,
                     "action": "stop before dynamics and rollout training",
                 }
@@ -1997,11 +2270,22 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             and epoch == gate_epoch
             and teacher_relative >= teacher_threshold
         ):
+            teacher_source = str(
+                teacher_metrics.get("teacher_stress_source", "unavailable")
+            )
             failure = {
                 "epoch": epoch,
                 "teacher_stress_relative_rmse": teacher_relative,
+                "teacher_stress_source": teacher_source,
+                "teacher_stress_label_coverage": teacher_metrics.get(
+                    "teacher_stress_label_coverage", 0.0
+                ),
                 "threshold": teacher_threshold,
-                "action": "stop rollout curriculum and add full tensor labels",
+                "action": (
+                    "stop rollout curriculum and revise constitutive model/data"
+                    if teacher_source == "cell_tensor"
+                    else "stop rollout curriculum and add full tensor labels"
+                ),
             }
             _save_json(output_dir / "teacher_stress_gate_failure.json", failure)
             raise RuntimeError(
@@ -2172,17 +2456,20 @@ def train_chp_epoch(
                         trajectory.static.reference_position
                         + trajectory.displacement[step + 1]
                     )
-                    exact_stress, _ = model.nodal_stress_at(
+                    exact_nodal_stress, exact_cell_stress = model.nodal_stress_at(
                         trajectory.static, exact_position
                     )
                     exact_mask = ~trajectory.static.prescribed_mask
                     if not bool(exact_mask.any().item()):
                         exact_mask = torch.ones_like(exact_mask)
-                    exact_constitutive, exact_metrics = _exact_constitutive_loss(
-                        exact_stress[exact_mask, :1],
-                        trajectory.stress[step + 1, exact_mask, :1],
+                    exact_constitutive, exact_metrics = _supervised_constitutive_loss(
+                        exact_nodal_stress,
+                        exact_cell_stress,
+                        trajectory,
+                        step + 1,
                         normalizers,
                         cfg,
+                        nodal_mask=exact_mask,
                     )
                     step_loss = step_loss + float(
                         get_cfg(cfg, "loss.exact_constitutive", 0.5)
@@ -2190,6 +2477,9 @@ def train_chp_epoch(
                     metrics["exact_constitutive"] = exact_metrics["loss"]
                     metrics["exact_stress_physical"] = exact_metrics[
                         "stress_physical"
+                    ]
+                    metrics["exact_stress_tensor_supervision"] = exact_metrics[
+                        "stress_tensor_supervision"
                     ]
                 if not bool(torch.isfinite(step_loss).item()):
                     raise FloatingPointError(
@@ -2259,6 +2549,14 @@ def evaluate_chp_rollouts(
             "stress_reference",
             "p95_error",
             "p95_reference",
+            "cell_tensor_error",
+            "cell_tensor_reference",
+            "cell_tensor_p95_error",
+            "cell_tensor_p95_reference",
+            "cell_vm_error",
+            "cell_vm_reference",
+            "cell_vm_p95_error",
+            "cell_vm_p95_reference",
             "penetration",
             "momentum",
             "energy",
@@ -2269,6 +2567,7 @@ def evaluate_chp_rollouts(
     }
     evaluated_steps = 0
     attempted_steps = 0
+    tensor_evaluated_steps = 0
     diverged = 0
     divergence_limit = float(get_cfg(cfg, "validation.divergence_position", 10.0))
     for case_index_value in tqdm(case_indices, desc="rollout-val", leave=False):
@@ -2387,6 +2686,34 @@ def evaluate_chp_rollouts(
             peak = target_stress.abs() >= threshold
             accum["p95_error"] += stress_error[peak].double().square().sum()
             accum["p95_reference"] += target_stress[peak].double().square().sum()
+            if _trajectory_has_cell_stress_tensor(trajectory):
+                predicted_tensor = _cauchy_to_tensor6(output.cell_stress_tensor)
+                target_tensor = trajectory.cell_stress[step + 1].to(
+                    predicted_tensor.dtype
+                )
+                tensor_error = predicted_tensor - target_tensor
+                target_vm = _tensor6_von_mises(target_tensor)
+                predicted_vm = _tensor6_von_mises(predicted_tensor)
+                vm_error = predicted_vm - target_vm
+                cell_threshold = torch.quantile(target_vm.abs(), 0.95)
+                cell_peak = target_vm.abs() >= cell_threshold
+                accum["cell_tensor_error"] += tensor_error.double().square().sum()
+                accum["cell_tensor_reference"] += target_tensor.double().square().sum()
+                accum["cell_tensor_p95_error"] += (
+                    tensor_error[cell_peak].double().square().sum()
+                )
+                accum["cell_tensor_p95_reference"] += (
+                    target_tensor[cell_peak].double().square().sum()
+                )
+                accum["cell_vm_error"] += vm_error.double().square().sum()
+                accum["cell_vm_reference"] += target_vm.double().square().sum()
+                accum["cell_vm_p95_error"] += (
+                    vm_error[cell_peak].double().square().sum()
+                )
+                accum["cell_vm_p95_reference"] += (
+                    target_vm[cell_peak].double().square().sum()
+                )
+                tensor_evaluated_steps += 1
             accum["penetration"] += output.energy_diagnostics[
                 "max_penetration"
             ].double()
@@ -2428,6 +2755,49 @@ def evaluate_chp_rollouts(
                 accum["p95_error"] / accum["p95_reference"].clamp_min(eps)
             ).item()
         ),
+        "cell_stress_tensor_relative_rmse": (
+            float(
+                torch.sqrt(
+                    accum["cell_tensor_error"]
+                    / accum["cell_tensor_reference"].clamp_min(eps)
+                ).item()
+            )
+            if tensor_evaluated_steps
+            else float("inf")
+        ),
+        "cell_stress_tensor_p95_relative_rmse": (
+            float(
+                torch.sqrt(
+                    accum["cell_tensor_p95_error"]
+                    / accum["cell_tensor_p95_reference"].clamp_min(eps)
+                ).item()
+            )
+            if tensor_evaluated_steps
+            else float("inf")
+        ),
+        "cell_stress_vm_relative_rmse": (
+            float(
+                torch.sqrt(
+                    accum["cell_vm_error"]
+                    / accum["cell_vm_reference"].clamp_min(eps)
+                ).item()
+            )
+            if tensor_evaluated_steps
+            else float("inf")
+        ),
+        "cell_stress_vm_p95_relative_rmse": (
+            float(
+                torch.sqrt(
+                    accum["cell_vm_p95_error"]
+                    / accum["cell_vm_p95_reference"].clamp_min(eps)
+                ).item()
+            )
+            if tensor_evaluated_steps
+            else float("inf")
+        ),
+        "cell_stress_tensor_coverage": float(
+            tensor_evaluated_steps / max(evaluated_steps, 1)
+        ),
         "diverged_cases": float(diverged),
         "mean_penetration": float((accum["penetration"] / max(evaluated_steps, 1)).item()),
         "mean_momentum_residual": float((accum["momentum"] / max(evaluated_steps, 1)).item()),
@@ -2461,8 +2831,8 @@ def evaluate_teacher_forced_stress(
     cfg: dict[str, Any],
     *,
     amp_dtype: torch.dtype = torch.bfloat16,
-) -> dict[str, float]:
-    """Isolate constitutive error by evaluating the exact next geometry."""
+) -> dict[str, Any]:
+    """Evaluate the potential on exact geometry, preferring full cell tensors."""
 
     model.eval()
     case_count = min(
@@ -2470,15 +2840,30 @@ def evaluate_teacher_forced_stress(
     )
     frame_count = max(int(get_cfg(cfg, "validation.teacher_stress_frames", 16)), 1)
     case_indices = np.linspace(0, len(cases) - 1, case_count).round().astype(int)
-    error = torch.zeros((), device=cache.device)
-    reference = torch.zeros((), device=cache.device)
-    peak_error = torch.zeros((), device=cache.device)
-    peak_reference = torch.zeros((), device=cache.device)
+    accum = {
+        key: torch.zeros((), device=cache.device)
+        for key in (
+            "nodal_error",
+            "nodal_reference",
+            "nodal_peak_error",
+            "nodal_peak_reference",
+            "tensor_error",
+            "tensor_reference",
+            "tensor_peak_error",
+            "tensor_peak_reference",
+            "cell_vm_error",
+            "cell_vm_reference",
+            "cell_vm_peak_error",
+            "cell_vm_peak_reference",
+        )
+    }
     requested_frames = 0
     admissible_frames = 0
     inverted_frames = 0
     near_singular_frames = 0
     extreme_i2_frames = 0
+    tensor_label_frames = 0
+    nodal_label_frames = 0
     for case_index_value in tqdm(
         case_indices, desc="teacher-stress", leave=False
     ):
@@ -2509,34 +2894,93 @@ def evaluate_teacher_forced_stress(
                 continue
             admissible_frames += 1
             with _autocast(cache.device, amp_dtype):
-                prediction, _ = model.nodal_stress_at(
+                nodal_prediction, cell_prediction = model.nodal_stress_at(
                     trajectory.static, exact_position
                 )
             mask = ~trajectory.static.prescribed_mask
             if not bool(mask.any().item()):
                 mask = torch.ones_like(mask)
-            target = trajectory.stress[frame, mask, :1]
-            residual = prediction[mask, :1] - target
-            error += residual.square().sum()
-            reference += target.square().sum()
-            threshold = torch.quantile(target.abs().reshape(-1), 0.95)
-            peak = target.abs() >= threshold
-            peak_error += residual[peak].square().sum()
-            peak_reference += target[peak].square().sum()
+            nodal_target = trajectory.stress[frame, mask, :1]
+            nodal_residual = nodal_prediction[mask, :1] - nodal_target
+            accum["nodal_error"] += nodal_residual.square().sum()
+            accum["nodal_reference"] += nodal_target.square().sum()
+            nodal_threshold = torch.quantile(nodal_target.abs().reshape(-1), 0.95)
+            nodal_peak = nodal_target.abs() >= nodal_threshold
+            accum["nodal_peak_error"] += nodal_residual[nodal_peak].square().sum()
+            accum["nodal_peak_reference"] += nodal_target[nodal_peak].square().sum()
+            nodal_label_frames += 1
+
+            if _trajectory_has_cell_stress_tensor(trajectory):
+                prediction6 = _cauchy_to_tensor6(cell_prediction)
+                target6 = trajectory.cell_stress[frame].to(prediction6.dtype)
+                residual6 = prediction6 - target6
+                target_vm = _tensor6_von_mises(target6)
+                prediction_vm = _tensor6_von_mises(prediction6)
+                residual_vm = prediction_vm - target_vm
+                peak_threshold = torch.quantile(target_vm.abs(), 0.95)
+                cell_peak = target_vm.abs() >= peak_threshold
+                accum["tensor_error"] += residual6.square().sum()
+                accum["tensor_reference"] += target6.square().sum()
+                accum["tensor_peak_error"] += residual6[cell_peak].square().sum()
+                accum["tensor_peak_reference"] += target6[cell_peak].square().sum()
+                accum["cell_vm_error"] += residual_vm.square().sum()
+                accum["cell_vm_reference"] += target_vm.square().sum()
+                accum["cell_vm_peak_error"] += residual_vm[cell_peak].square().sum()
+                accum["cell_vm_peak_reference"] += target_vm[cell_peak].square().sum()
+                tensor_label_frames += 1
     eps = torch.tensor(1.0e-12, device=cache.device)
-    relative = (
-        torch.sqrt(error / reference.clamp_min(eps))
-        if admissible_frames and bool((reference > eps).item())
-        else error.new_tensor(float("inf"))
+
+    def relative(error_key: str, reference_key: str, frames: int) -> float:
+        reference = accum[reference_key]
+        if frames and bool((reference > eps).item()):
+            return float(torch.sqrt(accum[error_key] / reference.clamp_min(eps)).item())
+        return float("inf")
+
+    nodal_relative = relative("nodal_error", "nodal_reference", nodal_label_frames)
+    nodal_peak_relative = relative(
+        "nodal_peak_error", "nodal_peak_reference", nodal_label_frames
     )
-    peak_relative = (
-        torch.sqrt(peak_error / peak_reference.clamp_min(eps))
-        if admissible_frames and bool((peak_reference > eps).item())
-        else error.new_tensor(float("inf"))
+    tensor_relative = relative(
+        "tensor_error", "tensor_reference", tensor_label_frames
     )
+    tensor_peak_relative = relative(
+        "tensor_peak_error", "tensor_peak_reference", tensor_label_frames
+    )
+    cell_vm_relative = relative(
+        "cell_vm_error", "cell_vm_reference", tensor_label_frames
+    )
+    cell_vm_peak_relative = relative(
+        "cell_vm_peak_error", "cell_vm_peak_reference", tensor_label_frames
+    )
+    if tensor_label_frames:
+        source = "cell_tensor"
+        primary_relative = tensor_relative
+        primary_peak_relative = tensor_peak_relative
+        label_frames = tensor_label_frames
+    else:
+        source = "nodal_scalar_vm_fallback"
+        primary_relative = nodal_relative
+        primary_peak_relative = nodal_peak_relative
+        label_frames = nodal_label_frames
     return {
-        "teacher_stress_relative_rmse": float(relative.item()),
-        "teacher_stress_p95_relative_rmse": float(peak_relative.item()),
+        # Stable API: these aliases always hold the preferred supervision source.
+        "teacher_stress_relative_rmse": primary_relative,
+        "teacher_stress_p95_relative_rmse": primary_peak_relative,
+        "teacher_stress_source": source,
+        "teacher_stress_label_coverage": float(
+            label_frames / max(admissible_frames, 1)
+        ),
+        "teacher_cell_stress_tensor_relative_rmse": tensor_relative,
+        "teacher_cell_stress_tensor_p95_relative_rmse": tensor_peak_relative,
+        "teacher_cell_stress_vm_relative_rmse": cell_vm_relative,
+        "teacher_cell_stress_vm_p95_relative_rmse": cell_vm_peak_relative,
+        "teacher_cell_stress_tensor_frames": float(tensor_label_frames),
+        "teacher_cell_stress_tensor_coverage": float(
+            tensor_label_frames / max(admissible_frames, 1)
+        ),
+        "teacher_nodal_stress_relative_rmse": nodal_relative,
+        "teacher_nodal_stress_p95_relative_rmse": nodal_peak_relative,
+        "teacher_nodal_stress_frames": float(nodal_label_frames),
         "teacher_stress_admissible_coverage": float(
             admissible_frames / max(requested_frames, 1)
         ),
