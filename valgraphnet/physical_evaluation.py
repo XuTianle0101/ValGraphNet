@@ -347,6 +347,15 @@ def save_comparison(path: str | Path, comparison: dict[str, Any]) -> None:
 
 def native_reference_payload(result: dict[str, Any]) -> dict[str, Any]:
     return {
+        "schema_version": int(result.get("schema_version", METRIC_SCHEMA_VERSION)),
+        "evaluation": dict(result.get("evaluation", {})),
+        "per_case": [
+            {
+                "case_id": value["case_id"],
+                "evaluated_frames": value["evaluated_frames"],
+            }
+            for value in result.get("per_case", [])
+        ],
         "rollout": {
             key: float(result["summary"][key]) for key in PRIMARY_METRICS
         }

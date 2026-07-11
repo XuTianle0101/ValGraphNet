@@ -8,6 +8,7 @@ from valgraphnet.physical_evaluation import (
     ErrorSums,
     compare_experiments,
     evaluate_prediction,
+    native_reference_payload,
     select_case_ids,
     validate_reference_protocol,
 )
@@ -127,6 +128,25 @@ def test_native_reference_protocol_requires_same_even_validation_subset(tmp_path
     }
     validate_reference_protocol(
         payload,
+        split_file=split_file,
+        split="val",
+        case_count=20,
+        frame_count=400,
+        case_selection="even",
+    )
+    reference = native_reference_payload(
+        {
+            **payload,
+            "summary": {
+                "moving_displacement_relative_rmse": 1.0,
+                "final_displacement_relative_rmse": 2.0,
+                "stress_relative_rmse": 3.0,
+                "stress_p95_relative_rmse": 4.0,
+            },
+        }
+    )
+    validate_reference_protocol(
+        reference,
         split_file=split_file,
         split="val",
         case_count=20,
