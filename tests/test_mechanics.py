@@ -7,6 +7,7 @@ from valgraphnet.mechanics import (
     AnalyticPotential,
     assemble_internal_force,
     deformation_gradient,
+    invariants,
     negative_j_barrier,
     precompute_tetrahedra,
     project_cell_to_nodes,
@@ -265,3 +266,39 @@ def test_cpu_cuda_mechanics_parity():
     torch.testing.assert_close(gpu_response.energy_density.cpu(), cpu_response.energy_density, atol=1.0e-6, rtol=1.0e-5)
     torch.testing.assert_close(gpu_response.first_piola.cpu(), cpu_response.first_piola, atol=2.0e-6, rtol=2.0e-5)
     torch.testing.assert_close(gpu_force.cpu(), cpu_force, atol=2.0e-6, rtol=2.0e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_bf16_autocast_keeps_all_analytic_mechanics_fp32():
+    nodes, cells = _unit_tetra(dtype=torch.float32)
+    nodes = nodes.cuda().requires_grad_(True)
+    cells = cells.cuda()
+    reference = precompute_tetrahedra(nodes.detach(), cells)
+    potential = AnalyticPotential().cuda()
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        deformation = deformation_gradient(
+            nodes * torch.tensor([1.05, 0.97, 1.02], device="cuda"),
+            cells,
+            reference.dm_inv,
+        )
+        state = invariants(deformation)
+        response = potential(deformation)
+        force = assemble_internal_force(
+            response.first_piola,
+            cells,
+            reference.volume,
+            reference.shape_gradients,
+            4,
+        )
+        loss = response.energy_density.sum() + force.square().sum()
+
+    assert deformation.dtype == torch.float32
+    assert state.c.dtype == torch.float32
+    assert state.j.dtype == torch.float32
+    assert response.first_piola.dtype == torch.float32
+    assert response.cauchy_stress.dtype == torch.float32
+    assert force.dtype == torch.float32
+    loss.backward()
+    assert nodes.grad is not None
+    assert torch.isfinite(nodes.grad).all()

@@ -12,6 +12,7 @@ finite-difference tests.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -110,6 +111,14 @@ def _work_dtype(tensor: torch.Tensor) -> torch.dtype:
     return tensor.dtype
 
 
+def _disable_autocast(tensor: torch.Tensor):
+    """Keep analytic mechanics out of surrounding neural AMP regions."""
+
+    if tensor.device.type in {"cuda", "cpu"}:
+        return torch.autocast(device_type=tensor.device.type, enabled=False)
+    return nullcontext()
+
+
 def _as_float_tensor(value, *, like: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(value, device=like.device, dtype=_work_dtype(like))
 
@@ -190,6 +199,18 @@ def deformation_gradient(
     cells: torch.Tensor,
     dm_inv: torch.Tensor,
 ) -> torch.Tensor:
+    """Compute ``F`` in FP32/FP64 even inside a neural autocast region."""
+
+    tensor = torch.as_tensor(current_pos)
+    with _disable_autocast(tensor):
+        return _deformation_gradient_impl(tensor, cells, dm_inv)
+
+
+def _deformation_gradient_impl(
+    current_pos: torch.Tensor,
+    cells: torch.Tensor,
+    dm_inv: torch.Tensor,
+) -> torch.Tensor:
     """Compute ``F = Ds @ Dm_inv`` for one state or a leading batch."""
 
     current_pos = torch.as_tensor(current_pos)
@@ -218,6 +239,16 @@ def deformation_gradient(
 
 
 def invariants(deformation: torch.Tensor, eps: float | None = None) -> DeformationInvariants:
+    """Return objective invariants without AMP down-casting matrix products."""
+
+    tensor = torch.as_tensor(deformation)
+    with _disable_autocast(tensor):
+        return _invariants_impl(tensor, eps=eps)
+
+
+def _invariants_impl(
+    deformation: torch.Tensor, eps: float | None = None
+) -> DeformationInvariants:
     """Return objective invariants of a deformation gradient.
 
     ``i1_bar`` and ``i2_bar`` use a clamped positive determinant so invalid
@@ -430,6 +461,17 @@ class AnalyticPotential(nn.Module):
         deformation: torch.Tensor,
         fiber_direction: torch.Tensor | None = None,
     ) -> ConstitutiveResponse:
+        """Evaluate the closed-form potential outside neural AMP."""
+
+        tensor = torch.as_tensor(deformation)
+        with _disable_autocast(tensor):
+            return self._forward_impl(tensor, fiber_direction=fiber_direction)
+
+    def _forward_impl(
+        self,
+        deformation: torch.Tensor,
+        fiber_direction: torch.Tensor | None = None,
+    ) -> ConstitutiveResponse:
         deformation = torch.as_tensor(deformation)
         if deformation.shape[-2:] != (3, 3):
             raise ValueError("deformation must have shape [..., 3, 3]")
@@ -546,6 +588,22 @@ def assemble_internal_force(
     shape_gradients: torch.Tensor,
     num_nodes: int,
 ) -> torch.Tensor:
+    """Assemble conservative forces outside neural AMP."""
+
+    tensor = torch.as_tensor(first_piola)
+    with _disable_autocast(tensor):
+        return _assemble_internal_force_impl(
+            tensor, cells, volume, shape_gradients, num_nodes
+        )
+
+
+def _assemble_internal_force_impl(
+    first_piola: torch.Tensor,
+    cells: torch.Tensor,
+    volume: torch.Tensor,
+    shape_gradients: torch.Tensor,
+    num_nodes: int,
+) -> torch.Tensor:
     """Assemble conservative nodal force ``-sum(V P grad(N))``.
 
     ``first_piola`` may have leading batch dimensions.  Reference geometry is
@@ -600,6 +658,19 @@ def project_cell_to_nodes(
     num_nodes: int,
     weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Project cell fields without AMP changing physical accumulation."""
+
+    tensor = torch.as_tensor(cell_values)
+    with _disable_autocast(tensor):
+        return _project_cell_to_nodes_impl(tensor, cells, num_nodes, weights)
+
+
+def _project_cell_to_nodes_impl(
+    cell_values: torch.Tensor,
+    cells: torch.Tensor,
+    num_nodes: int,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Project cell values to nodes by a (possibly weighted) average.
 
     The first dimension of ``cell_values`` is the cell dimension.  Arbitrary
@@ -639,6 +710,14 @@ def project_cell_to_nodes(
 
 
 def von_mises(stress: torch.Tensor) -> torch.Tensor:
+    """Compute von-Mises stress outside neural AMP."""
+
+    tensor = torch.as_tensor(stress)
+    with _disable_autocast(tensor):
+        return _von_mises_impl(tensor)
+
+
+def _von_mises_impl(stress: torch.Tensor) -> torch.Tensor:
     """Compute von-Mises equivalent stress from full ``3x3`` tensors."""
 
     stress = torch.as_tensor(stress)
@@ -658,6 +737,37 @@ def von_mises(stress: torch.Tensor) -> torch.Tensor:
 
 
 def semi_implicit_step(
+    position: torch.Tensor,
+    velocity: torch.Tensor,
+    force: torch.Tensor,
+    mass: torch.Tensor,
+    dt: float | torch.Tensor,
+    *,
+    substeps: int = 1,
+    fixed_mask: torch.Tensor | None = None,
+    prescribed_mask: torch.Tensor | None = None,
+    prescribed_position: torch.Tensor | None = None,
+    prescribed_velocity: torch.Tensor | None = None,
+) -> IntegrationResult:
+    """Advance the physical state outside neural AMP."""
+
+    tensor = torch.as_tensor(position)
+    with _disable_autocast(tensor):
+        return _semi_implicit_step_impl(
+            tensor,
+            velocity,
+            force,
+            mass,
+            dt,
+            substeps=substeps,
+            fixed_mask=fixed_mask,
+            prescribed_mask=prescribed_mask,
+            prescribed_position=prescribed_position,
+            prescribed_velocity=prescribed_velocity,
+        )
+
+
+def _semi_implicit_step_impl(
     position: torch.Tensor,
     velocity: torch.Tensor,
     force: torch.Tensor,
