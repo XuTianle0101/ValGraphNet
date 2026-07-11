@@ -27,6 +27,7 @@ class DeformingPlateSequence:
     cells: np.ndarray
     node_type: np.ndarray
     stress: np.ndarray
+    mesh_edge_index: torch.Tensor | None = None
 
     @property
     def num_steps(self) -> int:
@@ -97,26 +98,37 @@ def make_graph_sample(
     if step < 0 or step >= sequence.num_steps - 1:
         raise IndexError(f"step must be in [0, {sequence.num_steps - 2}], got {step}")
 
-    mesh_pos = torch.as_tensor(sequence.mesh_pos, dtype=torch.float32)
-    world_pos = torch.as_tensor(sequence.world_pos[step], dtype=torch.float32)
-    next_world_pos = torch.as_tensor(sequence.world_pos[step + 1], dtype=torch.float32)
+    sample_device = world_pos_override.device if world_pos_override is not None else None
+    mesh_pos = torch.as_tensor(sequence.mesh_pos, dtype=torch.float32, device=sample_device)
+    world_pos = torch.as_tensor(
+        sequence.world_pos[step], dtype=torch.float32, device=sample_device
+    )
+    next_world_pos = torch.as_tensor(
+        sequence.world_pos[step + 1], dtype=torch.float32, device=sample_device
+    )
     if world_pos_override is not None:
-        world_pos = world_pos_override.detach().float().cpu()
+        world_pos = world_pos_override.detach().float()
 
-    node_type = torch.as_tensor(sequence.node_type, dtype=torch.long).view(-1)
+    node_type = torch.as_tensor(
+        sequence.node_type, dtype=torch.long, device=sample_device
+    ).view(-1)
     target_delta = next_world_pos - world_pos
-    target_stress = torch.as_tensor(sequence.stress[step + 1], dtype=torch.float32)
+    target_stress = torch.as_tensor(
+        sequence.stress[step + 1], dtype=torch.float32, device=sample_device
+    )
     if target_stress.ndim == 1:
         target_stress = target_stress[:, None]
 
     if add_noise:
         noise_mask = node_type == NODE_TYPE_MOVING
-        noise = torch.normal(mean=0.0, std=float(noise_std), size=world_pos.shape)
+        noise = torch.randn_like(world_pos) * float(noise_std)
         noise = noise * noise_mask[:, None].float()
         world_pos = world_pos + noise
         target_delta = target_delta - noise
 
-    edge_index = cells_to_edges(sequence.cells)
+    if sequence.mesh_edge_index is None:
+        sequence.mesh_edge_index = cells_to_edges(sequence.cells)
+    edge_index = sequence.mesh_edge_index.to(world_pos.device)
     mesh_ref_features = edge_features(edge_index, mesh_pos)
     mesh_world_features = edge_features(edge_index, world_pos)
     mesh_edge_features = torch.cat([mesh_ref_features, mesh_world_features], dim=1)
@@ -159,7 +171,7 @@ def make_graph_sample(
     graph.world_pos = world_pos.float()
     graph.next_world_pos = next_world_pos.float()
     graph.mesh_pos = mesh_pos.float()
-    graph.cells = torch.as_tensor(sequence.cells, dtype=torch.long)
+    graph.cells = torch.as_tensor(sequence.cells, dtype=torch.long, device=world_pos.device)
     graph.node_type = node_type.long()
     graph.sample_id = sequence.sample_id
     graph.step = int(step)
@@ -221,8 +233,15 @@ def radius_world_edges(
     """
 
     if radius <= 0.0 or world_pos.shape[0] < 2:
-        return torch.zeros((2, 0), dtype=torch.long)
+        return torch.zeros((2, 0), dtype=torch.long, device=world_pos.device)
     if max_neighbors is not None and int(max_neighbors) > 0:
+        if world_pos.is_cuda:
+            return _radius_nearest_neighbors_gpu(
+                world_pos,
+                radius=float(radius),
+                mesh_edge_index=mesh_edge_index,
+                max_neighbors=int(max_neighbors),
+            )
         nearest = _radius_nearest_neighbors(
             world_pos,
             radius=float(radius),
@@ -248,6 +267,67 @@ def radius_world_edges(
             max_neighbors=int(max_neighbors),
         )
     return torch.as_tensor(directed, dtype=torch.long).t().contiguous()
+
+
+def _radius_nearest_neighbors_gpu(
+    world_pos: torch.Tensor,
+    radius: float,
+    mesh_edge_index: torch.Tensor,
+    max_neighbors: int,
+) -> torch.Tensor:
+    """Build bounded world edges entirely on GPU with PhysicsNeMo Warp search."""
+
+    from physicsnemo.nn.functional import radius_search
+
+    num_nodes = int(world_pos.shape[0])
+    mesh_edge_index = mesh_edge_index.long().to(world_pos.device)
+    mesh_degree = torch.bincount(mesh_edge_index[0], minlength=num_nodes)
+    max_mesh_degree = int(mesh_degree.max().item()) if mesh_degree.numel() else 0
+    query_k = min(num_nodes, 1 + int(max_neighbors) + max_mesh_degree)
+    neighbors = radius_search(
+        world_pos.float(),
+        world_pos.float(),
+        radius=float(radius),
+        max_points=query_k,
+        return_dists=False,
+        return_points=False,
+    ).long()
+
+    sources = torch.arange(num_nodes, device=world_pos.device)[:, None].expand_as(neighbors)
+    mesh_adjacency = torch.zeros(
+        (num_nodes, num_nodes), dtype=torch.bool, device=world_pos.device
+    )
+    mesh_adjacency[mesh_edge_index[0], mesh_edge_index[1]] = True
+    valid = (neighbors != sources) & ~mesh_adjacency[sources, neighbors]
+    delta = world_pos[sources] - world_pos[neighbors]
+    distance_sq = (delta * delta).sum(dim=-1)
+    valid &= distance_sq <= float(radius * radius)
+
+    sorted_neighbors, order = neighbors.sort(dim=1)
+    sorted_distance = distance_sq.gather(1, order)
+    sorted_valid = valid.gather(1, order)
+    duplicate = torch.zeros_like(sorted_valid)
+    duplicate[:, 1:] = sorted_neighbors[:, 1:] == sorted_neighbors[:, :-1]
+    sorted_valid &= ~duplicate
+    sorted_distance = sorted_distance.masked_fill(~sorted_valid, torch.inf)
+
+    keep_count = min(int(max_neighbors), query_k)
+    best_distance, best_position = torch.topk(
+        sorted_distance,
+        k=keep_count,
+        dim=1,
+        largest=False,
+        sorted=True,
+    )
+    best_neighbors = sorted_neighbors.gather(1, best_position)
+    keep = torch.isfinite(best_distance)
+    edge_sources = torch.arange(num_nodes, device=world_pos.device)[:, None].expand(
+        -1, keep_count
+    )[keep]
+    edge_destinations = best_neighbors[keep]
+    if edge_sources.numel() == 0:
+        return torch.zeros((2, 0), dtype=torch.long, device=world_pos.device)
+    return torch.stack([edge_sources, edge_destinations], dim=0).long()
 
 
 def one_hot_node_type(node_type: torch.Tensor) -> torch.Tensor:

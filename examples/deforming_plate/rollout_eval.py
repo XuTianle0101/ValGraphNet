@@ -46,12 +46,14 @@ def run_rollout_eval(
     checkpoint = _torch_load(checkpoint_path)
     ckpt_cfg = checkpoint.get("cfg", cfg)
     device = resolve_device(str(get_cfg(ckpt_cfg, "training.device", "auto")))
+    print(f"rollout device: {device}", flush=True)
 
     inference_cfg = copy.deepcopy(ckpt_cfg)
     inference_cfg.setdefault("model", {})["num_processor_checkpoint_segments"] = 0
     model = build_deforming_plate_model(inference_cfg).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
+    print("rollout model loaded", flush=True)
 
     output_dir = Path(
         out_dir
@@ -60,6 +62,7 @@ def run_rollout_eval(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sequences = _load_rollout_sequences(ckpt_cfg)
+    print(f"rollout sequences loaded: {len(sequences)}", flush=True)
 
     all_metrics = []
     for seq_idx, sequence in enumerate(sequences):
@@ -122,17 +125,18 @@ def _rollout_sequence(
     cfg: dict[str, Any],
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    current_pos = torch.as_tensor(sequence.world_pos[0], dtype=torch.float32)
-    node_type = torch.as_tensor(sequence.node_type, dtype=torch.long)
+    current_pos = torch.as_tensor(sequence.world_pos[0], dtype=torch.float32, device=device)
+    node_type = torch.as_tensor(sequence.node_type, dtype=torch.long, device=device)
     _, object_mask, clamped_mask = rollout_masks(node_type)
     boundary_mask = (object_mask | clamped_mask).float()
 
-    pred_positions = [current_pos.numpy()]
+    pred_positions = [current_pos.cpu().numpy()]
     exact_positions = [sequence.world_pos[0].astype(np.float32)]
     pred_stresses = []
     exact_stresses = []
     rollout_start = time.perf_counter()
     for step in range(sequence.num_steps - 1):
+        step_start = time.perf_counter()
         sample = make_graph_sample(
             sequence=sequence,
             step=step,
@@ -142,7 +146,11 @@ def _rollout_sequence(
             world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
             max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        graph_seconds = time.perf_counter() - step_start
         graph = sample.graph.to(device)
+        forward_start = time.perf_counter()
         with autocast_context(cfg, device):
             pred_norm = model(
                 graph.x,
@@ -150,26 +158,39 @@ def _rollout_sequence(
                 sample.world_edge_features.to(device),
                 graph,
             )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        forward_seconds = time.perf_counter() - forward_start
         pred_delta = denormalize(
             pred_norm[:, 0:3],
             node_stats["velocity_mean"],
             node_stats["velocity_std"],
-        ).cpu()
+        )
         pred_stress = denormalize(
             pred_norm[:, 3:4],
             node_stats["stress_mean"],
             node_stats["stress_std"],
-        ).cpu()
-        exact_next = torch.as_tensor(sequence.world_pos[step + 1], dtype=torch.float32)
+        )
+        exact_next = torch.as_tensor(
+            sequence.world_pos[step + 1], dtype=torch.float32, device=device
+        )
         next_pos = current_pos + pred_delta
         next_pos = next_pos * (1.0 - boundary_mask) + exact_next * boundary_mask
         current_pos = next_pos.detach()
 
-        pred_positions.append(current_pos.numpy())
-        exact_positions.append(exact_next.numpy())
-        pred_stresses.append(pred_stress.numpy())
+        pred_positions.append(current_pos.cpu().numpy())
+        exact_positions.append(exact_next.cpu().numpy())
+        pred_stresses.append(pred_stress.cpu().numpy())
         stress = sequence.stress[step + 1].astype(np.float32)
         exact_stresses.append(stress[:, None] if stress.ndim == 1 else stress[:, :1])
+        if step < 3:
+            print(
+                f"rollout {sequence.sample_id} step {step + 1}: "
+                f"graph={graph_seconds:.3f}s forward={forward_seconds:.3f}s "
+                f"world_edges={sample.graph.world_edge_count} "
+                f"max_abs_pos={float(current_pos.abs().max()):.4g}",
+                flush=True,
+            )
         if (step + 1) % 25 == 0 or step + 1 == sequence.num_steps - 1:
             print(
                 f"rollout {sequence.sample_id}: {step + 1}/{sequence.num_steps - 1} "
