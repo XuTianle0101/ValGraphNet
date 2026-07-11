@@ -15,6 +15,7 @@ geometry:
   indenter_segments: 32
   indenter_cap_angle_degrees: 70.0
   indenter_shell_thickness_m: 0.00010
+  indenter_density_kg_m3: 7800.0
 
 solver:
   minimum_version: "2.18"

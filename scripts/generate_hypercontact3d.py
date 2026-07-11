@@ -27,7 +27,7 @@ import numpy as np
 import yaml
 
 
-GENERATOR_VERSION = "1.0"
+GENERATOR_VERSION = "1.4"
 SCHEMA_VERSION = 1
 
 
@@ -281,6 +281,7 @@ def render_calculix_deck(
     c10 = float(case.material["c10_pa"])
     poisson = float(case.material["poisson_ratio"])
     density = float(case.material["density_kg_m3"])
+    indenter_density = float(geometry.get("indenter_density_kg_m3", 7800.0))
     d1 = _material_d1(c10, poisson)
     min_spacing = min(
         size[0] / divisions[0], size[1] / divisions[1], size[2] / divisions[2]
@@ -298,8 +299,6 @@ def render_calculix_deck(
     block_node_count = block.nodes.shape[0]
     sphere_node_count = sphere.nodes.shape[0]
     solid_element_count = block.tetrahedra.shape[0]
-    ref_node = block_node_count + sphere_node_count + 1
-    rot_node = ref_node + 1
     first_shell_element = solid_element_count + 1
 
     lines = [
@@ -319,14 +318,7 @@ def render_calculix_deck(
     for local_index, xyz in enumerate(sphere.nodes, start=1):
         index = sphere_node_offset + local_index
         lines.append(f"{index}, {_fmt(xyz[0])}, {_fmt(xyz[1])}, {_fmt(xyz[2])}")
-    lines.extend(
-        [
-            "*NODE, NSET=REFERENCE_NODES",
-            f"{ref_node}, {_fmt(center[0])}, {_fmt(center[1])}, {_fmt(center[2])}",
-            f"{rot_node}, {_fmt(center[0])}, {_fmt(center[1])}, {_fmt(center[2])}",
-            "*ELEMENT, TYPE=C3D4, ELSET=BLOCK",
-        ]
-    )
+    lines.append("*ELEMENT, TYPE=C3D4, ELSET=BLOCK")
     for index, tet in enumerate(block.tetrahedra, start=1):
         connectivity = ", ".join(str(int(node) + 1) for node in tet)
         lines.append(f"{index}, {connectivity}")
@@ -352,11 +344,12 @@ def render_calculix_deck(
             f"{_fmt(c10)}, {_fmt(d1)}",
             "*SOLID SECTION, ELSET=BLOCK, MATERIAL=BLOCK_MAT",
             "*MATERIAL, NAME=INDENTER_MAT",
+            "*DENSITY",
+            _fmt(indenter_density),
             "*ELASTIC",
             "2.1e11, 0.3",
             "*SHELL SECTION, ELSET=INDENTER, MATERIAL=INDENTER_MAT",
             _fmt(float(geometry["indenter_shell_thickness_m"])),
-            f"*RIGID BODY, ELSET=INDENTER, REF NODE={ref_node}, ROT NODE={rot_node}",
             "*SURFACE, NAME=BLOCK_CONTACT, TYPE=NODE",
             "BLOCK_TOP",
             "*SURFACE, NAME=INDENTER_CONTACT, TYPE=ELEMENT",
@@ -375,8 +368,7 @@ def render_calculix_deck(
             "BLOCK_CONTACT, INDENTER_CONTACT",
             "*BOUNDARY",
             "BOTTOM, 1, 3, 0.",
-            f"{ref_node}, 1, 2, 0.",
-            f"{rot_node}, 1, 3, 0.",
+            "INDENTER_NODES, 1, 2, 0.",
             "*STEP, NLGEOM",
             "*STATIC",
             (
@@ -385,15 +377,15 @@ def render_calculix_deck(
                 f"{_fmt(1.0 / int(solver['target_increments']))}"
             ),
             "*BOUNDARY",
-            f"{ref_node}, 3, 3, {_fmt(imposed_displacement)}",
+            f"INDENTER_NODES, 3, 3, {_fmt(imposed_displacement)}",
             "*NODE FILE, FREQUENCY=1, GLOBAL=YES",
             "U, RF",
             "*EL FILE, FREQUENCY=1",
             "S, E, ENER",
+            "*EL PRINT, ELSET=BLOCK, FREQUENCY=1",
+            "S",
             "*CONTACT FILE, FREQUENCY=1",
             "CDIS, CSTR",
-            "*CONTACT PRINT, FREQUENCY=1",
-            "CF, CFN, CFS",
             "*END STEP",
             "",
         ]
@@ -406,8 +398,7 @@ def render_calculix_deck(
         "top_nodes": int(block.top_nodes.size),
         "indenter_nodes": int(sphere_node_count),
         "indenter_triangles": int(sphere.triangles.shape[0]),
-        "reference_node_label": int(ref_node),
-        "rotation_node_label": int(rot_node),
+        "indenter_kinematics": "uniform prescribed translation on all surface nodes",
         "minimum_spacing_m": float(min_spacing),
     }
     derived = {
@@ -416,6 +407,11 @@ def render_calculix_deck(
         "contact_tension_cutoff_pa": float(tension_cutoff),
         "d1_pa_inverse": float(d1),
         "imposed_indenter_displacement_m": float(imposed_displacement),
+        "indenter_density_kg_m3": float(indenter_density),
+        "indenter_shell_thickness_m": float(
+            geometry["indenter_shell_thickness_m"]
+        ),
+        "step_duration": 1.0,
     }
     return "\n".join(lines), {"derived": derived, "mesh_statistics": mesh_metadata}
 
@@ -433,10 +429,21 @@ def _validate_axis_entries(config: Mapping[str, Any], axis: str) -> None:
         for value in values:
             if not isinstance(value, Mapping):
                 raise ValueError(f"each {axis} entry must be a mapping")
-            canonical = _canonical_json(value)
+            canonical = _canonical_json(_canonical_axis_parameters(axis, value))
             if canonical in seen:
                 raise ValueError(f"duplicate {axis} value across grid categories: {value}")
             seen.add(canonical)
+
+
+def _canonical_axis_parameters(
+    axis: str,
+    value: Mapping[str, Any],
+) -> dict[str, float | int]:
+    if axis in {"material", "load"}:
+        return {str(key): float(item) for key, item in value.items()}
+    if axis == "mesh":
+        return {str(key): int(item) for key, item in value.items()}
+    raise ValueError(f"unknown HyperContact parameter axis: {axis}")
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
@@ -454,6 +461,10 @@ def validate_config(config: Mapping[str, Any]) -> None:
     _require_finite_positive(geometry["initial_gap_m"], "geometry.initial_gap_m")
     _require_finite_positive(
         geometry["indenter_shell_thickness_m"], "geometry.indenter_shell_thickness_m"
+    )
+    _require_finite_positive(
+        geometry.get("indenter_density_kg_m3", 7800.0),
+        "geometry.indenter_density_kg_m3",
     )
     _require_int_at_least(geometry["indenter_rings"], 1, "geometry.indenter_rings")
     _require_int_at_least(geometry["indenter_segments"], 3, "geometry.indenter_segments")
@@ -537,9 +548,9 @@ def enumerate_cases(config: Mapping[str, Any]) -> list[BenchmarkCase]:
             "mesh": mesh_entry[0],
         }
         parameters = {
-            "material": dict(material_entry[1]),
-            "load": dict(load_entry[1]),
-            "mesh": dict(mesh_entry[1]),
+            "material": _canonical_axis_parameters("material", material_entry[1]),
+            "load": _canonical_axis_parameters("load", load_entry[1]),
+            "mesh": _canonical_axis_parameters("mesh", mesh_entry[1]),
         }
         provisional.append(
             BenchmarkCase(

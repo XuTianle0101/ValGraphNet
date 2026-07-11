@@ -1,0 +1,7 @@
+ stresses (elem, integ.pnt.,sxx,syy,szz,sxy,sxz,syz) for set BLOCK and time  5.0000000E-01
+
+         1   1  1.0000000E+01  2.0000000E+01  3.0000000E+01  4.0000000E+01  5.0000000E+01  6.0000000E+01
+
+ stresses (elem, integ.pnt.,sxx,syy,szz,sxy,sxz,syz) for set BLOCK and time  1.0000000E+00
+
+         1   1  2.0000000E+01  4.0000000E+01  6.0000000E+01  8.0000000E+01  1.0000000E+02  1.2000000E+02

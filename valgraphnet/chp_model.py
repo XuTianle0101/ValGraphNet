@@ -1052,10 +1052,22 @@ def build_chp_static(
 
     reference = tensor(case.nodes, torch.float32)
     cells = tensor(case.cells, torch.long)
-    surface_mask = tetra_surface_node_mask(
-        torch.from_numpy(np.array(case.cells, dtype=np.int64, copy=True)),
-        case.num_nodes,
-    ).to(device=device)
+    explicit_surface_mask = np.asarray(
+        getattr(case, "contact_surface_mask", np.zeros((0,), dtype=bool)),
+        dtype=bool,
+    )
+    if explicit_surface_mask.shape == (case.num_nodes,):
+        surface_mask = tensor(explicit_surface_mask, torch.bool)
+    elif explicit_surface_mask.size == 0:
+        surface_mask = tetra_surface_node_mask(
+            torch.from_numpy(np.array(case.cells, dtype=np.int64, copy=True)),
+            case.num_nodes,
+        ).to(device=device)
+    else:
+        raise ValueError(
+            f"{case.case_id}: contact_surface_mask must be empty or have shape "
+            f"[{case.num_nodes}]"
+        )
     mesh_edges = tensor(case.mesh_edge_index, torch.long)
     hierarchy = (hierarchy or build_case_hierarchy(case)).to(device)
     material_features = np.array(case.material_features, dtype=np.float32, copy=True)

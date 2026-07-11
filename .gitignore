@@ -11,6 +11,8 @@ data/raw/
 data/processed/
 data/deforming_plate_cases*/
 data/hypercontact3d_raw/
+data/hypercontact3d_raw_v*/
+data/hypercontact3d_cases_v*/
 raw_dataset/
 preprocessed_dataset/
 outputs/

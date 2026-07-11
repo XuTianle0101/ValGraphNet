@@ -1,9 +1,11 @@
 import copy
 import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from scripts.generate_hypercontact3d import (
     enumerate_cases,
@@ -125,22 +127,31 @@ def test_deck_contains_hyperelastic_contact_rigid_body_and_full_outputs():
     required_cards = (
         "*ELEMENT, TYPE=C3D4, ELSET=BLOCK",
         "*HYPERELASTIC, NEO HOOKE",
-        "*RIGID BODY, ELSET=INDENTER",
         "*SURFACE, NAME=BLOCK_CONTACT, TYPE=NODE",
         "*SURFACE, NAME=INDENTER_CONTACT, TYPE=ELEMENT",
         "*CONTACT PAIR, INTERACTION=CONTACT_PROPERTY, TYPE=NODE TO SURFACE",
         "*STEP, NLGEOM",
         "*NODE FILE, FREQUENCY=1, GLOBAL=YES",
         "*EL FILE, FREQUENCY=1",
+        "*EL PRINT, ELSET=BLOCK, FREQUENCY=1",
         "S, E, ENER",
         "*CONTACT FILE, FREQUENCY=1",
     )
     for card in required_cards:
         assert card in deck
+    assert deck.count("*DENSITY") == 2
+    assert "*RIGID BODY" not in deck
+    assert "*CONTACT PRINT" not in deck
+    assert "NSET=REFERENCE_NODES" not in deck
+    assert "INDENTER_NODES, 1, 2, 0." in deck
+    assert "INDENTER_NODES, 3, 3," in deck
     assert metadata["mesh_statistics"]["block_tetrahedra"] == 6 * 2 * 2 * 1
     assert metadata["derived"]["d1_pa_inverse"] > 0.0
     assert metadata["derived"]["contact_tension_cutoff_pa"] > 0.0
     assert metadata["derived"]["imposed_indenter_displacement_m"] < 0.0
+    assert metadata["derived"]["indenter_density_kg_m3"] == 7800.0
+    assert metadata["derived"]["indenter_shell_thickness_m"] > 0.0
+    assert metadata["derived"]["step_duration"] == 1.0
     assert "BLOCK_CONTACT, INDENTER_CONTACT" in deck
     in_element_block = False
     for line in deck.splitlines():
@@ -223,3 +234,44 @@ def test_duplicate_axis_value_across_categories_is_rejected():
 
     with pytest.raises(ValueError, match="duplicate mesh value"):
         validate_config(config)
+
+
+def test_numeric_yaml_strings_are_canonical_json_numbers():
+    config = _tiny_config()
+    config["parameter_grid"]["material"]["train"][0]["c10_pa"] = "2.5e5"
+    config["parameter_grid"]["load"]["train"][0]["indentation_m"] = "1.25e-3"
+
+    cases = enumerate_cases(config)
+
+    assert all(
+        isinstance(value, float)
+        for case in cases
+        for value in (*case.material.values(), *case.load.values())
+    )
+    assert all(
+        isinstance(value, int) for case in cases for value in case.mesh.values()
+    )
+    selected = next(case for case in cases if case.material["c10_pa"] == 2.5e5)
+    assert selected.material["c10_pa"] == 250000.0
+
+
+def test_chp_v1_4_config_is_gpu_bf16_quasistatic_and_reference_free():
+    path = Path("configs/hypercontact3d_chp.v1_4.yaml")
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert config["training"]["device"] == "cuda"
+    assert config["training"]["amp_dtype"] == "bfloat16"
+    assert config["training"]["mechanics_dtype"] == "float32"
+    assert config["model"]["fiber_order"] == 0
+    assert config["data"]["train_split"] == "train"
+    assert config["data"]["val_split"] == "validation"
+    assert config["validation"]["steps"] == 100
+    assert config["validation"]["checkpoint_reference_mode"] == "absolute_validation"
+    assert config["validation"]["native_reference_file"] is None
+    requirements = config["data"]["requirements"]
+    assert requirements["num_frames"] == 101
+    assert requirements["explicit_contact_surface_mask"]
+    assert requirements["full_cell_stress_tensor"]
+    assert requirements["full_integration_point_stress_tensor"]
+    assert requirements["material_feature_names"]
+    assert "quasi-static" in requirements["time_semantics"]

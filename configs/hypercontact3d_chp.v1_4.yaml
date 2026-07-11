@@ -1,0 +1,169 @@
+# CHP-GNS pilot for solver-backed HyperContact-3D v1.4 cases. CalculiX time is
+# a normalized quasi-static load parameter; V/A are path derivatives, not
+# physical transient kinematics. Neural blocks run in BF16 on CUDA while all
+# tetrahedral mechanics, determinants, stress, and assembly remain FP32.
+seed: 42
+
+data:
+  root: data/hypercontact3d_cases_v1_4
+  split_file: data/hypercontact3d_cases_v1_4/splits.json
+  train_split: train
+  val_split: validation
+  test_split: test_id
+  pressure_sign: 1.0
+  noise_std: 0.0
+  time_semantics: quasi_static_normalized_load_path
+  requirements:
+    required_metadata:
+      - time_semantics
+      - contact_surface_mask
+      - rigid_indenter.prescribed_displacement
+    required_files:
+      - nodes.npy
+      - elements.npy
+      - cells.npy
+      - indenter_triangles.npy
+      - contact_surface_mask.npy
+      - prescribed_mask.npy
+      - pressure_mask.npy
+      - U.npy
+      - V.npy
+      - A.npy
+      - S.npy
+      - S_cell.npy
+      - S_integration_point.npy
+      - integration_point_mask.npy
+      - material.json
+      - material_features.npy
+      - density.npy
+      - lumped_mass.npy
+    num_frames: 101
+    explicit_contact_surface_mask: true
+    prescribed_contact_surface: true
+    zero_pressure_mask: true
+    time_semantics: quasi-static normalized step time, not physical transient time
+    full_cell_stress_tensor: true
+    full_integration_point_stress_tensor: true
+    material_json: true
+    material_features: true
+    material_feature_names: true
+    density: true
+    stress_tensor_components: [S11, S22, S33, S12, S13, S23]
+
+model:
+  scalar_dim: 96
+  vector_dim: 16
+  cell_dim: 64
+  potential_order: 2
+  normalize_potential_scale: true
+  potential_i1_init: [0.5, 1.0e-6]
+  potential_i2_init: [0.01, 1.0e-10]
+  potential_j_init: [1.0, 0.1]
+  potential_log_j_init: 1.0
+  potential_minimum_coefficient: 1.0e-12
+  fiber_order: 0
+  inversion_stiffness: 10.0
+  minimum_j: 0.0
+  contact_substeps: 2
+  residual_acceleration_reference: 1.0e-3
+  residual_acceleration_cap: 1.0e-2
+  residual_activity_scale: 1.0e-3
+  residual_activity_diffusion_steps: 2
+  integration_minimum_j: 1.0e-4
+  integration_maximum_i2_bar: 1.0e6
+  integration_backtracks: 8
+  activation_checkpointing: true
+  initial_stress_scale: 2.0e5
+  initial_mass_scale: 1.0
+  initial_contact_scale: 1.0e-3
+  initial_damping_scale: 0.1
+
+contact:
+  enabled: true
+  radius: 0.003
+  max_neighbors: 32
+
+loss:
+  position: 1.0
+  velocity: 1.0
+  stress: 1.0
+  stress_physical_weight: 0.25
+  exact_constitutive: 0.5
+  work_energy: 0.1
+  penetration: 1.0
+  residual: 0.01
+  negative_j: 10.0
+  huber_delta: 1.0
+  peak_fraction: 0.1
+  peak_weight: 0.5
+
+constitutive_pretraining:
+  enabled: true
+  calibration_cases: 32
+  calibration_frames: 8
+  minimum_scale_factor: 1.0e-3
+  maximum_scale_factor: 1.0e4
+  preserve_force_mass_ratio: true
+  epochs: 2
+  cases_per_epoch: 128
+  frames_per_case: 8
+  lr: 1.0e-3
+  grad_clip_norm: 10.0
+
+# Static load-path derivatives are not physical accelerations. Do not pretrain
+# the dynamics residual against them as if this were a transient experiment.
+dynamics_pretraining:
+  enabled: false
+
+training:
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+  mechanics_dtype: float32
+  epochs: 16
+  curriculum:
+    - {horizon: 1, epochs: 4}
+    - {horizon: 2, epochs: 3}
+    - {horizon: 4, epochs: 3}
+    - {horizon: 8, epochs: 3}
+    - {horizon: 16, epochs: 3}
+  tbptt_chunk: 4
+  checkpoint_min_horizon: 8
+  pushforward_stop_gradient: true
+  trajectories_per_epoch: 1000
+  lr: 1.0e-4
+  constitutive_lr_scale: 0.1
+  weight_decay: 1.0e-6
+  warmup_steps: 500
+  grad_clip_norm: 1.0
+  fused_optimizer: true
+  gpu_case_cache_size: 3
+  normalizer_cases: 128
+  normalizer_frames: 8
+  normalizer_nodes: 256
+  output_dir: outputs/hypercontact3d_chp_v1_4_seed42
+  resume_from: auto
+
+validation:
+  stage_end_only: true
+  cases: 20
+  steps: 100
+  teacher_stress_cases: 20
+  teacher_stress_frames: 16
+  teacher_stress_threshold: 0.50
+  enforce_teacher_stress_gate: true
+  enforce_rollout_pilot_gate: true
+  pilot_moving_relative_rmse_threshold: 0.80
+  pilot_stress_relative_rmse_threshold: 0.65
+  gpu_case_cache_size: 2
+  divergence_position: 0.1
+  minimum_predicted_j: 1.0e-4
+  maximum_predicted_i2_bar: 1.0e6
+  # No native HyperContact surrogate baseline exists yet. Select checkpoints by
+  # the absolute worst validation metric and reject any supplied native artifact.
+  checkpoint_reference_mode: absolute_validation
+  require_native_reference_provenance: false
+  native_reference_file: null
+
+evaluation:
+  save_cell_stress: true

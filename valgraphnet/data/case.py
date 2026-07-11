@@ -33,6 +33,9 @@ class ValveCase:
     normals: np.ndarray
     nodal_area: np.ndarray
     mesh_edge_index: np.ndarray
+    contact_surface_mask: np.ndarray = field(
+        default_factory=lambda: np.zeros((0,), dtype=bool)
+    )
     cells: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 4), dtype=np.int64)
     )
@@ -203,6 +206,19 @@ def load_case(case_dir: str | Path) -> ValveCase:
     pressure_mask = _load_optional(
         root, "pressure_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
     ).astype(bool, copy=False)
+    contact_surface_path = root / "contact_surface_mask.npy"
+    if contact_surface_path.exists():
+        contact_surface_mask = np.load(
+            contact_surface_path, allow_pickle=False, mmap_mode="r"
+        ).astype(bool, copy=False)
+        if contact_surface_mask.shape != (nodes.shape[0],):
+            raise ValueError(
+                f"{root}: contact_surface_mask.npy must have shape [{nodes.shape[0]}]"
+            )
+    else:
+        # Empty distinguishes an absent optional mask from an explicitly empty
+        # contact surface. CHP can then retain its tetra-boundary fallback.
+        contact_surface_mask = np.zeros((0,), dtype=bool)
     leaflet_id = _load_optional(
         root, "leaflet_id.npy", np.zeros(nodes.shape[0], dtype=np.int64)
     ).astype(np.int64, copy=False)
@@ -216,6 +232,7 @@ def load_case(case_dir: str | Path) -> ValveCase:
     fixed_mask = np.array(fixed_mask, dtype=bool, copy=True)
     prescribed_mask = np.array(prescribed_mask, dtype=bool, copy=True)
     pressure_mask = np.array(pressure_mask, dtype=bool, copy=True)
+    contact_surface_mask = np.array(contact_surface_mask, dtype=bool, copy=True)
     leaflet_id = np.array(leaflet_id, dtype=np.int64, copy=True)
     thickness = np.array(thickness, dtype=np.float32, copy=True)
 
@@ -224,7 +241,11 @@ def load_case(case_dir: str | Path) -> ValveCase:
         elements.ndim == 2
         and elements.shape[1] == 2
         and metadata.get("element_representation")
-        == "unique two-node mesh edges derived from tetrahedral cells"
+        in {
+            "unique two-node mesh edges derived from tetrahedral cells",
+            "unique two-node mesh edges derived from tetrahedral cells and indenter triangles",
+            "directed two-node mesh edges derived from tetrahedral cells and indenter triangles",
+        }
     ):
         mesh_edge_index = np.asarray(elements, dtype=np.int64).T
     else:
@@ -255,6 +276,7 @@ def load_case(case_dir: str | Path) -> ValveCase:
         normals=normals,
         nodal_area=nodal_area,
         mesh_edge_index=mesh_edge_index,
+        contact_surface_mask=contact_surface_mask,
         cells=cells,
         dm_inv=dm_inv,
         reference_volume=reference_volume,
