@@ -27,6 +27,19 @@ determinants, inverses, stress, and force assembly.
   --split-file data\deforming_plate_cases_400\splits.json `
   --native-dir <native-npz-dir> --out <native-standard-dir>
 
+# Frozen validation reference for checkpoint selection. This must not point at
+# test artifacts; the loader verifies the split, ordered cases, and 400 frames.
+.venv\Scripts\python.exe -m examples.deforming_plate.rollout_eval `
+  --config examples\deforming_plate\config.full_400.yaml `
+  --checkpoint <native-best.pt> --split val --max-cases 20 `
+  --case-selection even --out <native-val20-npz-dir>
+.venv\Scripts\python.exe scripts\standardize_native_rollouts.py `
+  --case-root data\deforming_plate_cases_400 `
+  --split-file data\deforming_plate_cases_400\splits.json `
+  --split val --max-cases 20 --case-selection even `
+  --native-dir <native-val20-npz-dir> `
+  --out outputs\deforming_plate_chp_evidence\native_val20
+
 # 3. Corrected four-output MGN: delta-x + asinh stress
 .venv\Scripts\python.exe scripts\train_fair_deforming_plate.py `
   --config configs\deforming_plate_fair_mgn.full400.yaml
@@ -60,10 +73,13 @@ one improving metric cannot compensate for another regressing metric.
 
 ## Constitutive and benchmark gates
 
-The exact-geometry teacher-stress gate is checked after the four K=1 epochs.
-Failure at relative RMSE 0.50 stops the rollout curriculum. Cell memory is off
-by default and is enabled only when `scripts/diagnose_cell_memory.py` reports a
-conditional-to-global stress variance above 0.10.
+The exact-geometry teacher-stress gate is checked immediately after
+constitutive pretraining and checked again after the four K=1 epochs. Failure
+at relative RMSE 0.50 stops dynamics and rollout training before they can mask
+a constitutive failure. The K=1 rollout pilot is an independent gate. Cell
+memory is off by default and is enabled only when
+`scripts/diagnose_cell_memory.py` reports a conditional-to-global stress
+variance above 0.10.
 
 HyperContact-3D decks and deterministic ID/material/load/mesh/combined OOD
 splits are generated with:
