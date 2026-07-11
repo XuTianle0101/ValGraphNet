@@ -9,6 +9,8 @@ Run inside Abaqus Python, for example:
       --fixed-set ATTACHMENT \
       --pressure-surface VENTRICULAR_SURFACE \
       --leaflet-sets LEAFLET_1,LEAFLET_2,LEAFLET_3 \
+      --geometry-id geometry_001 \
+      --material-id material_001 \
       --pressure-csv pressure.csv
 """
 
@@ -74,10 +76,13 @@ def main() -> None:
         s_cell_integration_point = s_integration_point[:, cell_source_indices]
         cell_integration_point_mask = integration_point_mask[:, cell_source_indices]
         le_cell = le_element[:, cell_source_indices]
-        material, density, fiber_direction, material_features = load_material_sidecars(
-            args,
-            cell_element_labels,
-        )
+        (
+            material,
+            density,
+            fiber_direction,
+            material_features,
+            material_feature_names,
+        ) = load_material_sidecars(args, cell_element_labels)
         dm_inv, reference_volume, shape_gradients = tetra_reference_geometry(nodes, cells)
         lumped_mass = lumped_tetra_mass(
             nodes.shape[0],
@@ -138,8 +143,9 @@ def main() -> None:
                 "S": args.s_field,
                 "LE": args.strain_field,
             },
-            "stress_tensor_components": ["S11", "S22", "S33", "S12", "S13", "S23"],
-            "strain_tensor_components": ["LE11", "LE22", "LE33", "LE12", "LE13", "LE23"],
+            "stress_tensor_components": list(STRESS_TENSOR_COMPONENT_NAMES),
+            "strain_tensor_components": list(STRAIN_TENSOR_COMPONENT_NAMES),
+            "material_feature_names": material_feature_names,
             "element_stress_representation": "integration-point values and their masked mean",
             "cell_representation": "four-node C3D4-family linear tetrahedra",
             "material_json": args.material_json,
@@ -148,6 +154,10 @@ def main() -> None:
             "num_cells": int(cells.shape[0]),
             "num_frames": int(times.shape[0]),
         }
+        if args.geometry_id is not None:
+            metadata["geometry_id"] = args.geometry_id
+        if args.material_id is not None:
+            metadata["material_id"] = args.material_id
         with (out / "metadata.json").open("w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
         print("Exported ValGraphNet case:", out)
@@ -163,6 +173,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--out", required=True)
     parser.add_argument("--instance", default=None)
     parser.add_argument("--case-id", default=None)
+    parser.add_argument(
+        "--geometry-id",
+        default=None,
+        help="Explicit reference-geometry group id used for strict OOD splitting.",
+    )
+    parser.add_argument(
+        "--material-id",
+        default=None,
+        help="Explicit material-parameter-set id used for strict OOD splitting.",
+    )
     parser.add_argument("--fixed-set", required=True)
     parser.add_argument("--pressure-surface", required=True)
     parser.add_argument("--leaflet-sets", default="")
@@ -176,7 +196,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--material-json",
         default=None,
-        help="Optional material metadata JSON copied into the exported case.",
+        help=(
+            "Optional material metadata JSON copied into the exported case. "
+            "When material_features are present it must include an ordered "
+            "material_feature_names list."
+        ),
     )
     parser.add_argument(
         "--density",
@@ -355,6 +379,8 @@ def nodal_stress_field(frame, instance, label_to_index: dict[int, int], field_na
 
 
 TENSOR_COMPONENTS = ("11", "22", "33", "12", "13", "23")
+STRESS_TENSOR_COMPONENT_NAMES = tuple("S%s" % suffix for suffix in TENSOR_COMPONENTS)
+STRAIN_TENSOR_COMPONENT_NAMES = tuple("LE%s" % suffix for suffix in TENSOR_COMPONENTS)
 
 
 def export_element_tensor_frames(
@@ -497,7 +523,7 @@ def lumped_tetra_mass(
 def load_material_sidecars(
     args: argparse.Namespace,
     cell_element_labels: np.ndarray,
-) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """Load optional material metadata and cell-aligned numeric sidecars."""
 
     material: dict[str, Any] = {}
@@ -537,7 +563,40 @@ def load_material_sidecars(
 
     feature_source: Any = material.get("material_features", np.zeros((num_cells, 0)))
     material_features = align_material_features(feature_source, cell_element_labels)
-    return material, density, fiber_direction, material_features
+    material_feature_names = validate_material_feature_names(
+        material.get("material_feature_names"), material_features.shape[1]
+    )
+    return material, density, fiber_direction, material_features, material_feature_names
+
+
+def validate_material_feature_names(value: Any, feature_width: int) -> list[str]:
+    """Validate the ordered semantic schema of material feature columns."""
+
+    if value is None:
+        if feature_width:
+            raise ValueError(
+                "material_json must define an ordered material_feature_names list "
+                "when material_features are present"
+            )
+        return []
+    if not isinstance(value, list):
+        raise ValueError("material_feature_names must be a JSON list")
+    names: list[str] = []
+    for index, name in enumerate(value):
+        if not isinstance(name, str) or not name or name != name.strip():
+            raise ValueError(
+                "material_feature_names[%d] must be a non-empty string without "
+                "outer whitespace" % index
+            )
+        names.append(name)
+    if len(names) != int(feature_width):
+        raise ValueError(
+            "material_feature_names length (%d) must equal material feature width (%d)"
+            % (len(names), feature_width)
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("material_feature_names entries must be unique")
+    return names
 
 
 def load_numeric_sidecar(path: str | Path) -> Any:

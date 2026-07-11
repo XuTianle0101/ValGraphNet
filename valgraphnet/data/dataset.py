@@ -12,6 +12,10 @@ from torch.utils.data import Dataset
 from valgraphnet.config import get_cfg
 from valgraphnet.constants import BASE_OUTPUT_DIM
 from valgraphnet.data.case import ValveCase, discover_case_dirs, load_case, read_split_file
+from valgraphnet.data.valve_ood import (
+    validate_case_collection_requirements,
+    validate_case_requirements,
+)
 from valgraphnet.geometry import (
     ContactConfig,
     build_contact_edges,
@@ -43,6 +47,9 @@ class ValveGraphDataset(Dataset):
             raise FileNotFoundError(f"No exported cases found under {data_root}")
 
         self.cases = [load_case(path) for path in case_dirs]
+        for case in self.cases:
+            validate_case_requirements(case, self.cfg)
+        validate_case_collection_requirements(self.cases, self.cfg)
         self.samples: list[tuple[int, int]] = []
         self.trajectory_index_groups: list[range] = []
         for case_idx, case in enumerate(self.cases):
