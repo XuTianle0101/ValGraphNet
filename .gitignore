@@ -10,6 +10,7 @@ __pycache__/
 data/raw/
 data/processed/
 data/deforming_plate_cases*/
+data/hypercontact3d_raw/
 raw_dataset/
 preprocessed_dataset/
 outputs/

@@ -47,8 +47,18 @@ def run_rollout_eval(
     edge_stats = load_stats(cache_dir / "edge_stats.pt")
     node_stats = load_stats(cache_dir / "node_stats.pt")
     checkpoint = _torch_load(checkpoint_path)
-    ckpt_cfg = checkpoint.get("cfg", cfg)
+    ckpt_cfg = copy.deepcopy(checkpoint.get("cfg", cfg))
+    # Architecture/training semantics come from the checkpoint, while the
+    # requested data split and artifact policy come from the evaluation config.
+    # This permits a frozen 200-frame checkpoint to be audited on the complete
+    # 400-frame test set without silently falling back to its old five-case split.
+    if "data" in cfg:
+        ckpt_cfg["data"] = copy.deepcopy(cfg["data"])
+    if "rollout" in cfg:
+        ckpt_cfg["rollout"] = copy.deepcopy(cfg["rollout"])
     device = resolve_device(str(get_cfg(ckpt_cfg, "training.device", "auto")))
+    if device.type != "cuda":
+        raise RuntimeError("deforming_plate rollout evaluation requires CUDA")
     print(f"rollout device: {device}", flush=True)
 
     inference_cfg = copy.deepcopy(ckpt_cfg)

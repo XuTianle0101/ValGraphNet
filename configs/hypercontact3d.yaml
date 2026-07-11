@@ -1,0 +1,59 @@
+# Reproducible open hyperelastic-contact benchmark generated for CalculiX.
+# Every quantity is expressed in SI units.  The Cartesian grid is partitioned
+# before generation, making material, load, mesh, and combined OOD sets explicit.
+benchmark:
+  name: HyperContact-3D
+  schema_version: 1
+  split_seed: 20260712
+  id_test_fraction: 0.20
+
+geometry:
+  block_size_m: [0.040, 0.040, 0.012]
+  indenter_radius_m: 0.008
+  initial_gap_m: 0.00020
+  indenter_rings: 7
+  indenter_segments: 32
+  indenter_cap_angle_degrees: 70.0
+  indenter_shell_thickness_m: 0.00010
+
+solver:
+  minimum_version: "2.18"
+  target_increments: 100
+  minimum_increment: 1.0e-7
+  contact_penalty_factor: 50.0
+  contact_tension_fraction: 0.0025
+  contact_search_factor: 0.05
+  friction_coefficient: 0.0
+
+parameter_grid:
+  material:
+    train:
+      - {c10_pa: 2.0e5, poisson_ratio: 0.45, density_kg_m3: 1000.0}
+      - {c10_pa: 4.0e5, poisson_ratio: 0.45, density_kg_m3: 1000.0}
+      - {c10_pa: 6.0e5, poisson_ratio: 0.45, density_kg_m3: 1000.0}
+    interpolation:
+      - {c10_pa: 3.0e5, poisson_ratio: 0.45, density_kg_m3: 1000.0}
+    ood:
+      - {c10_pa: 1.0e5, poisson_ratio: 0.40, density_kg_m3: 1000.0}
+      - {c10_pa: 9.0e5, poisson_ratio: 0.475, density_kg_m3: 1100.0}
+
+  load:
+    train:
+      - {indentation_m: 0.00075, offset_x_m: 0.000, offset_y_m: 0.000}
+      - {indentation_m: 0.00150, offset_x_m: 0.000, offset_y_m: 0.000}
+      - {indentation_m: 0.00225, offset_x_m: 0.000, offset_y_m: 0.000}
+      - {indentation_m: 0.00150, offset_x_m: 0.003, offset_y_m: 0.000}
+      - {indentation_m: 0.00150, offset_x_m: 0.000, offset_y_m: -0.003}
+    interpolation:
+      - {indentation_m: 0.001125, offset_x_m: 0.0015, offset_y_m: 0.0015}
+    ood:
+      - {indentation_m: 0.00350, offset_x_m: 0.000, offset_y_m: 0.000}
+
+  mesh:
+    train:
+      - {nx: 4, ny: 4, nz: 2}
+      - {nx: 6, ny: 6, nz: 3}
+    interpolation:
+      - {nx: 5, ny: 5, nz: 3}
+    ood:
+      - {nx: 9, ny: 9, nz: 5}

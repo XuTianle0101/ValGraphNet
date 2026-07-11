@@ -602,22 +602,30 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             horizon=horizon,
             amp_dtype=amp_dtype,
         )
-        rollout_metrics = (
-            evaluate_chp_rollouts(
+        stage_ends = _curriculum_stage_ends(stages)
+        validation_every = int(get_cfg(cfg, "validation.every", 1))
+        validate_now = (
+            epoch == epochs
+            or epoch in stage_ends
+            or (
+                not bool(get_cfg(cfg, "validation.stage_end_only", False))
+                and validation_every > 0
+                and epoch % validation_every == 0
+            )
+        )
+        if validate_now and val_dataset is not None and val_cache is not None:
+            rollout_metrics = evaluate_chp_rollouts(
                 model, val_dataset.cases, val_cache, cfg, amp_dtype=amp_dtype
             )
-            if val_dataset is not None and val_cache is not None
-            else {key: float("inf") for key in ROLLOUT_METRIC_KEYS}
-        )
-        teacher_metrics = (
-            evaluate_teacher_forced_stress(
+            teacher_metrics = evaluate_teacher_forced_stress(
                 model, val_dataset.cases, val_cache, cfg, amp_dtype=amp_dtype
             )
-            if val_dataset is not None and val_cache is not None
-            else {"teacher_stress_relative_rmse": float("inf")}
-        )
-        rollout_metrics.update(teacher_metrics)
-        score = minimax_checkpoint_score(rollout_metrics, native_reference)
+            rollout_metrics.update(teacher_metrics)
+            score = minimax_checkpoint_score(rollout_metrics, native_reference)
+        else:
+            rollout_metrics = {}
+            teacher_metrics = {}
+            score = None
         peak_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
         record = {
             "epoch": epoch,
@@ -632,6 +640,10 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
         history = [item for item in history if int(item["epoch"]) != epoch]
         history.append(record)
         _save_json(output_dir / "history.json", sorted(history, key=lambda x: x["epoch"]))
+        checkpoint_score = float(score) if score is not None else 1.0e30
+        checkpoint_best = min(best_score, checkpoint_score)
+        if not math.isfinite(checkpoint_best):
+            checkpoint_best = 1.0e30
         payload = _checkpoint_payload(
             model,
             optimizer,
@@ -640,23 +652,26 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             normalizers,
             cfg,
             epoch,
-            score,
-            min(best_score, score),
+            checkpoint_score,
+            checkpoint_best,
             rollout_metrics,
             material_dim,
         )
         torch.save(payload, output_dir / "latest.pt")
-        if score < best_score:
+        if score is not None and score < best_score:
             best_score = score
             payload["best_score"] = best_score
             torch.save(payload, output_dir / "best.pt")
+        score_label = f"{score:.4g}" if score is not None else "not-evaluated"
         print(
             f"epoch={epoch:02d} K={horizon:02d} loss={train_metrics['loss']:.5g} "
-            f"score={score:.4g} peak={peak_gib:.2f}GiB "
+            f"score={score_label} peak={peak_gib:.2f}GiB "
             f"time={record['seconds']:.1f}s"
         )
         gate_epoch = _teacher_gate_epoch(stages)
-        teacher_relative = float(teacher_metrics["teacher_stress_relative_rmse"])
+        teacher_relative = float(
+            teacher_metrics.get("teacher_stress_relative_rmse", float("inf"))
+        )
         teacher_threshold = float(
             get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
         )
@@ -1028,7 +1043,10 @@ def load_chp_checkpoint(
     checkpoint = _torch_load(path, device)
     if int(checkpoint.get("schema_version", 0)) != CHPGNS.checkpoint_schema_version:
         raise ValueError("legacy checkpoints cannot populate the CHP physical decoder")
-    model = CHPGNS(cfg, material_dim=int(checkpoint.get("material_dim", 0))).to(device)
+    effective_cfg = checkpoint.get("config", cfg)
+    model = CHPGNS(
+        effective_cfg, material_dim=int(checkpoint.get("material_dim", 0))
+    ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     normalizers = CHPNormalizers.from_state_dict(checkpoint["normalizers"]).to(device)
@@ -1143,6 +1161,22 @@ def _teacher_gate_epoch(stages: Iterable[dict[str, int]] | None) -> int:
             break
         total += int(stage["epochs"])
     return max(total, 1)
+
+
+def _curriculum_stage_ends(stages: Iterable[dict[str, int]] | None) -> set[int]:
+    schedule = list(stages or (
+        {"horizon": 1, "epochs": 4},
+        {"horizon": 2, "epochs": 3},
+        {"horizon": 4, "epochs": 3},
+        {"horizon": 8, "epochs": 3},
+        {"horizon": 16, "epochs": 3},
+    ))
+    total = 0
+    ends = set()
+    for stage in schedule:
+        total += int(stage["epochs"])
+        ends.add(total)
+    return ends
 
 
 def _accumulate(totals: dict[str, float], values: dict[str, torch.Tensor]) -> None:

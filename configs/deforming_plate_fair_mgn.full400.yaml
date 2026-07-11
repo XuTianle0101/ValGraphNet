@@ -1,0 +1,70 @@
+# Corrected fair MeshGraphNet baseline for the complete 400-frame benchmark.
+# Neural training and rollout evaluation are deliberately CUDA/BF16-only.
+seed: 42
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+  pressure_sign: 1.0
+  noise_std: 0.003
+
+model:
+  processor_size: 15
+  hidden_dim_processor: 128
+  hidden_dim_node_decoder: 128
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  aggregation: sum
+  activation: relu
+  num_processor_checkpoint_segments: 3
+
+contact:
+  enabled: true
+  radius: 0.03
+  max_neighbors: 32
+  max_edges: 200000
+  different_leaflets_only: false
+
+loss:
+  position: 1.0
+  stress: 1.0
+  huber_delta: 1.0
+  peak_fraction: 0.1
+  peak_weight: 0.5
+
+training:
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+  epochs: 30
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  fused_optimizer: true
+  # Exactly one uniformly sampled frame from every trajectory in each epoch.
+  steps_per_trajectory_per_epoch: 1
+  normalizer_graphs: 128
+  normalizer_cases: 128
+  normalizer_frames: 8
+  normalizer_nodes: 256
+  stress_normalizer_values: 1000000
+  gpu_case_cache_size: 3
+  output_dir: outputs/deforming_plate_fair_mgn_full400_seed42
+  resume_from: auto
+  save_every: 1
+
+validation:
+  every: 3
+  cases: 20
+  steps: 399
+  divergence_position: 10.0
+  # The frozen experiment fails fast until the full-400 native reference is
+  # provided, preventing a raw weighted/checkpoint score from being reported as
+  # the required native-ratio minimax score.
+  require_native_reference: true
+  native_reference_file: outputs/deforming_plate_chp_evidence/native/metrics.json

@@ -341,7 +341,19 @@ def _build_case_backed_datasets(
         edge_stats = load_stats(edge_path)
         node_stats = load_stats(node_path)
     else:
-        edge_stats, node_stats = _fit_case_backed_stats(cfg)
+        source_dir = get_cfg(cfg, "data.stats_source_dir", None)
+        source_edge = Path(source_dir) / "edge_stats.pt" if source_dir else None
+        source_node = Path(source_dir) / "node_stats.pt" if source_dir else None
+        if (
+            source_edge is not None
+            and source_node is not None
+            and source_edge.exists()
+            and source_node.exists()
+        ):
+            edge_stats = load_stats(source_edge)
+            node_stats = load_stats(source_node)
+        else:
+            edge_stats, node_stats = _fit_case_backed_stats(cfg)
         save_stats(edge_path, edge_stats)
         save_stats(node_path, node_stats)
 

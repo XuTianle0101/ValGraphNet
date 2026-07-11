@@ -11,6 +11,9 @@ data:
   val_case_split: val
   test_case_split: test
   preprocess_output_dir: preprocessed_dataset/deforming_plate_full_400
+  # Input/target statistics were fitted on all 1,000 training trajectories in
+  # the existing 200-frame run; reuse them without reading any test labels.
+  stats_source_dir: preprocessed_dataset/deforming_plate_full_case_backed
   train_split: train
   val_split: valid
   test_split: test
@@ -52,7 +55,7 @@ training:
   save_every: 1
   save_latest: true
   resume_from: auto
-  device: auto
+  device: cuda
   amp: true
   amp_dtype: bfloat16
 
