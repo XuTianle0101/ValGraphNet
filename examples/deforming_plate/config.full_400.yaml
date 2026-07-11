@@ -1,0 +1,63 @@
+# Full, non-destructive 400-frame deforming_plate conversion and experiment config.
+# Running convert_to_cases with this file writes to a new case directory and does
+# not overwrite the existing 200-frame data/deforming_plate_cases dataset.
+seed: 42
+
+data:
+  data_dir: raw_dataset/deforming_plate/deforming_plate
+  case_dir: data/deforming_plate_cases_400
+  case_split_file: data/deforming_plate_cases_400/splits.json
+  train_case_split: train
+  val_case_split: val
+  test_case_split: test
+  preprocess_output_dir: preprocessed_dataset/deforming_plate_full_400
+  train_split: train
+  val_split: valid
+  test_split: test
+  num_training_samples: 1000
+  num_validation_samples: 100
+  num_test_samples: 100
+  num_training_time_steps: 400
+  num_validation_time_steps: 400
+  num_test_time_steps: 400
+  noise_std: 0.003
+
+graph:
+  world_edge_radius: 0.03
+  max_world_neighbors: 32
+
+model:
+  processor_size: 15
+  hidden_dim_processor: 128
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  do_concat_trick: false
+  num_processor_checkpoint_segments: 3
+  checkpoint_offloading: false
+  recompute_activation: false
+
+training:
+  batch_size: 1
+  epochs: 30
+  steps_per_trajectory_per_epoch: 1
+  validation_steps_per_trajectory: 3
+  lr: 1.0e-4
+  lr_decay_rate: 0.9999917
+  weight_decay: 0.0
+  num_workers: 0
+  output_dir: outputs/deforming_plate_full_400
+  save_every: 1
+  save_latest: true
+  resume_from: auto
+  device: auto
+  amp: true
+  amp_dtype: bfloat16
+
+rollout:
+  output_dir: outputs/deforming_plate_full_400/rollout_eval
+  frame_skip: 20
+  make_gif: false
+  gif_name: animation.gif

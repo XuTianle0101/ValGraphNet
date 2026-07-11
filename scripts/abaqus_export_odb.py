@@ -19,6 +19,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -37,6 +38,11 @@ def main() -> None:
         labels, nodes = export_nodes(instance)
         label_to_index = {int(label): idx for idx, label in enumerate(labels)}
         elements = export_elements(instance, label_to_index)
+        element_labels = export_element_labels(instance)
+        cells, cell_source_indices, cell_element_labels = export_tetrahedral_cells(
+            instance,
+            label_to_index,
+        )
         fixed_mask = export_node_mask(odb, instance, args.fixed_set, label_to_index)
         pressure_mask = export_pressure_mask(odb, instance, args.pressure_surface, label_to_index)
         leaflet_id = export_leaflet_ids(odb, instance, args.leaflet_sets, label_to_index)
@@ -52,24 +58,74 @@ def main() -> None:
         )
         pressure = load_pressure(args.pressure_csv, times)
         thickness = np.full(nodes.shape[0], args.thickness, dtype=np.float32)
+        s_element, s_integration_point, integration_point_mask = export_element_tensor_frames(
+            odb,
+            instance,
+            element_labels,
+            args.s_field,
+        )
+        le_element, _, strain_integration_point_mask = export_element_tensor_frames(
+            odb,
+            instance,
+            element_labels,
+            args.strain_field,
+        )
+        s_cell = s_element[:, cell_source_indices]
+        s_cell_integration_point = s_integration_point[:, cell_source_indices]
+        cell_integration_point_mask = integration_point_mask[:, cell_source_indices]
+        le_cell = le_element[:, cell_source_indices]
+        material, density, fiber_direction, material_features = load_material_sidecars(
+            args,
+            cell_element_labels,
+        )
+        dm_inv, reference_volume, shape_gradients = tetra_reference_geometry(nodes, cells)
+        lumped_mass = lumped_tetra_mass(
+            nodes.shape[0],
+            cells,
+            reference_volume,
+            density,
+        )
 
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
         np.save(out / "nodes.npy", nodes)
         np.save(out / "elements.npy", elements)
+        np.save(out / "element_labels.npy", element_labels)
+        np.save(out / "cells.npy", cells)
+        np.save(out / "cell_element_labels.npy", cell_element_labels)
         np.save(out / "times.npy", times)
         np.save(out / "pressure.npy", pressure)
         np.save(out / "U.npy", u)
         np.save(out / "V.npy", v)
         np.save(out / "A.npy", a)
         np.save(out / "S.npy", s)
+        np.save(out / "S_element.npy", s_element)
+        np.save(out / "S_element_integration_point.npy", s_integration_point)
+        np.save(out / "element_integration_point_mask.npy", integration_point_mask)
+        np.save(out / "S_cell.npy", s_cell)
+        np.save(out / "S_integration_point.npy", s_cell_integration_point)
+        np.save(out / "integration_point_mask.npy", cell_integration_point_mask)
+        if np.any(strain_integration_point_mask):
+            np.save(out / "LE_element.npy", le_element)
+            np.save(out / "LE_cell.npy", le_cell)
         np.save(out / "fixed_mask.npy", fixed_mask)
         np.save(out / "pressure_mask.npy", pressure_mask)
         np.save(out / "leaflet_id.npy", leaflet_id)
         np.save(out / "thickness.npy", thickness)
+        np.save(out / "Dm_inv.npy", dm_inv)
+        np.save(out / "reference_volume.npy", reference_volume)
+        np.save(out / "shape_gradients.npy", shape_gradients)
+        np.save(out / "lumped_mass.npy", lumped_mass)
+        np.save(out / "density.npy", density)
+        np.save(out / "fiber_direction.npy", fiber_direction)
+        np.save(out / "material_features.npy", material_features)
+        if material:
+            with (out / "material.json").open("w", encoding="utf-8") as f:
+                json.dump(material, f, indent=2)
 
         metadata = {
             "case_id": args.case_id or out.name,
+            "schema_version": 2,
             "odb": str(Path(args.odb).resolve()),
             "instance": instance.name,
             "fixed_set": args.fixed_set,
@@ -80,9 +136,16 @@ def main() -> None:
                 "V": args.v_field,
                 "A": args.a_field,
                 "S": args.s_field,
+                "LE": args.strain_field,
             },
+            "stress_tensor_components": ["S11", "S22", "S33", "S12", "S13", "S23"],
+            "strain_tensor_components": ["LE11", "LE22", "LE33", "LE12", "LE13", "LE23"],
+            "element_stress_representation": "integration-point values and their masked mean",
+            "cell_representation": "four-node C3D4-family linear tetrahedra",
+            "material_json": args.material_json,
             "num_nodes": int(nodes.shape[0]),
             "num_elements": int(elements.shape[0]),
+            "num_cells": int(cells.shape[0]),
             "num_frames": int(times.shape[0]),
         }
         with (out / "metadata.json").open("w", encoding="utf-8") as f:
@@ -109,6 +172,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--v-field", default="V")
     parser.add_argument("--a-field", default="A")
     parser.add_argument("--s-field", default="S")
+    parser.add_argument("--strain-field", default="LE")
+    parser.add_argument(
+        "--material-json",
+        default=None,
+        help="Optional material metadata JSON copied into the exported case.",
+    )
+    parser.add_argument(
+        "--density",
+        type=float,
+        default=None,
+        help="Uniform cell density in the ODB unit system.",
+    )
+    parser.add_argument(
+        "--density-file",
+        default=None,
+        help="Optional .npy/.csv/.json scalar density sidecar aligned by cell or element label.",
+    )
+    parser.add_argument(
+        "--fiber-direction-file",
+        default=None,
+        help="Optional .npy/.csv/.json [M,3] fiber sidecar aligned by cell or element label.",
+    )
     return parser.parse_args(argv)
 
 
@@ -142,6 +227,43 @@ def export_elements(instance, label_to_index: dict[int, int]) -> np.ndarray:
     for row_idx, conn in enumerate(rows):
         out[row_idx, : len(conn)] = conn
     return out
+
+
+def export_element_labels(instance) -> np.ndarray:
+    """Return Abaqus element labels in the same order as ``export_elements``."""
+
+    return np.asarray(
+        [
+            int(element.label)
+            for element in sorted(instance.elements, key=lambda elem: int(elem.label))
+        ],
+        dtype=np.int64,
+    )
+
+
+def export_tetrahedral_cells(
+    instance,
+    label_to_index: dict[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Export real four-node C3D4-family cells and their all-element row indices."""
+
+    cells = []
+    source_indices = []
+    labels = []
+    ordered = sorted(instance.elements, key=lambda elem: int(elem.label))
+    for source_idx, element in enumerate(ordered):
+        element_type = str(getattr(element, "type", "")).upper()
+        connectivity = list(element.connectivity)
+        if not element_type.startswith("C3D4") or len(connectivity) != 4:
+            continue
+        cells.append([label_to_index[int(label)] for label in connectivity])
+        source_indices.append(source_idx)
+        labels.append(int(element.label))
+    return (
+        np.asarray(cells, dtype=np.int64).reshape(-1, 4),
+        np.asarray(source_indices, dtype=np.int64),
+        np.asarray(labels, dtype=np.int64),
+    )
 
 
 def export_frames(
@@ -230,6 +352,283 @@ def nodal_stress_field(frame, instance, label_to_index: dict[int, int], field_na
         counts[idx] += 1.0
     counts[counts == 0.0] = 1.0
     return (accum / counts).astype(np.float32)
+
+
+TENSOR_COMPONENTS = ("11", "22", "33", "12", "13", "23")
+
+
+def export_element_tensor_frames(
+    odb,
+    instance,
+    element_labels: np.ndarray,
+    field_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Export canonical symmetric tensors at each element integration point.
+
+    The returned arrays are ``[T,E,6]``, ``[T,E,I,6]`` and ``[T,E,I]``.
+    The last mask makes padding explicit when element types use different numbers
+    of integration points or a field is unavailable at a frame.
+    """
+
+    frames = []
+    for step in odb.steps.values():
+        frames.extend(step.frames)
+    label_to_index = {int(label): idx for idx, label in enumerate(element_labels)}
+    records = []
+    max_points = 0
+    missing_warned = False
+    for frame in frames:
+        field = frame.fieldOutputs.get(field_name)
+        by_element: dict[int, list[np.ndarray]] = {}
+        if field is None:
+            if not missing_warned:
+                print("Warning: missing element field %s" % field_name)
+                missing_warned = True
+            records.append(by_element)
+            continue
+        try:
+            from abaqusConstants import INTEGRATION_POINT
+
+            subset = field.getSubset(region=instance, position=INTEGRATION_POINT)
+        except Exception:
+            subset = field.getSubset(region=instance)
+        component_labels = tuple(
+            str(label).upper() for label in getattr(field, "componentLabels", ())
+        )
+        for value in subset.values:
+            element_label = getattr(value, "elementLabel", None)
+            if element_label is None or int(element_label) not in label_to_index:
+                continue
+            tensor = canonical_tensor6(value.data, component_labels, field_name)
+            by_element.setdefault(int(element_label), []).append(tensor)
+        if by_element:
+            max_points = max(max_points, max(len(values) for values in by_element.values()))
+        records.append(by_element)
+
+    num_frames = len(frames)
+    num_elements = int(element_labels.shape[0])
+    integration = np.zeros((num_frames, num_elements, max_points, 6), dtype=np.float32)
+    mask = np.zeros((num_frames, num_elements, max_points), dtype=bool)
+    for frame_idx, by_element in enumerate(records):
+        for element_label, values in by_element.items():
+            element_idx = label_to_index[element_label]
+            count = len(values)
+            integration[frame_idx, element_idx, :count] = np.asarray(values, dtype=np.float32)
+            mask[frame_idx, element_idx, :count] = True
+
+    element_mean = np.zeros((num_frames, num_elements, 6), dtype=np.float32)
+    counts = mask.sum(axis=2, keepdims=True)
+    if max_points:
+        total = (integration * mask[..., None]).sum(axis=2)
+        np.divide(total, np.maximum(counts, 1), out=element_mean, where=counts > 0)
+    return element_mean, integration, mask
+
+
+def canonical_tensor6(data, component_labels: tuple[str, ...], field_name: str) -> np.ndarray:
+    """Map Abaqus tensor data to 11,22,33,12,13,23 component order."""
+
+    values = np.asarray(data, dtype=np.float32).reshape(-1)
+    out = np.zeros((6,), dtype=np.float32)
+    if component_labels and len(component_labels) == values.size:
+        normalized = [label.removeprefix(field_name.upper()) for label in component_labels]
+        for value, suffix in zip(values, normalized, strict=False):
+            if suffix in TENSOR_COMPONENTS:
+                out[TENSOR_COMPONENTS.index(suffix)] = value
+        return out
+    if values.size >= 6:
+        out[:] = values[:6]
+    elif values.size == 4:
+        out[[0, 1, 2, 3]] = values
+    else:
+        out[: values.size] = values
+    return out
+
+
+def tetra_reference_geometry(
+    nodes: np.ndarray,
+    cells: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Precompute linear-tetrahedron reference geometry."""
+
+    if cells.shape[0] == 0:
+        return (
+            np.zeros((0, 3, 3), dtype=np.float32),
+            np.zeros((0, 1), dtype=np.float32),
+            np.zeros((0, 4, 3), dtype=np.float32),
+        )
+    vertices = np.asarray(nodes, dtype=np.float64)[cells]
+    dm = np.stack(
+        (
+            vertices[:, 1] - vertices[:, 0],
+            vertices[:, 2] - vertices[:, 0],
+            vertices[:, 3] - vertices[:, 0],
+        ),
+        axis=-1,
+    )
+    determinant = np.linalg.det(dm)
+    if np.any(np.abs(determinant) <= np.finfo(np.float64).eps):
+        bad = np.flatnonzero(np.abs(determinant) <= np.finfo(np.float64).eps)[:5].tolist()
+        raise ValueError("Degenerate tetrahedral cells at indices %s" % bad)
+    dm_inv = np.linalg.inv(dm)
+    gradients = np.empty((cells.shape[0], 4, 3), dtype=np.float64)
+    gradients[:, 1:, :] = dm_inv
+    gradients[:, 0, :] = -dm_inv.sum(axis=1)
+    return (
+        dm_inv.astype(np.float32),
+        (np.abs(determinant) / 6.0).astype(np.float32)[:, None],
+        gradients.astype(np.float32),
+    )
+
+
+def lumped_tetra_mass(
+    num_nodes: int,
+    cells: np.ndarray,
+    reference_volume: np.ndarray,
+    density: np.ndarray,
+) -> np.ndarray:
+    mass = np.zeros((num_nodes, 1), dtype=np.float32)
+    if cells.size:
+        contribution = reference_volume[:, 0] * density[:, 0] / 4.0
+        for local_idx in range(4):
+            np.add.at(mass[:, 0], cells[:, local_idx], contribution)
+    return mass
+
+
+def load_material_sidecars(
+    args: argparse.Namespace,
+    cell_element_labels: np.ndarray,
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+    """Load optional material metadata and cell-aligned numeric sidecars."""
+
+    material: dict[str, Any] = {}
+    if args.material_json:
+        with Path(args.material_json).open("r", encoding="utf-8") as f:
+            material = json.load(f)
+        if not isinstance(material, dict):
+            raise ValueError("--material-json must contain a JSON object")
+
+    num_cells = int(cell_element_labels.shape[0])
+    density_source: Any = args.density
+    if density_source is None:
+        density_source = material.get("density", 1.0)
+    if args.density_file:
+        density_source = load_numeric_sidecar(args.density_file)
+    density = align_cell_values(
+        density_source,
+        cell_element_labels,
+        width=1,
+        name="density",
+    )
+    if np.any(density <= 0.0):
+        raise ValueError("density must be strictly positive")
+
+    fiber_source: Any = material.get("fiber_direction", np.zeros((num_cells, 3)))
+    if args.fiber_direction_file:
+        fiber_source = load_numeric_sidecar(args.fiber_direction_file)
+    fiber_direction = align_cell_values(
+        fiber_source,
+        cell_element_labels,
+        width=3,
+        name="fiber_direction",
+    )
+    norms = np.linalg.norm(fiber_direction, axis=1, keepdims=True)
+    nonzero = norms[:, 0] > 0.0
+    fiber_direction[nonzero] /= norms[nonzero]
+
+    feature_source: Any = material.get("material_features", np.zeros((num_cells, 0)))
+    material_features = align_material_features(feature_source, cell_element_labels)
+    return material, density, fiber_direction, material_features
+
+
+def load_numeric_sidecar(path: str | Path) -> Any:
+    """Load a numeric .npy, .csv or .json sidecar without implicit pickle data."""
+
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        return np.load(path, allow_pickle=False)
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    if suffix == ".csv":
+        rows = []
+        with path.open("r", encoding="utf-8-sig") as f:
+            for row in csv.reader(f):
+                try:
+                    rows.append([float(value) for value in row])
+                except ValueError:
+                    continue
+        if not rows:
+            raise ValueError("No numeric rows found in %s" % path)
+        return np.asarray(rows, dtype=np.float32)
+    raise ValueError("Unsupported sidecar extension: %s" % path.suffix)
+
+
+def align_cell_values(
+    value: Any,
+    cell_element_labels: np.ndarray,
+    width: int,
+    name: str,
+) -> np.ndarray:
+    """Broadcast or element-label align scalar/vector cell data."""
+
+    num_cells = int(cell_element_labels.shape[0])
+    if isinstance(value, dict):
+        if "values" in value:
+            value = value["values"]
+        else:
+            rows = []
+            for label in cell_element_labels:
+                key = str(int(label))
+                if key not in value:
+                    raise ValueError("%s is missing element label %s" % (name, key))
+                item = np.asarray(value[key], dtype=np.float32).reshape(-1)
+                rows.append(item)
+            value = np.asarray(rows, dtype=np.float32)
+
+    array = np.asarray(value, dtype=np.float32)
+    if width == 1 and array.ndim == 0:
+        array = np.full((num_cells, 1), float(array), dtype=np.float32)
+    elif array.shape == (width,):
+        array = np.broadcast_to(array[None, :], (num_cells, width)).copy()
+    elif width == 1 and array.shape == (num_cells,):
+        array = array[:, None]
+    elif array.ndim == 2 and array.shape == (num_cells, width + 1):
+        labels = array[:, 0].astype(np.int64)
+        by_label = {int(label): row[1:] for label, row in zip(labels, array, strict=False)}
+        try:
+            array = np.asarray(
+                [by_label[int(label)] for label in cell_element_labels],
+                dtype=np.float32,
+            )
+        except KeyError as exc:
+            raise ValueError("%s is missing element label %s" % (name, exc.args[0])) from exc
+    elif array.shape == (1, width) and num_cells != 1:
+        array = np.broadcast_to(array, (num_cells, width)).copy()
+    if array.shape != (num_cells, width):
+        raise ValueError("%s must be [%d], [M,%d], or label-prefixed [M,%d]" % (
+            name,
+            width,
+            width,
+            width + 1,
+        ))
+    if not np.all(np.isfinite(array)):
+        raise ValueError("%s must contain finite values" % name)
+    return array
+
+
+def align_material_features(value: Any, cell_element_labels: np.ndarray) -> np.ndarray:
+    num_cells = int(cell_element_labels.shape[0])
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim == 1:
+        array = np.broadcast_to(array[None, :], (num_cells, array.shape[0])).copy()
+    elif array.ndim == 2 and array.shape[0] == 1 and num_cells != 1:
+        array = np.broadcast_to(array, (num_cells, array.shape[1])).copy()
+    if array.ndim != 2 or array.shape[0] != num_cells:
+        raise ValueError("material_features must have shape [P] or [M,P]")
+    if not np.all(np.isfinite(array)):
+        raise ValueError("material_features must contain finite values")
+    return array
 
 
 def export_node_mask(odb, instance, set_name: str, label_to_index: dict[int, int]) -> np.ndarray:

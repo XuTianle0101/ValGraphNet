@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,43 @@ class ValveCase:
     normals: np.ndarray
     nodal_area: np.ndarray
     mesh_edge_index: np.ndarray
+    cells: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 4), dtype=np.int64)
+    )
+    dm_inv: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float32)
+    )
+    reference_volume: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 1), dtype=np.float32)
+    )
+    shape_gradients: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 4, 3), dtype=np.float32)
+    )
+    lumped_mass: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 1), dtype=np.float32)
+    )
+    cell_stress: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0, 0), dtype=np.float32)
+    )
+    integration_point_stress: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0, 0, 6), dtype=np.float32)
+    )
+    integration_point_mask: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0, 0), dtype=bool)
+    )
+    cell_strain: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0, 0), dtype=np.float32)
+    )
+    material: dict[str, Any] = field(default_factory=dict)
+    material_features: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0), dtype=np.float32)
+    )
+    density: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 1), dtype=np.float32)
+    )
+    fiber_direction: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3), dtype=np.float32)
+    )
 
     @property
     def num_steps(self) -> int:
@@ -45,6 +82,14 @@ class ValveCase:
     @property
     def stress_dim(self) -> int:
         return int(self.stress.shape[-1]) if self.stress.ndim == 3 else 0
+
+    @property
+    def num_cells(self) -> int:
+        return int(self.cells.shape[0])
+
+    @property
+    def has_constitutive_data(self) -> bool:
+        return self.num_cells > 0 and self.dm_inv.shape == (self.num_cells, 3, 3)
 
 
 def load_case(case_dir: str | Path) -> ValveCase:
@@ -65,6 +110,82 @@ def load_case(case_dir: str | Path) -> ValveCase:
     velocity = _load_required(root, "V.npy").astype(np.float32, copy=False)
     acceleration = _load_required(root, "A.npy").astype(np.float32, copy=False)
     stress = _load_optional(root, "S.npy", np.zeros((*displacement.shape[:2], 0), dtype=np.float32))
+    cells = _load_cells(root, nodes.shape[0])
+    num_cells = int(cells.shape[0])
+    material = _load_json_optional(root / "material.json")
+    density = _normalize_cell_scalar(
+        root,
+        "density.npy",
+        _load_optional(root, "density.npy", np.ones((num_cells, 1), dtype=np.float32)),
+        num_cells,
+    )
+    derived = _tetra_reference_geometry(root, nodes, cells)
+    dm_inv = _load_or_derived(root, "Dm_inv.npy", derived[0], (num_cells, 3, 3))
+    reference_volume = _normalize_cell_scalar(
+        root,
+        "reference_volume.npy",
+        _load_optional(root, "reference_volume.npy", derived[1]),
+        num_cells,
+    )
+    shape_gradients = _load_or_derived(
+        root,
+        "shape_gradients.npy",
+        derived[2],
+        (num_cells, 4, 3),
+    )
+    default_mass = _lumped_tetra_mass(nodes.shape[0], cells, reference_volume, density)
+    lumped_mass = _normalize_nodal_scalar(
+        root,
+        "lumped_mass.npy",
+        _load_optional(root, "lumped_mass.npy", default_mass),
+        nodes.shape[0],
+    )
+    material_features = _normalize_cell_matrix(
+        root,
+        "material_features.npy",
+        _load_optional(
+            root,
+            "material_features.npy",
+            np.zeros((num_cells, 0), dtype=np.float32),
+        ),
+        num_cells,
+    )
+    fiber_direction = _normalize_fiber_direction(
+        root,
+        _load_optional(
+            root,
+            "fiber_direction.npy",
+            np.zeros((num_cells, 3), dtype=np.float32),
+        ),
+        num_cells,
+    )
+    cell_stress = _normalize_cell_history(
+        root,
+        "S_cell.npy",
+        _load_optional(
+            root,
+            "S_cell.npy",
+            np.zeros((times.shape[0], num_cells, 0), dtype=np.float32),
+        ),
+        times.shape[0],
+        num_cells,
+    )
+    cell_strain = _normalize_cell_history(
+        root,
+        "LE_cell.npy",
+        _load_optional(
+            root,
+            "LE_cell.npy",
+            np.zeros((times.shape[0], num_cells, 0), dtype=np.float32),
+        ),
+        times.shape[0],
+        num_cells,
+    )
+    integration_point_stress, integration_point_mask = _load_integration_point_stress(
+        root,
+        times.shape[0],
+        num_cells,
+    )
     fixed_mask = _load_optional(
         root, "fixed_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
     ).astype(bool, copy=False)
@@ -134,6 +255,19 @@ def load_case(case_dir: str | Path) -> ValveCase:
         normals=normals,
         nodal_area=nodal_area,
         mesh_edge_index=mesh_edge_index,
+        cells=cells,
+        dm_inv=dm_inv,
+        reference_volume=reference_volume,
+        shape_gradients=shape_gradients,
+        lumped_mass=lumped_mass,
+        cell_stress=cell_stress,
+        integration_point_stress=integration_point_stress,
+        integration_point_mask=integration_point_mask,
+        cell_strain=cell_strain,
+        material=material,
+        material_features=material_features,
+        density=density,
+        fiber_direction=fiber_direction,
     )
 
 
@@ -170,6 +304,211 @@ def _load_optional(root: Path, name: str, default: np.ndarray) -> np.ndarray:
     if path.exists():
         return np.load(path, allow_pickle=False, mmap_mode="r")
     return default
+
+
+def _load_json_optional(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: material JSON must contain an object")
+    return value
+
+
+def _load_cells(root: Path, num_nodes: int) -> np.ndarray:
+    path = root / "cells.npy"
+    if path.exists():
+        cells = np.load(path, allow_pickle=False, mmap_mode="r")
+    else:
+        cells = np.zeros((0, 4), dtype=np.int64)
+    cells = np.asarray(cells, dtype=np.int64)
+    if cells.ndim != 2 or cells.shape[1] != 4:
+        raise ValueError(f"{root}: cells.npy must have shape [M, 4]")
+    if cells.size and (int(cells.min()) < 0 or int(cells.max()) >= num_nodes):
+        raise ValueError(f"{root}: cells.npy contains node indices outside [0, {num_nodes})")
+    return cells
+
+
+def _tetra_reference_geometry(
+    root: Path,
+    nodes: np.ndarray,
+    cells: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    num_cells = int(cells.shape[0])
+    if num_cells == 0:
+        return (
+            np.zeros((0, 3, 3), dtype=np.float32),
+            np.zeros((0, 1), dtype=np.float32),
+            np.zeros((0, 4, 3), dtype=np.float32),
+        )
+    vertices = np.asarray(nodes, dtype=np.float64)[cells]
+    dm = np.stack(
+        (
+            vertices[:, 1] - vertices[:, 0],
+            vertices[:, 2] - vertices[:, 0],
+            vertices[:, 3] - vertices[:, 0],
+        ),
+        axis=-1,
+    )
+    determinant = np.linalg.det(dm)
+    scale = np.maximum(np.linalg.norm(dm, axis=(1, 2)), 1.0)
+    singular = np.abs(determinant) <= np.finfo(np.float64).eps * scale**3
+    if np.any(singular):
+        indices = np.flatnonzero(singular)[:5].tolist()
+        raise ValueError(f"{root}: degenerate tetrahedral cells at indices {indices}")
+    dm_inv = np.linalg.inv(dm)
+    shape_gradients = np.empty((num_cells, 4, 3), dtype=np.float64)
+    shape_gradients[:, 1:, :] = dm_inv
+    shape_gradients[:, 0, :] = -dm_inv.sum(axis=1)
+    volume = (np.abs(determinant) / 6.0)[:, None]
+    return (
+        dm_inv.astype(np.float32),
+        volume.astype(np.float32),
+        shape_gradients.astype(np.float32),
+    )
+
+
+def _load_or_derived(
+    root: Path,
+    name: str,
+    default: np.ndarray,
+    expected_shape: tuple[int, ...],
+) -> np.ndarray:
+    array = _load_optional(root, name, default)
+    array = np.asarray(array, dtype=np.float32)
+    if array.shape != expected_shape:
+        raise ValueError(f"{root}: {name} must have shape {list(expected_shape)}")
+    return array
+
+
+def _normalize_cell_scalar(
+    root: Path,
+    name: str,
+    value: np.ndarray,
+    num_cells: int,
+) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim == 0:
+        array = np.full((num_cells, 1), float(array), dtype=np.float32)
+    elif array.shape == (1,):
+        array = np.full((num_cells, 1), float(array[0]), dtype=np.float32)
+    elif array.shape == (num_cells,):
+        array = array[:, None]
+    elif array.shape == (1, 1):
+        array = np.full((num_cells, 1), float(array[0, 0]), dtype=np.float32)
+    if array.shape != (num_cells, 1):
+        raise ValueError(f"{root}: {name} must be scalar, [M], or [M, 1]")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{root}: {name} must contain finite values")
+    if name in {"density.npy", "reference_volume.npy"} and np.any(array <= 0.0):
+        raise ValueError(f"{root}: {name} must contain positive values")
+    return array
+
+
+def _normalize_nodal_scalar(
+    root: Path,
+    name: str,
+    value: np.ndarray,
+    num_nodes: int,
+) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.shape == (num_nodes,):
+        array = array[:, None]
+    if array.shape != (num_nodes, 1):
+        raise ValueError(f"{root}: {name} must have shape [N] or [N, 1]")
+    if not np.all(np.isfinite(array)) or np.any(array < 0.0):
+        raise ValueError(f"{root}: {name} must contain finite non-negative values")
+    return array
+
+
+def _normalize_cell_matrix(
+    root: Path,
+    name: str,
+    value: np.ndarray,
+    num_cells: int,
+) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim == 1:
+        array = np.broadcast_to(array[None, :], (num_cells, array.shape[0])).copy()
+    elif array.ndim == 2 and array.shape[0] == 1 and num_cells != 1:
+        array = np.broadcast_to(array, (num_cells, array.shape[1])).copy()
+    if array.ndim != 2 or array.shape[0] != num_cells:
+        raise ValueError(f"{root}: {name} must have shape [P] or [M, P]")
+    return array
+
+
+def _normalize_fiber_direction(
+    root: Path,
+    value: np.ndarray,
+    num_cells: int,
+) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.shape == (3,):
+        array = np.broadcast_to(array[None, :], (num_cells, 3)).copy()
+    elif array.shape == (1, 3) and num_cells != 1:
+        array = np.broadcast_to(array, (num_cells, 3)).copy()
+    if array.shape != (num_cells, 3):
+        raise ValueError(f"{root}: fiber_direction.npy must have shape [3] or [M, 3]")
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    nonzero = norms[:, 0] > 0.0
+    array = array.copy()
+    array[nonzero] /= norms[nonzero]
+    return array
+
+
+def _normalize_cell_history(
+    root: Path,
+    name: str,
+    value: np.ndarray,
+    num_steps: int,
+    num_cells: int,
+) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim != 3 or array.shape[:2] != (num_steps, num_cells):
+        raise ValueError(f"{root}: {name} must have shape [T, M, C]")
+    if array.shape[2] not in (0, 6):
+        raise ValueError(f"{root}: {name} must store zero or six symmetric tensor components")
+    return array
+
+
+def _load_integration_point_stress(
+    root: Path,
+    num_steps: int,
+    num_cells: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    stress = _load_optional(
+        root,
+        "S_integration_point.npy",
+        np.zeros((num_steps, num_cells, 0, 6), dtype=np.float32),
+    )
+    stress = np.asarray(stress, dtype=np.float32)
+    if stress.ndim != 4 or stress.shape[:2] != (num_steps, num_cells):
+        raise ValueError(f"{root}: S_integration_point.npy must have shape [T, M, I, C]")
+    if stress.shape[2] and stress.shape[3] != 6:
+        raise ValueError(f"{root}: S_integration_point.npy must store six tensor components")
+    default_mask = np.ones(stress.shape[:3], dtype=bool)
+    mask = _load_optional(root, "integration_point_mask.npy", default_mask)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape == stress.shape[1:3]:
+        mask = np.broadcast_to(mask[None, :, :], stress.shape[:3]).copy()
+    if mask.shape != stress.shape[:3]:
+        raise ValueError(f"{root}: integration_point_mask.npy must have shape [M, I] or [T, M, I]")
+    return stress, mask
+
+
+def _lumped_tetra_mass(
+    num_nodes: int,
+    cells: np.ndarray,
+    volume: np.ndarray,
+    density: np.ndarray,
+) -> np.ndarray:
+    mass = np.zeros((num_nodes, 1), dtype=np.float32)
+    if cells.size:
+        contribution = (volume[:, 0] * density[:, 0] / 4.0).astype(np.float32)
+        for local_idx in range(4):
+            np.add.at(mass[:, 0], cells[:, local_idx], contribution)
+    return mass
 
 
 def _validate_case(
