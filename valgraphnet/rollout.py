@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,9 @@ def run_rollout(
 
     dataset = ValveGraphDataset(data_root=case_dir, cfg=ckpt_cfg, normalizers=None)
     case = dataset.cases[0]
-    model = build_model(ckpt_cfg, output_dim=output_dim).to(device)
+    inference_cfg = copy.deepcopy(ckpt_cfg)
+    inference_cfg.setdefault("model", {})["num_processor_checkpoint_segments"] = 0
+    model = build_model(inference_cfg, output_dim=output_dim).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 

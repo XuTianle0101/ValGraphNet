@@ -237,7 +237,7 @@ def _radius_nearest_contact_edges(
         current_pos,
         k=query_k,
         distance_upper_bound=float(radius),
-        workers=-1,
+        workers=1,
     )
     if query_k == 1:
         distances = distances[:, None]

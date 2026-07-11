@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +47,9 @@ def run_rollout_eval(
     ckpt_cfg = checkpoint.get("cfg", cfg)
     device = resolve_device(str(get_cfg(ckpt_cfg, "training.device", "auto")))
 
-    model = build_deforming_plate_model(ckpt_cfg).to(device)
+    inference_cfg = copy.deepcopy(ckpt_cfg)
+    inference_cfg.setdefault("model", {})["num_processor_checkpoint_segments"] = 0
+    model = build_deforming_plate_model(inference_cfg).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
@@ -127,6 +131,7 @@ def _rollout_sequence(
     exact_positions = [sequence.world_pos[0].astype(np.float32)]
     pred_stresses = []
     exact_stresses = []
+    rollout_start = time.perf_counter()
     for step in range(sequence.num_steps - 1):
         sample = make_graph_sample(
             sequence=sequence,
@@ -165,6 +170,12 @@ def _rollout_sequence(
         pred_stresses.append(pred_stress.numpy())
         stress = sequence.stress[step + 1].astype(np.float32)
         exact_stresses.append(stress[:, None] if stress.ndim == 1 else stress[:, :1])
+        if (step + 1) % 25 == 0 or step + 1 == sequence.num_steps - 1:
+            print(
+                f"rollout {sequence.sample_id}: {step + 1}/{sequence.num_steps - 1} "
+                f"steps in {time.perf_counter() - rollout_start:.1f}s",
+                flush=True,
+            )
 
     return (
         np.asarray(pred_positions, dtype=np.float32),
