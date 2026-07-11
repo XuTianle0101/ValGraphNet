@@ -18,7 +18,7 @@ from valgraphnet.data import PerTrajectoryStepSampler, ValveGraphDataset, collat
 from valgraphnet.losses import valve_loss
 from valgraphnet.gpu_graph import update_state
 from valgraphnet.model import build_model
-from valgraphnet.normalization import fit_normalizers, split_target
+from valgraphnet.normalization import Normalizers, fit_normalizers, split_target
 
 
 def run_training(cfg: dict[str, Any]) -> Path:
@@ -31,13 +31,24 @@ def run_training(cfg: dict[str, Any]) -> Path:
     _save_json(output_dir / "config_snapshot.json", cfg)
 
     train_dataset, val_dataset = build_datasets(cfg)
+    resume_path = _resolve_resume_path(cfg, output_dir)
     normalizers = None
     if bool(get_cfg(cfg, "normalization.enabled", True)):
-        normalizers = fit_normalizers(
-            train_dataset,
-            max_samples=get_cfg(cfg, "data.max_train_samples_for_stats", 512),
-            eps=float(get_cfg(cfg, "normalization.eps", 1.0e-8)),
+        stats_path = resume_path or get_cfg(cfg, "training.initial_checkpoint", None)
+        stats_state = (
+            _torch_load(Path(stats_path), map_location="cpu")
+            if stats_path and Path(stats_path).exists()
+            else None
         )
+        if stats_state is not None and stats_state.get("normalizers") is not None:
+            normalizers = Normalizers.from_state_dict(stats_state["normalizers"])
+            print(f"reused normalization statistics from: {stats_path}")
+        else:
+            normalizers = fit_normalizers(
+                train_dataset,
+                max_samples=get_cfg(cfg, "data.max_train_samples_for_stats", 512),
+                eps=float(get_cfg(cfg, "normalization.eps", 1.0e-8)),
+            )
         train_dataset.normalizers = normalizers
         if val_dataset is not None:
             val_dataset.normalizers = normalizers
@@ -99,7 +110,6 @@ def run_training(cfg: dict[str, Any]) -> Path:
     start_epoch = 1
     history_path = output_dir / "history.json"
     history = _load_history(history_path)
-    resume_path = _resolve_resume_path(cfg, output_dir)
     if resume_path is not None:
         checkpoint = _torch_load(resume_path, map_location=device)
         model.load_compatible_state_dict(checkpoint["model"])
