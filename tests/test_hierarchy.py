@@ -1,0 +1,54 @@
+import torch
+
+from valgraphnet.hierarchy import (
+    ScalarVectorBlock,
+    build_topology_hierarchy,
+    pool_mean,
+)
+
+
+def _chain_edges(count: int) -> torch.Tensor:
+    forward = torch.stack([torch.arange(count - 1), torch.arange(1, count)])
+    return torch.cat([forward, forward.flip(0)], dim=1)
+
+
+def test_topology_hierarchy_is_deterministic_and_coarsens_without_geometry():
+    edges = _chain_edges(64)
+    first = build_topology_hierarchy(64, edges)
+    second = build_topology_hierarchy(64, edges)
+
+    assert first.node_counts == [64, 16, 4]
+    assert all(torch.equal(a, b) for a, b in zip(first.assignments, second.assignments))
+    assert all(torch.equal(a, b) for a, b in zip(first.edge_indices, second.edge_indices))
+    value = torch.arange(64, dtype=torch.float32)[:, None]
+    pooled = pool_mean(value, first.assignments[0], first.node_counts[1])
+    assert pooled.shape == (16, 1)
+
+
+def test_scalar_vector_block_is_rotation_equivariant():
+    torch.manual_seed(4)
+    count = 8
+    scalar = torch.randn(count, 12)
+    vector = torch.randn(count, 4, 3)
+    position = torch.randn(count, 3)
+    edges = _chain_edges(count)
+    block = ScalarVectorBlock(12, 4).eval()
+    angle = torch.tensor(0.7)
+    rotation = torch.tensor(
+        [
+            [torch.cos(angle), -torch.sin(angle), 0.0],
+            [torch.sin(angle), torch.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+
+    scalar_a, vector_a = block(scalar, vector, edges, position)
+    scalar_b, vector_b = block(
+        scalar,
+        vector @ rotation.T,
+        edges,
+        position @ rotation.T,
+    )
+
+    assert torch.allclose(scalar_a, scalar_b, atol=2.0e-5, rtol=2.0e-5)
+    assert torch.allclose(vector_a @ rotation.T, vector_b, atol=2.0e-5, rtol=2.0e-5)
