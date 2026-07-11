@@ -1,0 +1,85 @@
+# Full-trajectory reproduction of the repository model before CHP-GNS.  This
+# intentionally keeps its independent state/stress decoders as a historical
+# architecture baseline while using the same 400-frame train/validation data.
+seed: 42
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+  pressure_sign: 0.0
+  noise_std: 0.003
+  require_pressure_mask: false
+  require_fixed_mask: true
+  max_train_samples_for_stats: 1024
+
+contact:
+  enabled: true
+  radius: 0.03
+  radius_factor: 2.5
+  max_edges: 200000
+  max_neighbors: 32
+  different_leaflets_only: false
+
+normalization:
+  enabled: true
+  eps: 1.0e-8
+
+model:
+  type: hybrid
+  processor_size: 15
+  hidden_dim_processor: 128
+  hidden_dim_node_decoder: 128
+  independent_stress_decoder: true
+  detach_stress_latent: true
+  stress_decoder_layers: 2
+  aggregation: sum
+  activation: relu
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  do_concat_trick: false
+  num_processor_checkpoint_segments: 3
+  checkpoint_offloading: false
+  recompute_activation: false
+
+training:
+  epochs: 30
+  steps_per_trajectory_per_epoch: 1
+  validation_steps_per_trajectory: 3
+  rollout_steps: 3
+  rollout_loss_discount: 0.8
+  rollout_stress_steps: 3
+  rollout_validation_cases: 20
+  rollout_validation_steps: 399
+  rollout_validation_every: 3
+  rollout_checkpoint_stress_weight: 1.0
+  checkpoint_metric: rollout
+  batch_size: 1
+  num_workers: 0
+  gpu_graph_build: true
+  gpu_case_cache_size: 3
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  output_dir: outputs/deforming_plate_repo_full400_seed42
+  save_every: 1
+  save_latest: true
+  resume_from: auto
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+
+loss:
+  delta_u: 1.0
+  delta_v: 0.1
+  accel: 0.05
+  stress: 0.5
+
+rollout:
+  steps: null
+
+evaluation:
+  steps: 399

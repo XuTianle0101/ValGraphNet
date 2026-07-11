@@ -188,18 +188,24 @@ def run_training(cfg: dict[str, Any]) -> Path:
             if val_loader is not None
             else None
         )
-        rollout_metrics = None
-        if val_dataset is not None and str(
+        checkpoint_metric = str(
             get_cfg(cfg, "training.checkpoint_metric", "one_step")
-        ).lower() == "rollout":
+        ).lower()
+        rollout_metrics = None
+        if (
+            val_dataset is not None
+            and checkpoint_metric == "rollout"
+            and _rollout_validation_due(epoch, epochs, cfg)
+        ):
             rollout_metrics = evaluate_rollout_metric(
                 model, val_dataset, device, cfg
             )
-        score = (
-            rollout_metrics["score"]
-            if rollout_metrics is not None
-            else val_metrics["total"] if val_metrics else train_metrics["total"]
-        )
+        if checkpoint_metric == "rollout":
+            # Never compare an inexpensive one-step loss with rollout scores.
+            # On skipped epochs only latest.pt advances; best.pt is unchanged.
+            score = rollout_metrics["score"] if rollout_metrics is not None else None
+        else:
+            score = val_metrics["total"] if val_metrics else train_metrics["total"]
 
         print(_format_epoch(epoch, train_metrics, val_metrics, rollout_metrics))
         history = [item for item in history if int(item["epoch"]) != epoch]
@@ -216,7 +222,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
             }
         )
         _save_history(history_path, history)
-        if score < best_loss:
+        if score is not None and score < best_loss:
             best_loss = score
             save_checkpoint(
                 best_path,
@@ -229,6 +235,9 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 epoch,
                 best_loss,
             )
+        checkpoint_score = score if score is not None else best_loss
+        if not np.isfinite(checkpoint_score):
+            checkpoint_score = 1.0e30
         if save_latest:
             save_checkpoint(
                 output_dir / "latest.pt",
@@ -239,7 +248,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 normalizers,
                 train_dataset.output_dim,
                 epoch,
-                score,
+                checkpoint_score,
             )
         if save_every > 0 and epoch % save_every == 0:
             save_checkpoint(
@@ -251,7 +260,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 normalizers,
                 train_dataset.output_dim,
                 epoch,
-                score,
+                checkpoint_score,
             )
 
     return best_path
@@ -571,6 +580,19 @@ def evaluate_rollout_metric(
         "stress_normalized_rmse": float(stress_normalized.item()),
         "cases": float(case_count),
     }
+
+
+def _rollout_validation_due(
+    epoch: int,
+    total_epochs: int,
+    cfg: dict[str, Any],
+) -> bool:
+    """Return whether an expensive autoregressive checkpoint audit is due."""
+
+    every = int(get_cfg(cfg, "training.rollout_validation_every", 1))
+    if every <= 0:
+        raise ValueError("training.rollout_validation_every must be positive")
+    return int(epoch) == int(total_epochs) or int(epoch) % every == 0
 
 
 def save_checkpoint(
