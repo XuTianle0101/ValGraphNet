@@ -16,8 +16,9 @@ from tqdm import tqdm
 from valgraphnet.config import get_cfg
 from valgraphnet.data import PerTrajectoryStepSampler, ValveGraphDataset, collate_valve_graphs
 from valgraphnet.losses import valve_loss
+from valgraphnet.gpu_graph import update_state
 from valgraphnet.model import build_model
-from valgraphnet.normalization import fit_normalizers
+from valgraphnet.normalization import fit_normalizers, split_target
 
 
 def run_training(cfg: dict[str, Any]) -> Path:
@@ -60,29 +61,34 @@ def run_training(cfg: dict[str, Any]) -> Path:
         f" ({str(amp_dtype).removeprefix('torch.') if amp_enabled else 'disabled'})"
     )
 
+    gpu_graphs = bool(get_cfg(cfg, "training.gpu_graph_build", False))
+    if gpu_graphs and device.type != "cuda":
+        raise RuntimeError("training.gpu_graph_build requires training.device=cuda")
+
     train_sampler = _build_step_sampler(train_dataset, cfg, training=True)
     val_sampler = (
         _build_step_sampler(val_dataset, cfg, training=False)
         if val_dataset is not None
         else None
     )
+    train_source = range(len(train_dataset)) if gpu_graphs else train_dataset
     train_loader = DataLoader(
-        train_dataset,
+        train_source,
         batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
         shuffle=train_sampler is None,
         sampler=train_sampler,
         num_workers=int(get_cfg(cfg, "training.num_workers", 0)),
-        collate_fn=collate_valve_graphs,
+        collate_fn=_collate_index if gpu_graphs else collate_valve_graphs,
     )
     val_loader = None
     if val_dataset is not None:
         val_loader = DataLoader(
-            val_dataset,
+            range(len(val_dataset)) if gpu_graphs else val_dataset,
             batch_size=int(get_cfg(cfg, "training.batch_size", 1)),
             shuffle=False,
             sampler=val_sampler,
             num_workers=int(get_cfg(cfg, "training.num_workers", 0)),
-            collate_fn=collate_valve_graphs,
+            collate_fn=_collate_index if gpu_graphs else collate_valve_graphs,
         )
 
     best_loss = float("inf")
@@ -96,7 +102,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
     resume_path = _resolve_resume_path(cfg, output_dir)
     if resume_path is not None:
         checkpoint = _torch_load(resume_path, map_location=device)
-        model.load_state_dict(checkpoint["model"])
+        model.load_compatible_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
@@ -105,22 +111,50 @@ def run_training(cfg: dict[str, Any]) -> Path:
         if best_path.exists():
             best_loss = float(_torch_load(best_path, map_location="cpu").get("score", best_loss))
         print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
+    else:
+        initial_path = get_cfg(cfg, "training.initial_checkpoint", None)
+        if initial_path:
+            checkpoint = _torch_load(Path(initial_path), map_location=device)
+            model.load_compatible_state_dict(checkpoint["model"])
+            print(f"initialized compatible weights from: {initial_path}")
 
     for epoch in range(start_epoch, epochs + 1):
         epoch_start = time.perf_counter()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_metrics = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg)
-        val_metrics = evaluate(model, val_loader, device, cfg) if val_loader is not None else None
-        score = val_metrics["total"] if val_metrics else train_metrics["total"]
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, scaler, device, cfg,
+            dataset=train_dataset if gpu_graphs else None,
+        )
+        val_metrics = (
+            evaluate(
+                model, val_loader, device, cfg,
+                dataset=val_dataset if gpu_graphs else None,
+            )
+            if val_loader is not None
+            else None
+        )
+        rollout_metrics = None
+        if val_dataset is not None and str(
+            get_cfg(cfg, "training.checkpoint_metric", "one_step")
+        ).lower() == "rollout":
+            rollout_metrics = evaluate_rollout_metric(
+                model, val_dataset, device, cfg
+            )
+        score = (
+            rollout_metrics["score"]
+            if rollout_metrics is not None
+            else val_metrics["total"] if val_metrics else train_metrics["total"]
+        )
 
-        print(_format_epoch(epoch, train_metrics, val_metrics))
+        print(_format_epoch(epoch, train_metrics, val_metrics, rollout_metrics))
         history = [item for item in history if int(item["epoch"]) != epoch]
         history.append(
             {
                 "epoch": epoch,
                 "train": train_metrics,
                 "val": val_metrics,
+                "rollout_val": rollout_metrics,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "seconds": time.perf_counter() - epoch_start,
                 "train_steps": len(train_loader),
@@ -178,12 +212,27 @@ def _build_step_sampler(dataset, cfg: dict[str, Any], training: bool):
     steps = get_cfg(cfg, key, None)
     if steps is None:
         return None
+    groups = dataset.trajectory_index_groups
+    if training:
+        rollout_steps = int(get_cfg(cfg, "training.rollout_steps", 1))
+        if rollout_steps > 1:
+            groups = [
+                range(group.start, group.stop - rollout_steps + 1)
+                for group in groups
+                if len(group) >= rollout_steps
+            ]
     return PerTrajectoryStepSampler(
-        dataset.trajectory_index_groups,
+        groups,
         steps_per_trajectory=int(steps),
         shuffle=training,
         seed=int(cfg.get("seed", 42)) + (0 if training else 1_000_000),
     )
+
+
+def _collate_index(batch) -> int:
+    if len(batch) != 1:
+        raise ValueError("GPU graph construction currently requires batch_size=1")
+    return int(batch[0])
 
 
 def _resolve_resume_path(cfg: dict[str, Any], output_dir: Path) -> Path | None:
@@ -245,16 +294,22 @@ def train_one_epoch(
     scaler,
     device,
     cfg: dict[str, Any],
+    dataset: ValveGraphDataset | None = None,
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
     count = 0
     for batch in tqdm(loader, desc="train", leave=False):
-        batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
-        with autocast_context(cfg, device):
-            pred = model(batch)
-            loss, metrics = valve_loss(pred, batch, cfg)
+        if dataset is not None:
+            loss, metrics = _multistep_gpu_loss(
+                model, dataset, int(batch), device, cfg
+            )
+        else:
+            batch = batch.to(device)
+            with autocast_context(cfg, device):
+                pred = model(batch)
+                loss, metrics = valve_loss(pred, batch, cfg)
         scaler.scale(loss).backward()
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
@@ -269,20 +324,192 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, cfg: dict[str, Any]) -> dict[str, float]:
+def evaluate(
+    model,
+    loader,
+    device,
+    cfg: dict[str, Any],
+    dataset: ValveGraphDataset | None = None,
+) -> dict[str, float]:
     if loader is None:
         return {}
     model.eval()
     totals: dict[str, float] = {}
     count = 0
     for batch in tqdm(loader, desc="val", leave=False):
-        batch = batch.to(device)
+        if dataset is not None:
+            case_index, step = dataset.samples[int(batch)]
+            batch = dataset.make_graph_gpu(case_index, step, device)
+        else:
+            batch = batch.to(device)
         with autocast_context(cfg, device):
             pred = model(batch)
             _, metrics = valve_loss(pred, batch, cfg)
         _accumulate(totals, metrics)
         count += 1
     return _average(totals, count)
+
+
+def _multistep_gpu_loss(
+    model,
+    dataset: ValveGraphDataset,
+    sample_index: int,
+    device: torch.device,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    case_index, start_step = dataset.samples[sample_index]
+    case = dataset.cases[case_index]
+    steps = min(
+        int(get_cfg(cfg, "training.rollout_steps", 1)),
+        case.num_steps - 1 - start_step,
+    )
+    discount = float(get_cfg(cfg, "training.rollout_loss_discount", 1.0))
+    state = dataset.gpu_builder.state(case, start_step, device)
+    case_tensors = dataset.gpu_builder.case_tensors(case, device)
+    loss = torch.zeros((), device=device)
+    totals: dict[str, float] = {}
+    weight_sum = 0.0
+
+    for offset in range(steps):
+        step = start_step + offset
+        graph = dataset.make_graph_gpu(case_index, step, device, state=state)
+        weight = discount**offset
+        with autocast_context(cfg, device):
+            pred = model(graph)
+            step_loss, metrics = valve_loss(pred, graph, cfg)
+        loss = loss + weight * step_loss
+        for key, value in metrics.items():
+            totals[key] = totals.get(key, 0.0) + weight * float(value)
+        weight_sum += weight
+
+        prediction = torch.cat(
+            [pred["delta_u"], pred["delta_v"], pred["accel"], pred["stress"]],
+            dim=1,
+        )
+        if dataset.normalizers is not None:
+            prediction = prediction * graph.target_scale
+        state = update_state(
+            split_target(prediction), state, case_tensors, step + 1
+        )
+
+    loss = loss / max(weight_sum, 1.0e-12)
+    metrics = {key: value / max(weight_sum, 1.0e-12) for key, value in totals.items()}
+    metrics["rollout_steps"] = float(steps)
+    return loss, metrics
+
+
+@torch.no_grad()
+def evaluate_rollout_metric(
+    model,
+    dataset: ValveGraphDataset,
+    device: torch.device,
+    cfg: dict[str, Any],
+) -> dict[str, float]:
+    """Evaluate true autoregressive trajectories and return checkpoint score."""
+
+    model.eval()
+    case_count = min(
+        int(get_cfg(cfg, "training.rollout_validation_cases", 5)),
+        len(dataset.cases),
+    )
+    case_indices = (
+        torch.linspace(0, len(dataset.cases) - 1, steps=case_count)
+        .round()
+        .long()
+        .tolist()
+    )
+    requested_steps = get_cfg(cfg, "training.rollout_validation_steps", None)
+    u_error = torch.zeros((), device=device)
+    u_reference = torch.zeros((), device=device)
+    u_count = torch.zeros((), device=device)
+    stress_error = torch.zeros((), device=device)
+    stress_reference = torch.zeros((), device=device)
+    stress_count = torch.zeros((), device=device)
+    final_error = torch.zeros((), device=device)
+    final_count = torch.zeros((), device=device)
+    max_evaluated_steps = 1
+
+    for case_index in tqdm(case_indices, desc="rollout-val", leave=False):
+        case = dataset.cases[case_index]
+        tensors = dataset.gpu_builder.case_tensors(case, device)
+        state = dataset.gpu_builder.state(case, 0, device)
+        steps = case.num_steps - 1
+        if requested_steps is not None:
+            steps = min(steps, int(requested_steps))
+        max_evaluated_steps = max(max_evaluated_steps, steps)
+        free = ~(tensors["fixed"] | tensors["prescribed"])
+        if not bool(free.any().item()):
+            free = ~tensors["fixed"]
+
+        for step in range(steps):
+            graph = dataset.make_graph_gpu(case_index, step, device, state=state)
+            with autocast_context(cfg, device):
+                pred = model(graph)
+            prediction = torch.cat(
+                [pred["delta_u"], pred["delta_v"], pred["accel"], pred["stress"]],
+                dim=1,
+            )
+            if dataset.normalizers is not None:
+                prediction = prediction * graph.target_scale
+            physical = split_target(prediction)
+            state = update_state(physical, state, tensors, step + 1)
+
+            u_residual = state["U"][free] - tensors["U"][step + 1, free]
+            u_error += (u_residual * u_residual).sum()
+            u_reference += (tensors["U"][step + 1, free] ** 2).sum()
+            u_count += u_residual.numel()
+            if physical["stress"].numel() > 0:
+                truth_stress = tensors["S"][step + 1, free, : physical["stress"].shape[1]]
+                stress_residual = physical["stress"][free] - truth_stress
+                stress_error += (stress_residual * stress_residual).sum()
+                stress_reference += (truth_stress * truth_stress).sum()
+                stress_count += stress_residual.numel()
+        final_residual = state["U"][free] - tensors["U"][steps, free]
+        final_error += (final_residual * final_residual).sum()
+        final_count += final_residual.numel()
+
+    eps = torch.tensor(1.0e-12, device=device)
+    displacement_rmse = torch.sqrt(u_error / u_count.clamp_min(1.0))
+    displacement_relative = torch.sqrt(u_error / u_reference.clamp_min(eps))
+    final_rmse = torch.sqrt(final_error / final_count.clamp_min(1.0))
+    if bool((stress_count > 0).item()):
+        stress_rmse = torch.sqrt(stress_error / stress_count)
+        stress_relative = torch.sqrt(stress_error / stress_reference.clamp_min(eps))
+    else:
+        stress_rmse = torch.zeros((), device=device)
+        stress_relative = torch.zeros((), device=device)
+    stress_weight = float(
+        get_cfg(cfg, "training.rollout_checkpoint_stress_weight", 0.1)
+    )
+    if dataset.normalizers is not None:
+        target_scale = dataset.normalizers.target_scale.to(device)
+        delta_scale = torch.sqrt((target_scale[:3] ** 2).mean())
+        stress_scale = (
+            torch.sqrt((target_scale[9:] ** 2).mean())
+            if target_scale.numel() > 9
+            else torch.ones((), device=device)
+        )
+    else:
+        delta_scale = torch.ones((), device=device)
+        stress_scale = torch.ones((), device=device)
+    reference_u_rms = torch.sqrt(u_reference / u_count.clamp_min(1.0))
+    rollout_scale = delta_scale * float(max_evaluated_steps) ** 0.5
+    displacement_normalized = displacement_rmse / torch.maximum(
+        reference_u_rms, rollout_scale.clamp_min(eps)
+    )
+    stress_normalized = stress_rmse / stress_scale.clamp_min(eps)
+    score = displacement_normalized + stress_weight * stress_normalized
+    return {
+        "score": float(score.item()),
+        "displacement_rmse": float(displacement_rmse.item()),
+        "displacement_relative_rmse": float(displacement_relative.item()),
+        "displacement_normalized_rmse": float(displacement_normalized.item()),
+        "final_displacement_rmse": float(final_rmse.item()),
+        "stress_rmse": float(stress_rmse.item()),
+        "stress_relative_rmse": float(stress_relative.item()),
+        "stress_normalized_rmse": float(stress_normalized.item()),
+        "cases": float(case_count),
+    }
 
 
 def save_checkpoint(
@@ -357,12 +584,22 @@ def _average(totals: dict[str, float], count: int) -> dict[str, float]:
     return {key: value / denom for key, value in totals.items()}
 
 
-def _format_epoch(epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float] | None) -> str:
+def _format_epoch(
+    epoch: int,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float] | None,
+    rollout_metrics: dict[str, float] | None = None,
+) -> str:
     train_part = ", ".join(f"{k}={v:.5g}" for k, v in sorted(train_metrics.items()))
+    rollout_part = ""
+    if rollout_metrics:
+        rollout_part = " | rollout: " + ", ".join(
+            f"{k}={v:.5g}" for k, v in sorted(rollout_metrics.items())
+        )
     if val_metrics:
         val_part = ", ".join(f"{k}={v:.5g}" for k, v in sorted(val_metrics.items()))
-        return f"epoch {epoch:04d} | train: {train_part} | val: {val_part}"
-    return f"epoch {epoch:04d} | train: {train_part}"
+        return f"epoch {epoch:04d} | train: {train_part} | val: {val_part}{rollout_part}"
+    return f"epoch {epoch:04d} | train: {train_part}{rollout_part}"
 
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:

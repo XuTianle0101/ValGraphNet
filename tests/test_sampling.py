@@ -32,3 +32,20 @@ def test_validation_sampler_uses_evenly_spaced_steps():
     sampler = PerTrajectoryStepSampler([range(10)], 3, shuffle=False)
 
     assert list(sampler) == [0, 4, 9]
+
+
+def test_multistep_training_sampler_excludes_incomplete_tail():
+    from valgraphnet.train import _build_step_sampler
+
+    dataset = type("Dataset", (), {"trajectory_index_groups": [range(0, 10)]})()
+    cfg = {
+        "seed": 3,
+        "training": {
+            "steps_per_trajectory_per_epoch": 20,
+            "rollout_steps": 3,
+        },
+    }
+    sampler = _build_step_sampler(dataset, cfg, training=True)
+
+    assert sorted(sampler.groups[0]) == list(range(8))
+    assert max(iter(sampler)) <= 7

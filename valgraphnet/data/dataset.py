@@ -18,6 +18,7 @@ from valgraphnet.geometry import (
     build_edge_features,
     build_node_features,
 )
+from valgraphnet.gpu_graph import GpuGraphBuilder
 
 
 class ValveGraphDataset(Dataset):
@@ -55,6 +56,8 @@ class ValveGraphDataset(Dataset):
 
         self.stress_dim = max(case.stress_dim for case in self.cases)
         self.output_dim = BASE_OUTPUT_DIM + self.stress_dim
+        self.gpu_builder = GpuGraphBuilder(self.cfg, self.stress_dim)
+        self._device_normalizers: dict[str, Any] = {}
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -172,6 +175,29 @@ class ValveGraphDataset(Dataset):
         data.dt = float(dt)
         data.mesh_edge_count = int(case.mesh_edge_index.shape[1])
         data.world_edge_count = int(world_edge_index.shape[1])
+        return data
+
+    def make_graph_gpu(
+        self,
+        case_index: int,
+        step: int,
+        device: torch.device,
+        state: dict[str, torch.Tensor] | None = None,
+    ):
+        """Build and optionally normalize a graph without leaving CUDA."""
+
+        if device.type != "cuda":
+            raise ValueError("make_graph_gpu requires a CUDA device")
+        data = self.gpu_builder.make_graph(
+            self.cases[int(case_index)], int(step), device, state=state
+        )
+        if self.normalizers is not None:
+            key = str(device)
+            normalizers = self._device_normalizers.get(key)
+            if normalizers is None:
+                normalizers = self.normalizers.to(device)
+                self._device_normalizers[key] = normalizers
+            data = normalizers.transform_data(data)
         return data
 
 
