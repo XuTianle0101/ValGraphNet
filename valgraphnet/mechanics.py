@@ -313,12 +313,17 @@ def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
 
 
 def _polynomial_energy_and_derivative(
-    value: torch.Tensor, coefficients: torch.Tensor
+    value: torch.Tensor,
+    coefficients: torch.Tensor,
+    *,
+    exponent_stride: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if exponent_stride < 1:
+        raise ValueError("exponent_stride must be positive")
     energy = torch.zeros_like(value)
     derivative = torch.zeros_like(value)
     for index, coefficient in enumerate(coefficients):
-        exponent = 2 * (index + 1)
+        exponent = exponent_stride * (index + 1)
         energy = energy + coefficient * value.pow(exponent)
         derivative = derivative + coefficient * exponent * value.pow(exponent - 1)
     return energy, derivative
@@ -444,10 +449,10 @@ class AnalyticPotential(nn.Module):
         x2 = state.i2_bar - 3.0
         xj = state.j - 1.0
         energy_i1, derivative_i1 = _polynomial_energy_and_derivative(
-            x1, self.i1_coefficients
+            x1, self.i1_coefficients, exponent_stride=1
         )
         energy_i2, derivative_i2 = _polynomial_energy_and_derivative(
-            x2, self.i2_coefficients
+            x2, self.i2_coefficients, exponent_stride=1
         )
         energy_j, derivative_j = _polynomial_energy_and_derivative(
             xj, self.j_coefficients

@@ -95,6 +95,21 @@ def test_uniform_stretch_produces_positive_isotropic_stress():
     )
 
 
+def test_isochoric_potential_has_nonzero_small_strain_tangent():
+    potential = AnalyticPotential().double()
+    shear = 1.0e-5
+    deformation = torch.eye(3, dtype=torch.float64)[None]
+    deformation[0, 0, 1] = shear
+    response = potential(deformation)
+
+    # Ibar-3 is already second order in infinitesimal strain.  A linear
+    # invariant term is therefore required for a finite reference tangent;
+    # starting at (Ibar-3)^2 would incorrectly make the shear modulus zero.
+    tangent = response.cauchy_stress[0, 0, 1] / shear
+    assert tangent.item() > 0.1
+    assert response.energy_density.item() / shear**2 > 0.1
+
+
 def test_rigid_rotation_preserves_energy_and_rotates_stress():
     potential = AnalyticPotential(fiber_order=1).double()
     deformation = torch.tensor(
