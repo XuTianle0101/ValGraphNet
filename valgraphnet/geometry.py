@@ -135,6 +135,18 @@ def build_contact_edges(
     else:
         fixed_mask = np.asarray(fixed_mask, dtype=bool)
 
+    if cfg.max_neighbors and not cfg.different_leaflets_only:
+        nearest = _radius_nearest_contact_edges(
+            current_pos=current_pos,
+            radius=float(radius),
+            mesh_edge_index=mesh_edge_index,
+            fixed_mask=fixed_mask,
+            max_neighbors=int(cfg.max_neighbors),
+            max_edges=int(cfg.max_edges),
+        )
+        if nearest is not None:
+            return nearest
+
     pairs = _radius_pairs(current_pos, radius)
     directed: list[tuple[int, int]] = []
     for i, j in pairs:
@@ -194,6 +206,63 @@ def _nearest_neighbors(
     starts = np.maximum.accumulate(np.where(group_start, np.arange(source.size), 0))
     keep = np.arange(source.size) - starts < int(max_neighbors)
     return [tuple(edge) for edge in sorted_edges[keep].tolist()]
+
+
+def _radius_nearest_contact_edges(
+    current_pos: np.ndarray,
+    radius: float,
+    mesh_edge_index: np.ndarray,
+    fixed_mask: np.ndarray,
+    max_neighbors: int,
+    max_edges: int,
+) -> np.ndarray | None:
+    """Query bounded contact neighbors without materializing dense point pairs."""
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        return None
+
+    num_nodes = int(current_pos.shape[0])
+    mesh_edges = {
+        (int(src), int(dst)) for src, dst in np.asarray(mesh_edge_index).T.tolist()
+    }
+    mesh_degree = np.bincount(mesh_edge_index[0], minlength=num_nodes)
+    max_mesh_degree = int(mesh_degree.max()) if mesh_degree.size else 0
+    query_k = min(
+        num_nodes,
+        1 + int(max_neighbors) + max_mesh_degree + int(fixed_mask.sum()),
+    )
+    distances, neighbors = cKDTree(current_pos).query(
+        current_pos,
+        k=query_k,
+        distance_upper_bound=float(radius),
+        workers=-1,
+    )
+    if query_k == 1:
+        distances = distances[:, None]
+        neighbors = neighbors[:, None]
+
+    directed: list[tuple[int, int]] = []
+    for src in range(num_nodes):
+        candidates = sorted(
+            (
+                (float(distance), int(dst))
+                for distance, dst in zip(distances[src], neighbors[src], strict=False)
+                if int(dst) < num_nodes
+                and int(dst) != src
+                and not (fixed_mask[src] and fixed_mask[int(dst)])
+                and (src, int(dst)) not in mesh_edges
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        directed.extend((src, dst) for _, dst in candidates[:max_neighbors])
+        if len(directed) >= max_edges:
+            directed = directed[:max_edges]
+            break
+    if not directed:
+        return np.zeros((2, 0), dtype=np.int64)
+    return np.asarray(directed, dtype=np.int64).T
 
 
 def _radius_pairs_chunked(points: np.ndarray, radius: float, chunk_size: int = 1024) -> list[tuple[int, int]]:

@@ -222,6 +222,15 @@ def radius_world_edges(
 
     if radius <= 0.0 or world_pos.shape[0] < 2:
         return torch.zeros((2, 0), dtype=torch.long)
+    if max_neighbors is not None and int(max_neighbors) > 0:
+        nearest = _radius_nearest_neighbors(
+            world_pos,
+            radius=float(radius),
+            mesh_edge_index=mesh_edge_index,
+            max_neighbors=int(max_neighbors),
+        )
+        if nearest is not None:
+            return nearest
     pairs = _radius_pairs(world_pos, radius)
     mesh_edges = {tuple(edge) for edge in mesh_edge_index.t().tolist()}
     directed: list[tuple[int, int]] = []
@@ -429,6 +438,53 @@ def _nearest_neighbors(
     starts = np.maximum.accumulate(np.where(group_start, np.arange(source.size), 0))
     keep = np.arange(source.size) - starts < int(max_neighbors)
     return [tuple(edge) for edge in sorted_edges[keep].tolist()]
+
+
+def _radius_nearest_neighbors(
+    world_pos: torch.Tensor,
+    radius: float,
+    mesh_edge_index: torch.Tensor,
+    max_neighbors: int,
+) -> torch.Tensor | None:
+    """Query bounded radius neighbors directly, avoiding dense candidate pairs."""
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        return None
+
+    points = world_pos.detach().cpu().numpy()
+    num_nodes = int(points.shape[0])
+    mesh_edges = {tuple(edge) for edge in mesh_edge_index.t().tolist()}
+    mesh_degree = torch.bincount(mesh_edge_index[0], minlength=num_nodes)
+    max_mesh_degree = int(mesh_degree.max()) if mesh_degree.numel() else 0
+    query_k = min(num_nodes, 1 + int(max_neighbors) + max_mesh_degree)
+    distances, neighbors = cKDTree(points).query(
+        points,
+        k=query_k,
+        distance_upper_bound=float(radius),
+        workers=-1,
+    )
+    if query_k == 1:
+        distances = distances[:, None]
+        neighbors = neighbors[:, None]
+
+    directed: list[tuple[int, int]] = []
+    for src in range(num_nodes):
+        candidates = sorted(
+            (
+                (float(distance), int(dst))
+                for distance, dst in zip(distances[src], neighbors[src], strict=False)
+                if int(dst) < num_nodes
+                and int(dst) != src
+                and (src, int(dst)) not in mesh_edges
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        directed.extend((src, dst) for _, dst in candidates[:max_neighbors])
+    if not directed:
+        return torch.zeros((2, 0), dtype=torch.long)
+    return torch.as_tensor(directed, dtype=torch.long).t().contiguous()
 
 
 class _Moments:
