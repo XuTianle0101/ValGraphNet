@@ -25,6 +25,9 @@ class ValveGraphNet(nn.Module):
         self.independent_stress_decoder = bool(
             model_cfg.get("independent_stress_decoder", False)
         ) and self.stress_dim > 0
+        self.detach_stress_latent = bool(
+            model_cfg.get("detach_stress_latent", False)
+        )
 
         try:
             if model_type == "hybrid":
@@ -92,7 +95,8 @@ class ValveGraphNet(nn.Module):
         if self.independent_stress_decoder:
             latent = self._encode_and_process(data)
             dynamics = self.net.node_decoder(latent)
-            stress = self.stress_decoder(latent)
+            stress_input = latent.detach() if self.detach_stress_latent else latent
+            stress = self.stress_decoder(stress_input)
             out = torch.cat([dynamics, stress], dim=1)
         elif self.model_type == "hybrid":
             out = self.net(
@@ -173,6 +177,36 @@ class ValveGraphNet(nn.Module):
                     self.dynamics_dim : self.dynamics_dim + target.shape[0]
                 ]
         self.load_state_dict(migrated)
+
+    def load_stress_decoder_state_dict(
+        self, state: dict[str, torch.Tensor]
+    ) -> None:
+        """Load only the stress head from a split or legacy joint checkpoint."""
+
+        if not self.independent_stress_decoder:
+            raise ValueError("A separate stress decoder is not enabled")
+        target = self.stress_decoder.state_dict()
+        split_prefix = "stress_decoder."
+        joint_prefix = "net.node_decoder."
+        for key, value in list(target.items()):
+            split_value = state.get(split_prefix + key)
+            if split_value is not None and split_value.shape == value.shape:
+                target[key] = split_value
+                continue
+            joint_value = state.get(joint_prefix + key)
+            if joint_value is None:
+                continue
+            if joint_value.shape == value.shape:
+                target[key] = joint_value
+            elif (
+                joint_value.ndim == value.ndim
+                and joint_value.shape[1:] == value.shape[1:]
+                and joint_value.shape[0] >= self.dynamics_dim + value.shape[0]
+            ):
+                target[key] = joint_value[
+                    self.dynamics_dim : self.dynamics_dim + value.shape[0]
+                ]
+        self.stress_decoder.load_state_dict(target)
 
 
 def build_model(cfg: dict[str, Any], output_dim: int) -> ValveGraphNet:

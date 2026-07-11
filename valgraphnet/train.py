@@ -127,6 +127,50 @@ def run_training(cfg: dict[str, Any]) -> Path:
             checkpoint = _torch_load(Path(initial_path), map_location=device)
             model.load_compatible_state_dict(checkpoint["model"])
             print(f"initialized compatible weights from: {initial_path}")
+            stress_path = get_cfg(cfg, "training.stress_initial_checkpoint", None)
+            if stress_path:
+                stress_checkpoint = _torch_load(Path(stress_path), map_location=device)
+                model.load_stress_decoder_state_dict(stress_checkpoint["model"])
+                print(f"initialized stress decoder from: {stress_path}")
+
+            if val_dataset is not None and str(
+                get_cfg(cfg, "training.checkpoint_metric", "one_step")
+            ).lower() == "rollout":
+                initial_rollout = evaluate_rollout_metric(
+                    model, val_dataset, device, cfg
+                )
+                best_loss = initial_rollout["score"]
+                history = [item for item in history if int(item["epoch"]) != 0]
+                history.append(
+                    {
+                        "epoch": 0,
+                        "train": {},
+                        "val": {},
+                        "rollout_val": initial_rollout,
+                        "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                        "seconds": 0.0,
+                        "train_steps": 0,
+                        "val_steps": 0,
+                    }
+                )
+                _save_history(history_path, history)
+                save_checkpoint(
+                    best_path,
+                    model,
+                    optimizer,
+                    scaler,
+                    cfg,
+                    normalizers,
+                    train_dataset.output_dim,
+                    0,
+                    best_loss,
+                )
+                print(
+                    "initial rollout checkpoint: "
+                    f"score={best_loss:.6g}, "
+                    f"displacement_rmse={initial_rollout['displacement_rmse']:.6g}, "
+                    f"stress_rmse={initial_rollout['stress_rmse']:.6g}"
+                )
 
     for epoch in range(start_epoch, epochs + 1):
         epoch_start = time.perf_counter()
@@ -374,6 +418,7 @@ def _multistep_gpu_loss(
         case.num_steps - 1 - start_step,
     )
     discount = float(get_cfg(cfg, "training.rollout_loss_discount", 1.0))
+    stress_steps = int(get_cfg(cfg, "training.rollout_stress_steps", steps))
     state = dataset.gpu_builder.state(case, start_step, device)
     case_tensors = dataset.gpu_builder.case_tensors(case, device)
     loss = torch.zeros((), device=device)
@@ -386,7 +431,13 @@ def _multistep_gpu_loss(
         weight = discount**offset
         with autocast_context(cfg, device):
             pred = model(graph)
-            step_loss, metrics = valve_loss(pred, graph, cfg)
+            step_cfg = cfg
+            if offset >= stress_steps:
+                step_cfg = {
+                    **cfg,
+                    "loss": {**cfg.get("loss", {}), "stress": 0.0},
+                }
+            step_loss, metrics = valve_loss(pred, graph, step_cfg)
         loss = loss + weight * step_loss
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + weight * float(value)
