@@ -32,6 +32,7 @@ def main() -> int:
     run_case_path()
     run_case_rollouts()
     write_comparison()
+    run_analysis()
     return 0
 
 
@@ -149,6 +150,10 @@ def write_comparison() -> None:
         },
     }
     write_json(EXP_DIR / "comparison.json", comparison)
+
+
+def run_analysis() -> None:
+    run_step("analysis", [sys.executable, "scripts/analyze_deforming_plate_experiment.py"])
 
 
 def case_rollout_metrics(case_id: str, case_dir: Path, rollout_dir: Path) -> dict[str, float | str]:

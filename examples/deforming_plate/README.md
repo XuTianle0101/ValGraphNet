@@ -65,9 +65,11 @@ python scripts/run_deforming_plate_full_experiment.py
 
 It creates the case dataset when needed, trains both routes, evaluates every
 configured test case, and writes the comparison to
-`outputs/deforming_plate_full_experiment/comparison.json`. The full 30-epoch
-run contains millions of optimizer steps and is intended as a long-running
-experiment; use the quick route above for installation and pipeline checks.
+`outputs/deforming_plate_full_experiment/comparison.json`. It also writes
+`analysis.json`, `report.md`, `training_curves.png`, and
+`rollout_curves.png`. The full-data config uses trajectory-stratified time-step
+sampling so every case contributes once per epoch while complete 200-frame
+trajectories are retained for rollout evaluation.
 
 `rollout_eval.py` writes per-sequence `.npz` artifacts and a `metrics.json` with:
 
@@ -125,6 +127,8 @@ The full configs are tuned for a local CUDA GPU with 8 GB of memory:
   precision without FP16's narrow numeric range.
 - `model.num_processor_checkpoint_segments: 3` recomputes processor
   activations during backward to reduce the training peak.
+- Native autoregressive inference uses PhysicsNeMo Warp radius search so
+  dynamic world-edge search and edge-feature construction stay on CUDA.
 
 Set `training.device: cuda` to require a GPU. The default `auto` selects CUDA
 when it is available and otherwise falls back to CPU. Checkpoints include the
