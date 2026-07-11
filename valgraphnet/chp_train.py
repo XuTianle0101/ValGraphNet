@@ -448,6 +448,7 @@ def contact_pairs_at(
 
 def chp_step_loss(
     output: PhysicalStep,
+    input_state: CHPState,
     trajectory: CHPDeviceCase,
     next_step: int,
     normalizers: CHPNormalizers,
@@ -457,14 +458,19 @@ def chp_step_loss(
 
     static = trajectory.static
     exact_position = static.reference_position + trajectory.displacement[next_step]
-    exact_velocity = trajectory.velocity[next_step]
+    step_dt = trajectory.times[next_step] - trajectory.times[next_step - 1]
+    target_velocity, _ = integration_consistent_targets(
+        input_state,
+        exact_position,
+        step_dt,
+    )
     moving = ~(static.fixed_mask | static.prescribed_mask)
     if not bool(moving.any().item()):
         moving = ~static.fixed_mask
     predicted_position = output.next_position[moving]
     predicted_velocity = output.next_velocity[moving]
     target_position = exact_position[moving]
-    target_velocity = exact_velocity[moving]
+    target_velocity = target_velocity[moving]
     position_loss = F.huber_loss(
         (predicted_position - target_position) / normalizers.displacement_scale,
         torch.zeros_like(predicted_position),
@@ -563,6 +569,23 @@ def chp_step_loss(
             "integration_domain_penalty"
         ].detach(),
     }
+
+
+def integration_consistent_targets(
+    input_state: CHPState,
+    exact_next_position: torch.Tensor,
+    dt: float | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply state-noise correction under the public full-step convention."""
+
+    step_dt = torch.as_tensor(
+        dt,
+        device=input_state.position.device,
+        dtype=input_state.position.dtype,
+    )
+    target_velocity = (exact_next_position - input_state.position) / step_dt
+    target_acceleration = (target_velocity - input_state.velocity) / step_dt
+    return target_velocity, target_acceleration
 
 
 def minimax_checkpoint_score(
@@ -1297,7 +1320,7 @@ def train_chp_epoch(
                         prescribed_velocity=trajectory.velocity[step + 1],
                     )
                     step_loss, metrics = chp_step_loss(
-                        output, trajectory, step + 1, normalizers, cfg
+                        output, state, trajectory, step + 1, normalizers, cfg
                     )
                     exact_position = (
                         trajectory.static.reference_position

@@ -5,11 +5,12 @@ import numpy as np
 import pytest
 import torch
 
-from valgraphnet.chp_model import CHPGNS
+from valgraphnet.chp_model import CHPGNS, CHPState
 from valgraphnet.chp_train import (
     ROLLOUT_METRIC_KEYS,
     curriculum_horizon,
     fit_chp_normalizers,
+    integration_consistent_targets,
     minimax_checkpoint_score,
     load_native_reference,
     select_rollout_start,
@@ -26,6 +27,28 @@ def test_default_curriculum_matches_fixed_long_horizon_schedule():
         8, 8, 8,
         16, 16, 16,
     ]
+
+
+def test_noise_corrected_targets_match_public_full_step_convention():
+    clean_current = torch.tensor([[1.0, 0.0, 0.0]])
+    noise = torch.tensor([[0.003, -0.002, 0.001]])
+    input_state = CHPState(
+        position=clean_current + noise,
+        velocity=torch.tensor([[0.01, 0.0, 0.0]]),
+    )
+    exact_next = torch.tensor([[1.02, 0.0, 0.0]])
+    target_velocity, target_acceleration = integration_consistent_targets(
+        input_state, exact_next, 1.0
+    )
+    torch.testing.assert_close(input_state.position + target_velocity, exact_next)
+    torch.testing.assert_close(
+        input_state.velocity + target_acceleration,
+        target_velocity,
+    )
+    torch.testing.assert_close(
+        target_velocity,
+        torch.tensor([[0.017, 0.002, -0.001]]),
+    )
 
 
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():

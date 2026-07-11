@@ -104,6 +104,27 @@ def test_residual_acceleration_preserves_force_contract():
     assert torch.linalg.vector_norm(recovered, dim=1).max() <= 3.0e-3
 
 
+def test_full_step_exports_are_kinematically_consistent_with_two_substeps():
+    static = build_chp_static(_case(), "cpu")
+    model = CHPGNS(_cfg()).eval()
+    translated = static.reference_position + torch.tensor([0.01, 0.0, 0.0])
+    velocity = torch.full_like(translated, 1.0e-3)
+    state = CHPState(translated, velocity)
+    output = model(static, state, dt=0.5)
+    torch.testing.assert_close(
+        output.next_position - state.position,
+        0.5 * output.next_velocity,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+    torch.testing.assert_close(
+        output.next_velocity - state.velocity,
+        0.5 * output.acceleration,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+
 def test_pair_force_scatter_has_exact_zero_resultant():
     force = torch.randn(3, 3)
     pairs = torch.tensor([[0, 0, 1], [1, 2, 3]])

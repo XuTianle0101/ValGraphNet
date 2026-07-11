@@ -307,7 +307,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 1
+    dynamics_schema_version = 2
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -610,6 +610,9 @@ class CHPGNS(nn.Module):
         max_penetration = position.new_zeros(())
         minimum_update_scale = position.new_ones(())
         integration_valid = torch.ones((), dtype=torch.bool, device=position.device)
+        free_mask = ~static.fixed_mask
+        if active_prescribed_mask is not None:
+            free_mask = free_mask & ~active_prescribed_mask
         damping = torch.zeros_like(position)
         contact = torch.zeros_like(position)
         total_force = torch.zeros_like(position)
@@ -688,9 +691,6 @@ class CHPGNS(nn.Module):
             minimum_update_scale = torch.minimum(minimum_update_scale, update_scale)
             integration_valid = integration_valid & update_valid
             derived_velocity = (accepted_position - current_position) / substep_dt
-            free_mask = ~static.fixed_mask
-            if active_prescribed_mask is not None:
-                free_mask = free_mask & ~active_prescribed_mask
             accepted_velocity = torch.where(
                 free_mask[:, None], derived_velocity, integrated.velocity
             )
@@ -703,23 +703,75 @@ class CHPGNS(nn.Module):
             projection_dissipation = projection_dissipation + (
                 proposal_kinetic - accepted_kinetic
             ).clamp_min(0.0)
-            substep_displacement = accepted_position - current_position
-            external_work = external_work + (external_force * substep_displacement).sum()
-            residual_work = residual_work + (residual * substep_displacement).sum()
-            if active_prescribed_mask is not None:
-                reaction = (
-                    nodal_mass[:, None] * integrated.acceleration - total_force
-                )
-                boundary_work = boundary_work + (
-                    reaction[active_prescribed_mask]
-                    * substep_displacement[active_prescribed_mask]
-                ).sum()
             damping_dissipation = damping_dissipation + damping_rate * substep_dt
             contact_dissipation = contact_dissipation + contact_rate * substep_dt
             current_position = accepted_position
             current_velocity = accepted_velocity
 
+        # Contact substeps refine forces and the final velocity.  Reconstruct
+        # the public full-step state from that velocity so delta-x, delta-v,
+        # and acceleration obey one unambiguous semi-implicit convention:
+        # x[t+1] = x[t] + dt * v[t+1].
+        full_step_proposal = position + step_dt * current_velocity
+        full_step_proposal = torch.where(
+            static.fixed_mask[:, None], position, full_step_proposal
+        )
+        if active_prescribed_mask is not None and prescribed_position is not None:
+            full_step_proposal = torch.where(
+                active_prescribed_mask[:, None],
+                prescribed_position.float(),
+                full_step_proposal,
+            )
+        full_step_penalty = tetrahedral_domain_penalty(
+            full_step_proposal,
+            static.cells,
+            static.dm_inv,
+            minimum_j=self.integration_minimum_j,
+            maximum_i2_bar=self.integration_maximum_i2_bar,
+        )
+        integration_domain_penalty = torch.maximum(
+            integration_domain_penalty, full_step_penalty
+        )
+        final_position, final_scale, final_valid = backtrack_tetrahedral_update(
+            position,
+            full_step_proposal,
+            static.cells,
+            static.dm_inv,
+            fixed_mask=static.fixed_mask,
+            prescribed_mask=active_prescribed_mask,
+            minimum_j=self.integration_minimum_j,
+            maximum_i2_bar=self.integration_maximum_i2_bar,
+            max_backtracks=self.integration_backtracks,
+        )
+        minimum_update_scale = torch.minimum(minimum_update_scale, final_scale)
+        integration_valid = integration_valid & final_valid
+        final_velocity = torch.where(
+            free_mask[:, None],
+            (final_position - position) / step_dt,
+            current_velocity,
+        )
+        solver_kinetic = 0.5 * (
+            nodal_mass[:, None] * current_velocity.square()
+        ).sum()
+        final_kinetic = 0.5 * (
+            nodal_mass[:, None] * final_velocity.square()
+        ).sum()
+        projection_dissipation = projection_dissipation + (
+            solver_kinetic - final_kinetic
+        ).clamp_min(0.0)
+        current_position = final_position
+        current_velocity = final_velocity
+
         acceleration = (current_velocity - velocity) / step_dt
+        full_step_displacement = current_position - position
+        external_work = (external_force * full_step_displacement).sum()
+        residual_work = (residual * full_step_displacement).sum()
+        if active_prescribed_mask is not None:
+            reaction = nodal_mass[:, None] * acceleration - total_force
+            boundary_work = (
+                reaction[active_prescribed_mask]
+                * full_step_displacement[active_prescribed_mask]
+            ).sum()
         final_fields = self.constitutive_fields(static, current_position)
         kinetic_before = 0.5 * (
             static.lumped_mass.reshape(-1, 1)
