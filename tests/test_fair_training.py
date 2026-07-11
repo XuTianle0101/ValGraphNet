@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from valgraphnet.fair_train import (
+    _fair_validation_due,
     FAIR_CHECKPOINT_SCHEMA_VERSION,
     FAIR_MODEL_FAMILY,
     ROLLOUT_METRIC_KEYS,
@@ -20,6 +21,13 @@ from valgraphnet.stress_transform import AsinhStressTransform
 class _Case:
     def __init__(self, steps):
         self.num_steps = steps
+
+
+def test_fair_rollout_validation_cadence_includes_final_epoch():
+    assert not _fair_validation_due(1, 10, 3)
+    assert _fair_validation_due(3, 10, 3)
+    assert _fair_validation_due(10, 10, 3)
+    assert not _fair_validation_due(10, 10, 0)
 
 
 def test_one_uniform_start_per_trajectory_is_deterministic_and_valid():

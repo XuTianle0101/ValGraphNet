@@ -541,7 +541,7 @@ def run_fair_training(cfg: dict[str, Any]) -> Path:
         scheduler.step()
         rollout_metrics: dict[str, float] | None = None
         score = float("inf")
-        if validation_every > 0 and epoch % validation_every == 0:
+        if _fair_validation_due(epoch, epochs, validation_every):
             rollout_metrics = evaluate_fair_rollouts(
                 model,
                 val_dataset,
@@ -565,7 +565,7 @@ def run_fair_training(cfg: dict[str, Any]) -> Path:
         _save_history(history_path, history)
         print(_format_epoch(row), flush=True)
 
-        if not best_path.exists() or score < best_score:
+        if rollout_metrics is not None and math.isfinite(score) and score < best_score:
             best_score = score
             torch.save(
                 _checkpoint_payload(
@@ -616,7 +616,19 @@ def run_fair_training(cfg: dict[str, Any]) -> Path:
                 ),
                 output_dir / f"epoch_{epoch:04d}.pt",
             )
+    if not best_path.exists() or not math.isfinite(best_score):
+        raise RuntimeError(
+            "fair baseline produced no finite rollout-validated checkpoint"
+        )
     return best_path
+
+
+def _fair_validation_due(epoch: int, total_epochs: int, every: int) -> bool:
+    """Validate on cadence and always audit the final trained epoch."""
+
+    return int(every) > 0 and (
+        int(epoch) == int(total_epochs) or int(epoch) % int(every) == 0
+    )
 
 
 def _checkpoint_payload(
