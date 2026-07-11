@@ -83,6 +83,13 @@ def test_ascii_frd_and_dat_parsers_preserve_tensor_components():
     np.testing.assert_allclose(frames[0].values[1], [[10, 20, 30, 40, 50, 60]])
 
 
+def test_production_force_component_aliases_are_canonical():
+    from valgraphnet.calculix_results import _component_indices
+
+    assert _component_indices(("F1", "F2", "F3", "ALL"), "force") == [0, 1, 2]
+    assert _component_indices(("RF1", "RF2", "RF3"), "force") == [0, 1, 2]
+
+
 def test_conversion_writes_loadable_constitutive_case(tmp_path):
     raw, entry = _raw_case(tmp_path)
     output = tmp_path / "processed" / entry["case_id"]

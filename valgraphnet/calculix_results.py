@@ -377,6 +377,8 @@ def _component_indices(components: Sequence[str], kind: str) -> list[int]:
             ("SZX", "SXZ", "S13"),
             ("SYZ", "S23"),
         )
+    elif kind == "force":
+        aliases = (("F1", "RF1"), ("F2", "RF2"), ("F3", "RF3"))
     else:
         raise ValueError(f"unknown component kind: {kind}")
     indices: list[int] = []
@@ -718,6 +720,22 @@ def convert_case(
             cell_stress, mesh.cells, volume, mesh.block_node_labels.shape[0]
         )
 
+    block_nodal_force: np.ndarray | None = None
+    try:
+        force_times, raw_block_force = _nodal_history(
+            datasets,
+            mesh.block_node_labels,
+            names={"FORC", "RF"},
+            kind="force",
+        )
+        block_nodal_force = raw_block_force[
+            _match_frame_indices(times, force_times, "FRD block nodal force")
+        ]
+    except ValueError:
+        # Older/synthetic exports may omit RF. Production HyperContact configs
+        # fail closed by requiring solver_nodal_force.npy.
+        block_nodal_force = None
+
     block_node_count = int(mesh.block_node_labels.shape[0])
     indenter_node_count = int(mesh.indenter_node_labels.shape[0])
     derived_parameters = dict(entry.get("derived", {}))
@@ -766,6 +784,10 @@ def convert_case(
         integration_stress,
         integration_mask,
     )
+    if block_nodal_force is not None and prepended_reference:
+        block_nodal_force = np.concatenate(
+            (np.zeros_like(block_nodal_force[:1]), block_nodal_force), axis=0
+        )
     assert nodal_stress is not None and cell_stress is not None
     velocity = _finite_difference(displacement, times)
     acceleration = _finite_difference(velocity, times)
@@ -855,6 +877,12 @@ def convert_case(
     if integration_stress is not None and integration_mask is not None:
         arrays["S_integration_point.npy"] = integration_stress.astype(np.float32)
         arrays["integration_point_mask.npy"] = integration_mask
+    if block_nodal_force is not None:
+        full_nodal_force = np.zeros(
+            (times.shape[0], mesh.nodes.shape[0], 3), dtype=np.float64
+        )
+        full_nodal_force[:, :block_node_count] = block_nodal_force
+        arrays["solver_nodal_force.npy"] = full_nodal_force.astype(np.float32)
 
     destination = Path(output_directory)
     _write_case_arrays(destination, arrays)
@@ -898,6 +926,13 @@ def convert_case(
         "source": "HyperContact-3D / CalculiX",
         "split": str(entry.get("split", "unknown")),
         "stress_source": stress_source,
+        "solver_nodal_force": (
+            "CalculiX FRD FORC on deformable block nodes; prescribed rigid "
+            "indenter entries are zero"
+            if block_nodal_force is not None
+            else None
+        ),
+        "solver_nodal_force_components": ["F1", "F2", "F3"],
         "rigid_nodal_stress": "zero; prescribed rigid surface has no constitutive cells",
         "nodal_stress_components": [
             "von_mises",

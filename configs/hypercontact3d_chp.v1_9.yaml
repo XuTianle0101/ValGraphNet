@@ -36,6 +36,7 @@ data:
       - S_cell.npy
       - S_integration_point.npy
       - integration_point_mask.npy
+      - solver_nodal_force.npy
       - material.json
       - material_features.npy
       - density.npy
