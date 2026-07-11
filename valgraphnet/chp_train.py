@@ -477,8 +477,10 @@ def load_native_reference(cfg: dict[str, Any]) -> dict[str, float] | None:
     if path:
         with Path(path).open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        if "rollout" in payload:
-            payload = payload["rollout"]
+        for container in ("rollout", "summary", "aggregate"):
+            if container in payload and isinstance(payload[container], dict):
+                payload = payload[container]
+                break
         inline = payload
     if not inline:
         return None

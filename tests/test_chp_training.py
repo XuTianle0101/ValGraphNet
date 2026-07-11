@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,7 @@ from valgraphnet.chp_train import (
     curriculum_horizon,
     fit_chp_normalizers,
     minimax_checkpoint_score,
+    load_native_reference,
     select_rollout_start,
     stress_frame_scores,
 )
@@ -47,6 +49,15 @@ def test_minimax_checkpoint_cannot_trade_stress_for_displacement():
     stress_regression = {**balanced, "stress_relative_rmse": 1.1}
     assert minimax_checkpoint_score(balanced, native) == 0.8
     assert minimax_checkpoint_score(stress_regression, native) == 1.1
+
+
+def test_native_reference_loads_shared_evaluator_summary(tmp_path):
+    values = {key: float(index + 1) for index, key in enumerate(ROLLOUT_METRIC_KEYS)}
+    path = tmp_path / "metrics.json"
+    path.write_text(json.dumps({"summary": values}), encoding="utf-8")
+    assert load_native_reference(
+        {"validation": {"native_reference_file": str(path)}}
+    ) == values
 
 
 def test_normalizers_are_finite_invertible_and_do_not_clip_stress():
