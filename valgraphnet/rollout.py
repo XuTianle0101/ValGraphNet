@@ -27,7 +27,7 @@ def run_rollout(
     """Run autoregressive rollout for one exported case."""
 
     device = resolve_device(str(get_cfg(cfg, "training.device", "auto")))
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ckpt_cfg = checkpoint.get("cfg", cfg)
     output_dim = int(checkpoint["output_dim"])
     normalizers = None

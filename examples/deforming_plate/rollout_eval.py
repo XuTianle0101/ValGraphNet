@@ -36,8 +36,11 @@ def run_rollout_eval(
     cache_dir = Path(
         get_cfg(cfg, "data.preprocess_output_dir", "preprocessed_dataset/deforming_plate")
     )
-    if get_cfg(cfg, "data.case_dir", None) and not (cache_dir / "edge_stats.pt").exists():
-        _build_case_backed_datasets(cfg, cache_dir)
+    if get_cfg(cfg, "data.case_dir", None):
+        if not (cache_dir / "edge_stats.pt").exists() or not (
+            cache_dir / "node_stats.pt"
+        ).exists():
+            _build_case_backed_datasets(cfg, cache_dir)
     elif not preprocess_cache_is_compatible(cfg, cache_dir):
         run_preprocess(cfg)
 
