@@ -1,6 +1,7 @@
 import torch
 
 from valgraphnet.hierarchy import (
+    HierarchicalScalarVectorProcessor,
     ScalarVectorBlock,
     build_topology_hierarchy,
     pool_mean,
@@ -52,3 +53,17 @@ def test_scalar_vector_block_is_rotation_equivariant():
 
     assert torch.allclose(scalar_a, scalar_b, atol=2.0e-5, rtol=2.0e-5)
     assert torch.allclose(vector_a @ rotation.T, vector_b, atol=2.0e-5, rtol=2.0e-5)
+
+
+def test_hierarchy_activation_checkpointing_preserves_gradients():
+    hierarchy = build_topology_hierarchy(8, _chain_edges(8))
+    processor = HierarchicalScalarVectorProcessor(
+        scalar_dim=8, vector_dim=3, activation_checkpointing=True
+    ).train()
+    scalar = torch.randn(8, 8, requires_grad=True)
+    vector = torch.randn(8, 3, 3, requires_grad=True)
+    position = torch.randn(8, 3)
+    scalar_out, vector_out = processor(scalar, vector, position, hierarchy)
+    (scalar_out.square().mean() + vector_out.square().mean()).backward()
+    assert scalar.grad is not None and torch.isfinite(scalar.grad).all()
+    assert vector.grad is not None and torch.isfinite(vector.grad).all()

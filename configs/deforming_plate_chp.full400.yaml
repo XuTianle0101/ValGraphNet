@@ -1,0 +1,89 @@
+# CHP-GNS flagship deforming_plate experiment. Training and rollout are
+# intentionally CUDA-only; neural blocks use BF16 while mechanics stays FP32.
+seed: 42
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+  noise_std: 0.003
+  pressure_sign: 1.0
+
+model:
+  scalar_dim: 96
+  vector_dim: 16
+  cell_dim: 64
+  potential_order: 2
+  fiber_order: 0
+  inversion_stiffness: 10.0
+  minimum_j: 0.0
+  contact_substeps: 2
+  residual_force_limit: 0.1
+  activation_checkpointing: true
+  # DeepMind publishes unit-spaced frames rather than SI time. These learned,
+  # positive scales initialize the constitutive stress and effective inertia in
+  # a numerically useful range and remain part of the trained physical model.
+  initial_stress_scale: 1.0e4
+  initial_mass_scale: 1.0e16
+  initial_contact_scale: 1.0e-5
+  initial_damping_scale: 0.1
+
+contact:
+  enabled: true
+  radius: 0.03
+  max_neighbors: 32
+
+loss:
+  position: 1.0
+  velocity: 1.0
+  stress: 1.0
+  work_energy: 0.1
+  penetration: 1.0
+  residual: 0.01
+  negative_j: 10.0
+  huber_delta: 1.0
+  peak_fraction: 0.1
+  peak_weight: 0.5
+
+training:
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+  epochs: 16
+  curriculum:
+    - {horizon: 1, epochs: 4}
+    - {horizon: 2, epochs: 3}
+    - {horizon: 4, epochs: 3}
+    - {horizon: 8, epochs: 3}
+    - {horizon: 16, epochs: 3}
+  tbptt_chunk: 4
+  pushforward_stop_gradient: true
+  noise_smoothing_steps: 4
+  noise_min_j: 0.2
+  noise_backtracks: 8
+  trajectories_per_epoch: 1000
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  warmup_steps: 500
+  grad_clip_norm: 1.0
+  fused_optimizer: true
+  gpu_case_cache_size: 3
+  normalizer_cases: 128
+  normalizer_frames: 8
+  normalizer_nodes: 256
+  output_dir: outputs/deforming_plate_chp_full400_seed42
+  resume_from: auto
+
+validation:
+  cases: 20
+  steps: 399
+  teacher_stress_cases: 20
+  teacher_stress_frames: 16
+  teacher_stress_threshold: 0.50
+  enforce_teacher_stress_gate: true
+  gpu_case_cache_size: 2
+  divergence_position: 10.0
+  # Add native_reference_file after the native full-400 reference pass. The
+  # trainer then selects checkpoints by the worst of the four native ratios.

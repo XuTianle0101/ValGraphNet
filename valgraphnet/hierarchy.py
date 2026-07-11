@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -114,10 +115,12 @@ class ScalarVectorBlock(nn.Module):
             dim=1,
         )
         raw = self.message(invariants)
-        scalar_message = raw[:, : self.scalar_dim]
-        direction_weight = raw[:, self.scalar_dim :]
-        mixed = self.vector_mix(src_vector.transpose(1, 2)).transpose(1, 2)
-        vector_message = mixed + direction_weight[:, :, None] * direction[:, None, :]
+        scalar_message = raw[:, : self.scalar_dim].to(scalar.dtype)
+        direction_weight = raw[:, self.scalar_dim :].to(vector.dtype)
+        mixed = self.vector_mix(src_vector.transpose(1, 2)).transpose(1, 2).to(vector.dtype)
+        vector_message = (
+            mixed + direction_weight[:, :, None] * direction[:, None, :]
+        ).to(vector.dtype)
 
         scalar_agg = scalar.new_zeros(scalar.shape)
         vector_agg = vector.new_zeros(vector.shape)
@@ -137,8 +140,15 @@ class ScalarVectorBlock(nn.Module):
 class HierarchicalScalarVectorProcessor(nn.Module):
     """Two fine and four coarse blocks followed by two fine refinement blocks."""
 
-    def __init__(self, scalar_dim: int = 96, vector_dim: int = 16) -> None:
+    def __init__(
+        self,
+        scalar_dim: int = 96,
+        vector_dim: int = 16,
+        *,
+        activation_checkpointing: bool = False,
+    ) -> None:
         super().__init__()
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.fine_in = nn.ModuleList(
             [ScalarVectorBlock(scalar_dim, vector_dim) for _ in range(2)]
         )
@@ -154,6 +164,40 @@ class HierarchicalScalarVectorProcessor(nn.Module):
         self.coarse_one_fuse = nn.Linear(2 * scalar_dim, scalar_dim)
         self.fine_fuse = nn.Linear(2 * scalar_dim, scalar_dim)
 
+    def _blocks(
+        self,
+        blocks: nn.ModuleList,
+        scalar: torch.Tensor,
+        vector: torch.Tensor,
+        edge_index: torch.Tensor,
+        position: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        def run_pair(
+            pair: nn.ModuleList,
+            scalar_value: torch.Tensor,
+            vector_value: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            for block in pair:
+                scalar_value, vector_value = block(
+                    scalar_value, vector_value, edge_index, position
+                )
+            return scalar_value, vector_value
+
+        # Every list currently contains two blocks. Keeping the grouping generic
+        # makes the memory policy stable if a later ablation changes the depth.
+        for start in range(0, len(blocks), 2):
+            pair = blocks[start : start + 2]
+            if self.activation_checkpointing and self.training:
+                scalar, vector = checkpoint(
+                    lambda s, v, pair=pair: run_pair(pair, s, v),
+                    scalar,
+                    vector,
+                    use_reentrant=False,
+                )
+            else:
+                scalar, vector = run_pair(pair, scalar, vector)
+        return scalar, vector
+
     def forward(
         self,
         scalar: torch.Tensor,
@@ -163,20 +207,23 @@ class HierarchicalScalarVectorProcessor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         edges = [edge.to(scalar.device) for edge in hierarchy.edge_indices]
         assignments = [value.to(scalar.device) for value in hierarchy.assignments]
-        for block in self.fine_in:
-            scalar, vector = block(scalar, vector, edges[0], position)
+        scalar, vector = self._blocks(
+            self.fine_in, scalar, vector, edges[0], position
+        )
 
         scalar_one = pool_mean(scalar, assignments[0], hierarchy.node_counts[1])
         vector_one = pool_mean(vector, assignments[0], hierarchy.node_counts[1])
         position_one = pool_mean(position, assignments[0], hierarchy.node_counts[1])
-        for block in self.coarse_one:
-            scalar_one, vector_one = block(scalar_one, vector_one, edges[1], position_one)
+        scalar_one, vector_one = self._blocks(
+            self.coarse_one, scalar_one, vector_one, edges[1], position_one
+        )
 
         scalar_two = pool_mean(scalar_one, assignments[1], hierarchy.node_counts[2])
         vector_two = pool_mean(vector_one, assignments[1], hierarchy.node_counts[2])
         position_two = pool_mean(position_one, assignments[1], hierarchy.node_counts[2])
-        for block in self.coarse_two:
-            scalar_two, vector_two = block(scalar_two, vector_two, edges[2], position_two)
+        scalar_two, vector_two = self._blocks(
+            self.coarse_two, scalar_two, vector_two, edges[2], position_two
+        )
 
         scalar_one = self.coarse_one_fuse(
             torch.cat([scalar_one, unpool(scalar_two, assignments[1])], dim=1)
@@ -186,8 +233,9 @@ class HierarchicalScalarVectorProcessor(nn.Module):
             torch.cat([scalar, unpool(scalar_one, assignments[0])], dim=1)
         )
         vector = vector + unpool(vector_one, assignments[0])
-        for block in self.fine_out:
-            scalar, vector = block(scalar, vector, edges[0], position)
+        scalar, vector = self._blocks(
+            self.fine_out, scalar, vector, edges[0], position
+        )
         return scalar, vector
 
 
