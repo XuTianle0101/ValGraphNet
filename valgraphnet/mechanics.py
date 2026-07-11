@@ -644,7 +644,12 @@ def von_mises(stress: torch.Tensor) -> torch.Tensor:
     mean_stress = torch.diagonal(symmetric, dim1=-2, dim2=-1).sum(dim=-1) / 3.0
     identity = torch.eye(3, dtype=symmetric.dtype, device=symmetric.device)
     deviator = symmetric - mean_stress[..., None, None] * identity
-    return torch.sqrt((1.5 * deviator.square().sum(dim=(-2, -1))).clamp_min(0.0))
+    equivalent_squared = (1.5 * deviator.square().sum(dim=(-2, -1))).clamp_min(0.0)
+    # Plain sqrt has an infinite derivative at the physically important
+    # zero-stress reference state.  Subtracting the identical smoothing offset
+    # preserves an exact zero value while keeping training gradients finite.
+    eps = equivalent_squared.new_tensor(torch.finfo(equivalent_squared.dtype).eps)
+    return torch.sqrt(equivalent_squared + eps) - torch.sqrt(eps)
 
 
 def semi_implicit_step(

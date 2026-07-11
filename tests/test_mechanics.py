@@ -113,6 +113,15 @@ def test_rigid_rotation_preserves_energy_and_rotates_stress():
     torch.testing.assert_close(von_mises(rotated.cauchy_stress), von_mises(base.cauchy_stress), atol=2.0e-11, rtol=2.0e-11)
 
 
+def test_von_mises_has_finite_zero_stress_gradient():
+    stress = torch.zeros(2, 3, 3, requires_grad=True)
+    value = von_mises(stress)
+    torch.testing.assert_close(value, torch.zeros_like(value), atol=0.0, rtol=0.0)
+    value.sum().backward()
+    assert stress.grad is not None
+    assert torch.isfinite(stress.grad).all()
+
+
 def test_assembled_internal_force_has_zero_resultant_and_projection_is_weighted():
     nodes, cells = _unit_tetra()
     reference = precompute_tetrahedra(nodes, cells)

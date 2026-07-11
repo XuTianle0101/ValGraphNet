@@ -59,6 +59,7 @@ training:
     - {horizon: 8, epochs: 3}
     - {horizon: 16, epochs: 3}
   tbptt_chunk: 4
+  checkpoint_min_horizon: 8
   pushforward_stop_gradient: true
   noise_smoothing_steps: 4
   noise_min_j: 0.2

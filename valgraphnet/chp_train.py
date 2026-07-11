@@ -712,6 +712,9 @@ def train_chp_epoch(
     amp_dtype: torch.dtype,
 ) -> dict[str, float]:
     model.train()
+    model.processor.activation_checkpointing = bool(
+        get_cfg(cfg, "model.activation_checkpointing", True)
+    ) and horizon >= int(get_cfg(cfg, "training.checkpoint_min_horizon", 8))
     rng = np.random.default_rng(int(cfg.get("seed", 42)) + 1009 * int(epoch))
     indices = rng.permutation(len(cases))
     requested = get_cfg(cfg, "training.trajectories_per_epoch", None)
