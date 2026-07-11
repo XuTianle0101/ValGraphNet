@@ -19,6 +19,7 @@ PRIMARY_METRICS = (
     "stress_relative_rmse",
     "stress_p95_relative_rmse",
 )
+METRIC_SCHEMA_VERSION = 2
 
 
 def select_case_ids(
@@ -207,7 +208,7 @@ def evaluate_prediction_directory(
     summary["evaluated_cases"] = float(len(per_case))
     summary["missing_cases"] = float(len(missing))
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": METRIC_SCHEMA_VERSION,
         "evaluation": {
             "split": str(split),
             "case_selection": str(case_selection),
@@ -241,6 +242,8 @@ def validate_reference_protocol(
 ) -> None:
     """Reject checkpoint references evaluated on a different development set."""
 
+    if int(payload.get("schema_version", 0)) < METRIC_SCHEMA_VERSION:
+        raise ValueError("native reference uses a metric schema without provenance")
     evaluation = payload.get("evaluation")
     if not isinstance(evaluation, dict):
         raise ValueError("native reference is missing evaluation provenance")

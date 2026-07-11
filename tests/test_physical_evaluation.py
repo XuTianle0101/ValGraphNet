@@ -118,6 +118,7 @@ def test_native_reference_protocol_requires_same_even_validation_subset(tmp_path
     )
     expected = select_case_ids(val_ids, 20, "even")
     payload = {
+        "schema_version": 2,
         "evaluation": {"split": "val"},
         "per_case": [
             {"case_id": case_id, "evaluated_frames": 400}
