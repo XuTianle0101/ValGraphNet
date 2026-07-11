@@ -74,3 +74,43 @@ def test_valgraphnet_wrapper_hybrid_forward_smoke():
     assert pred["delta_v"].shape == (num_nodes, 3)
     assert pred["accel"].shape == (num_nodes, 3)
     assert pred["stress"].shape == (num_nodes, 1)
+
+
+def test_independent_stress_decoder_migrates_joint_decoder():
+    from valgraphnet.constants import BASE_OUTPUT_DIM, EDGE_FEATURE_DIM, NODE_FEATURE_DIM
+    from valgraphnet.model import ValveGraphNet
+
+    torch.manual_seed(1)
+    output_dim = BASE_OUTPUT_DIM + 1
+    base_cfg = {
+        "model": {
+            "type": "hybrid",
+            "processor_size": 1,
+            "hidden_dim_processor": 16,
+            "decoder_layers": 2,
+        }
+    }
+    joint = ValveGraphNet(base_cfg, output_dim=output_dim)
+    split_cfg = {"model": {**base_cfg["model"], "independent_stress_decoder": True}}
+    split = ValveGraphNet(split_cfg, output_dim=output_dim)
+    split.load_compatible_state_dict(joint.state_dict())
+
+    joint_final = joint.net.node_decoder.model[-1]
+    dynamics_final = split.net.node_decoder.model[-1]
+    stress_final = split.stress_decoder.model[-1]
+    assert torch.equal(dynamics_final.weight, joint_final.weight[:BASE_OUTPUT_DIM])
+    assert torch.equal(stress_final.weight, joint_final.weight[BASE_OUTPUT_DIM:])
+
+    num_nodes = 6
+    mesh_edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+    world_edge_index = torch.tensor([[0, 5], [5, 0]], dtype=torch.long)
+    graph = pyg.data.Data(
+        edge_index=torch.cat([mesh_edge_index, world_edge_index], dim=1),
+        num_nodes=num_nodes,
+    )
+    graph.node_features = torch.randn(num_nodes, NODE_FEATURE_DIM)
+    graph.mesh_edge_features = torch.randn(mesh_edge_index.shape[1], EDGE_FEATURE_DIM)
+    graph.world_edge_features = torch.randn(world_edge_index.shape[1], EDGE_FEATURE_DIM)
+    graph.fixed_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    pred = split(graph)
+    assert pred["stress"].shape == (num_nodes, 1)
