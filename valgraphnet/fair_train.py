@@ -142,6 +142,7 @@ def fair_one_step_loss(
     stress_loss, stress_parts = robust_stress_loss(
         prediction["stress_transformed"][stress_mask],
         encoded_stress[stress_mask],
+        ranking_target=target_stress[stress_mask],
         peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
         peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
         delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),

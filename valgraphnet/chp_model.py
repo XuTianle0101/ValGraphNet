@@ -35,6 +35,7 @@ class CHPStatic:
     lumped_mass: torch.Tensor
     fixed_mask: torch.Tensor
     prescribed_mask: torch.Tensor
+    contact_surface_mask: torch.Tensor
     material_features: torch.Tensor
     fiber_direction: torch.Tensor
     hierarchy: TopologyHierarchy
@@ -244,21 +245,42 @@ class PairForceHeads(nn.Module):
         contact_pairs: torch.Tensor,
         radius: float,
         nodal_mass: torch.Tensor | None = None,
+        reference_position: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if contact_pairs.numel() == 0:
             zero = position.new_zeros((position.shape[0], 3))
             scalar_zero = position.new_zeros(())
             return zero, scalar_zero, scalar_zero
         features, direction, relative_velocity, normal_velocity = self.invariants(
-            scalar, position, velocity, contact_pairs
+            scalar,
+            position,
+            velocity,
+            contact_pairs,
+            reference_position,
         )
         raw = self.contact(features)
-        penetration = ((float(radius) - features[:, -4:-3]) / max(float(radius), 1.0e-8)).clamp_min(0.0)
+        distance = features[:, -4:-3]
+        if reference_position is None:
+            contact_distance = torch.full_like(distance, float(radius))
+        else:
+            src, dst = contact_pairs
+            reference_distance = torch.linalg.vector_norm(
+                reference_position[dst] - reference_position[src],
+                dim=1,
+                keepdim=True,
+            )
+            contact_distance = reference_distance.clamp_max(float(radius))
+        penetration = (
+            (contact_distance - distance)
+            / contact_distance.clamp_min(1.0e-8)
+        ).clamp_min(0.0)
         normal_magnitude = F.softplus(raw[:, :1]) * penetration
         normal_force_src = -normal_magnitude * direction
         tangential_velocity = relative_velocity - normal_velocity * direction
         tangential_coefficient = F.softplus(raw[:, 1:2])
-        tangential_force_src = tangential_coefficient * tangential_velocity
+        tangential_force_src = (
+            tangential_coefficient * tangential_velocity * penetration
+        )
         force_src = normal_force_src + tangential_force_src
         pair_mass = None
         pair_weight = self.pair_normalization(contact_pairs, position.shape[0]).to(
@@ -272,6 +294,7 @@ class PairForceHeads(nn.Module):
         dissipation_density = (
             tangential_coefficient
             * tangential_velocity.square().sum(1, keepdim=True)
+            * penetration
             * pair_weight
         )
         if pair_mass is not None:
@@ -295,6 +318,9 @@ class CHPGNS(nn.Module):
         self.contact_radius = float(get_cfg(cfg, "contact.radius", 0.03))
         self.contact_substeps = int(model_cfg.get("contact_substeps", 2))
         self.residual_limit = float(model_cfg.get("residual_force_limit", 0.1))
+        self.normalize_potential_scale = bool(
+            model_cfg.get("normalize_potential_scale", True)
+        )
         initial_stress_scale = float(model_cfg.get("initial_stress_scale", 1.0))
         initial_mass_scale = float(model_cfg.get("initial_mass_scale", 1.0))
         initial_contact_scale = float(model_cfg.get("initial_contact_scale", 1.0e-3))
@@ -377,7 +403,13 @@ class CHPGNS(nn.Module):
             )
         fiber = static.fiber_direction if self.potential.fiber_order else None
         response = self.potential(deformation, fiber_direction=fiber)
-        stress_scale = self.log_stress_scale.clamp(-20.0, 30.0).exp()
+        physical_modulus = self.log_stress_scale.clamp(-20.0, 30.0).exp()
+        potential_scale = (
+            self.potential.i1_coefficients[0].clamp_min(1.0e-12)
+            if self.normalize_potential_scale
+            else physical_modulus.new_ones(())
+        )
+        stress_scale = physical_modulus / potential_scale
         if self.material_scale is None:
             scale = torch.ones(
                 (static.cells.shape[0], 1),
@@ -487,7 +519,7 @@ class CHPGNS(nn.Module):
         if contact_pairs is None:
             contact_pairs = position.new_zeros((2, 0), dtype=torch.long)
         contact_pairs = unique_undirected_pairs(contact_pairs, static.num_nodes)
-        mass_scale = self.log_mass_scale.clamp(-20.0, 40.0).exp()
+        mass_scale = self.log_mass_scale.clamp(-20.0, 50.0).exp()
         nodal_mass = static.lumped_mass.reshape(-1) * mass_scale
         contact_scale = self.log_contact_scale.clamp(-20.0, 10.0).exp()
         damping_scale = self.log_damping_scale.clamp(-20.0, 10.0).exp()
@@ -541,6 +573,7 @@ class CHPGNS(nn.Module):
                 contact_pairs,
                 self.contact_radius,
                 nodal_mass,
+                reference,
             )
             damping = damping * damping_scale
             damping_rate = damping_rate * damping_scale
@@ -660,6 +693,34 @@ def unique_undirected_pairs(edge_index: torch.Tensor, num_nodes: int) -> torch.T
     return torch.stack([encoded // int(num_nodes), encoded % int(num_nodes)], dim=0)
 
 
+def tetra_surface_node_mask(cells: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """Return nodes incident to a boundary face of a tetrahedral complex."""
+
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    if cells.ndim != 2 or cells.shape[1] != 4:
+        raise ValueError("cells must have shape [M, 4]")
+    faces = torch.cat(
+        [
+            cells[:, [0, 1, 2]],
+            cells[:, [0, 1, 3]],
+            cells[:, [0, 2, 3]],
+            cells[:, [1, 2, 3]],
+        ],
+        dim=0,
+    ).sort(dim=1).values
+    encoded = (faces[:, 0] * int(num_nodes) + faces[:, 1]) * int(
+        num_nodes
+    ) + faces[:, 2]
+    _, inverse, counts = torch.unique(
+        encoded, sorted=False, return_inverse=True, return_counts=True
+    )
+    boundary_faces = faces[counts[inverse] == 1]
+    mask = torch.zeros(int(num_nodes), dtype=torch.bool, device=cells.device)
+    if boundary_faces.numel():
+        mask[boundary_faces.reshape(-1)] = True
+    return mask
+
+
 def build_chp_static(
     case,
     device: torch.device | str,
@@ -674,6 +735,10 @@ def build_chp_static(
 
     reference = tensor(case.nodes, torch.float32)
     cells = tensor(case.cells, torch.long)
+    surface_mask = tetra_surface_node_mask(
+        torch.from_numpy(np.array(case.cells, dtype=np.int64, copy=True)),
+        case.num_nodes,
+    ).to(device=device)
     mesh_edges = tensor(case.mesh_edge_index, torch.long)
     hierarchy = (hierarchy or build_case_hierarchy(case)).to(device)
     material_features = np.array(case.material_features, dtype=np.float32, copy=True)
@@ -698,6 +763,7 @@ def build_chp_static(
         lumped_mass=tensor(case.lumped_mass.reshape(-1), torch.float32),
         fixed_mask=tensor(case.fixed_mask, torch.bool),
         prescribed_mask=tensor(case.prescribed_mask, torch.bool),
+        contact_surface_mask=surface_mask,
         material_features=tensor(material_features, torch.float32),
         fiber_direction=tensor(case.fiber_direction, torch.float32),
         hierarchy=hierarchy,
@@ -719,6 +785,8 @@ def radius_contact_pairs(
     fixed_mask: torch.Tensor,
     radius: float,
     max_neighbors: int = 32,
+    prescribed_mask: torch.Tensor | None = None,
+    surface_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build exact bounded contact pairs on CUDA using PhysicsNeMo Warp search."""
 
@@ -741,6 +809,15 @@ def radius_contact_pairs(
     adjacency[mesh_edge_index[0], mesh_edge_index[1]] = True
     valid = (neighbors != sources) & ~adjacency[sources, neighbors]
     valid &= ~(fixed_mask[sources] & fixed_mask[neighbors])
+    if prescribed_mask is not None and bool(prescribed_mask.any().item()):
+        prescribed_mask = prescribed_mask.to(device=position.device, dtype=torch.bool)
+        # In deforming_plate the prescribed tetrahedra form the rigid indenter.
+        # Only cross-body pairs are contacts; nearby non-edge vertices inside
+        # either tetrahedral body must never repel one another.
+        valid &= prescribed_mask[sources] ^ prescribed_mask[neighbors]
+    if surface_mask is not None:
+        surface_mask = surface_mask.to(device=position.device, dtype=torch.bool)
+        valid &= surface_mask[sources] & surface_mask[neighbors]
     distance_sq = ((points[sources] - points[neighbors]) ** 2).sum(-1)
     valid &= distance_sq <= float(radius) ** 2
     distance_sq = distance_sq.masked_fill(~valid, torch.inf)

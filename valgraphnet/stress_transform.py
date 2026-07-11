@@ -91,6 +91,7 @@ def robust_stress_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     *,
+    ranking_target: torch.Tensor | None = None,
     peak_fraction: float = 0.1,
     peak_weight: float = 0.5,
     delta: float = 1.0,
@@ -103,7 +104,10 @@ def robust_stress_loss(
         peak = base.new_zeros(())
     else:
         topk = max(1, min(count, int(round(count * float(peak_fraction)))))
-        indices = target.detach().abs().reshape(-1).topk(topk).indices
+        ranking = target if ranking_target is None else ranking_target
+        if ranking.shape != target.shape:
+            raise ValueError("ranking_target must have the same shape as target")
+        indices = ranking.detach().abs().reshape(-1).topk(topk).indices
         pred_flat = prediction.reshape(-1)[indices]
         target_flat = target.reshape(-1)[indices]
         peak = F.huber_loss(pred_flat, target_flat, reduction="mean", delta=float(delta))

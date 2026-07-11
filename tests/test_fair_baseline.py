@@ -16,6 +16,20 @@ def test_asinh_stress_transform_round_trip_and_tail_loss():
     assert components["stress_peak"] > 0
 
 
+def test_peak_loss_uses_raw_physical_stress_ranking():
+    prediction = torch.tensor([[0.0], [4.0], [0.0], [0.0]])
+    transformed_target = torch.tensor([[-5.0], [4.0], [0.0], [0.0]])
+    physical_target = torch.tensor([[0.0], [100.0], [1.0], [2.0]])
+    _, parts = robust_stress_loss(
+        prediction,
+        transformed_target,
+        ranking_target=physical_target,
+        peak_fraction=0.25,
+        peak_weight=1.0,
+    )
+    torch.testing.assert_close(parts["stress_peak"], torch.zeros(()))
+
+
 def test_position_delta_is_the_only_integrated_dynamics_output():
     current = torch.zeros(3, 3)
     velocity = torch.tensor([[1.0, 0.0, 0.0]]).repeat(3, 1)

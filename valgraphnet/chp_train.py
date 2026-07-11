@@ -340,6 +340,34 @@ def geometry_safe_state_noise(
 
 
 @torch.no_grad()
+def training_state_admissibility(
+    static: CHPStatic,
+    position: torch.Tensor,
+    cfg: dict[str, Any],
+) -> tuple[bool, float, float]:
+    """Return potential-domain validity and the limiting invariants."""
+
+    state = invariants(
+        deformation_gradient(position, static.cells, static.dm_inv)
+    )
+    minimum_j = float(get_cfg(cfg, "training.minimum_start_j", 1.0e-2))
+    maximum_i2 = float(get_cfg(cfg, "training.maximum_start_i2_bar", 1.0e5))
+    minimum_observed_j = state.j.min()
+    maximum_observed_i2 = state.i2_bar.max()
+    valid = (
+        torch.isfinite(state.j).all()
+        & torch.isfinite(state.i2_bar).all()
+        & (minimum_observed_j >= minimum_j)
+        & (maximum_observed_i2 <= maximum_i2)
+    )
+    return (
+        bool(valid.item()),
+        float(minimum_observed_j.item()),
+        float(maximum_observed_i2.item()),
+    )
+
+
+@torch.no_grad()
 def is_admissible_training_state(
     static: CHPStatic,
     position: torch.Tensor,
@@ -347,13 +375,21 @@ def is_admissible_training_state(
 ) -> bool:
     """Reject source frames that already violate the potential domain."""
 
-    state = invariants(
-        deformation_gradient(position, static.cells, static.dm_inv)
+    return training_state_admissibility(static, position, cfg)[0]
+
+
+@torch.no_grad()
+def is_admissible_training_window(
+    trajectory: CHPDeviceCase,
+    cfg: dict[str, Any],
+) -> bool:
+    """Require every exact state in a rollout window to lie in GL+(3)."""
+
+    position = (
+        trajectory.static.reference_position[None]
+        + trajectory.displacement
     )
-    minimum_j = float(get_cfg(cfg, "training.minimum_start_j", 1.0e-2))
-    maximum_i2 = float(get_cfg(cfg, "training.maximum_start_i2_bar", 1.0e5))
-    valid = (state.j.min() >= minimum_j) & (state.i2_bar.max() <= maximum_i2)
-    return bool(valid.item())
+    return training_state_admissibility(trajectory.static, position, cfg)[0]
 
 
 def build_sampling_scores(
@@ -405,6 +441,8 @@ def contact_pairs_at(
         trajectory.static.fixed_mask,
         float(get_cfg(cfg, "contact.radius", 0.03)),
         max_neighbors=int(get_cfg(cfg, "contact.max_neighbors", 32)),
+        prescribed_mask=trajectory.static.prescribed_mask,
+        surface_mask=trajectory.static.contact_surface_mask,
     )
 
 
@@ -447,10 +485,22 @@ def chp_step_loss(
     stress_loss, stress_parts = robust_stress_loss(
         transformed_prediction,
         transformed_target,
+        ranking_target=stress_target,
         peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
         peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
         delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
     )
+    physical_scale = normalizers.stress.reference_scale.to(
+        stress_prediction.device, stress_prediction.dtype
+    ).clamp_min(1.0e-8)
+    stress_physical = F.huber_loss(
+        (stress_prediction - stress_target) / physical_scale,
+        torch.zeros_like(stress_prediction),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    stress_loss = stress_loss + float(
+        get_cfg(cfg, "loss.stress_physical_weight", 0.25)
+    ) * stress_physical
 
     diagnostics = output.energy_diagnostics
     work_scale = (
@@ -486,6 +536,7 @@ def chp_step_loss(
         "stress": stress_loss.detach(),
         "stress_base": stress_parts["stress_base"],
         "stress_peak": stress_parts["stress_peak"],
+        "stress_physical": stress_physical.detach(),
         "work_energy": work_loss.detach(),
         "penetration": penetration_loss.detach(),
         "residual": residual_loss.detach(),
@@ -529,6 +580,350 @@ def load_native_reference(cfg: dict[str, Any]) -> dict[str, float] | None:
     return {key: float(inline[key]) for key in ROLLOUT_METRIC_KEYS}
 
 
+def _constitutive_parameters(model: CHPGNS) -> list[torch.nn.Parameter]:
+    parameters: list[torch.nn.Parameter] = [
+        model.log_stress_scale,
+        *model.potential.parameters(),
+    ]
+    if model.material_scale is not None:
+        parameters.extend(model.material_scale.parameters())
+    return parameters
+
+
+@torch.no_grad()
+def calibrate_constitutive_modulus(
+    model: CHPGNS,
+    cases: list[ValveCase],
+    cache: CHPCaseCache,
+    cfg: dict[str, Any],
+) -> dict[str, float]:
+    """Fit the train-only physical modulus by a closed-form least-squares step."""
+
+    model.eval()
+    case_count = min(
+        int(get_cfg(cfg, "constitutive_pretraining.calibration_cases", 32)),
+        len(cases),
+    )
+    frames_per_case = max(
+        int(get_cfg(cfg, "constitutive_pretraining.calibration_frames", 8)), 1
+    )
+    case_indices = np.linspace(0, len(cases) - 1, case_count).round().astype(int)
+    prediction_square = torch.zeros((), device=cache.device)
+    prediction_target = torch.zeros((), device=cache.device)
+    target_square = torch.zeros((), device=cache.device)
+    frame_moments: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    admissible_frames = 0
+    requested_frames = 0
+    for case_index_value in tqdm(
+        case_indices, desc="constitutive-scale", leave=False
+    ):
+        case_index = int(case_index_value)
+        case = cases[case_index]
+        trajectory = cache.get(case_index)
+        frames = np.linspace(
+            1, case.num_steps - 1, min(frames_per_case, case.num_steps - 1)
+        )
+        for frame_value in np.unique(frames.round().astype(int)):
+            requested_frames += 1
+            frame = int(frame_value)
+            exact_position = (
+                trajectory.static.reference_position
+                + trajectory.displacement[frame]
+            )
+            if not is_admissible_training_state(
+                trajectory.static, exact_position, cfg
+            ):
+                continue
+            prediction, _ = model.nodal_stress_at(
+                trajectory.static, exact_position
+            )
+            mask = ~trajectory.static.prescribed_mask
+            if not bool(mask.any().item()):
+                mask = torch.ones_like(mask)
+            prediction = prediction[mask, :1].float()
+            target = trajectory.stress[frame, mask, :1].float()
+            if not bool(
+                (torch.isfinite(prediction).all() & torch.isfinite(target).all()).item()
+            ):
+                continue
+            frame_prediction_square = prediction.square().sum()
+            frame_prediction_target = (prediction * target).sum()
+            frame_target_square = target.square().sum()
+            prediction_square += frame_prediction_square
+            prediction_target += frame_prediction_target
+            target_square += frame_target_square
+            if bool(
+                (
+                    (frame_prediction_square > 1.0e-12)
+                    & (frame_prediction_target > 0.0)
+                    & (frame_target_square > 1.0e-12)
+                ).item()
+            ):
+                frame_moments.append(
+                    (
+                        frame_prediction_square,
+                        frame_prediction_target,
+                        frame_target_square,
+                    )
+                )
+            admissible_frames += 1
+    if not frame_moments:
+        raise RuntimeError("no admissible non-zero frames for constitutive calibration")
+    # A pooled least-squares factor is dominated by a handful of nearly
+    # singular cells.  The median of per-frame optima is a robust train-only
+    # modulus estimator and is stable across mesh resolutions.
+    frame_factors = torch.stack(
+        [cross / square for square, cross, _ in frame_moments]
+    )
+    factor = frame_factors.median().clamp(
+        min=float(get_cfg(cfg, "constitutive_pretraining.minimum_scale_factor", 1.0e-3)),
+        max=float(get_cfg(cfg, "constitutive_pretraining.maximum_scale_factor", 1.0e4)),
+    )
+    before_error = prediction_square - 2.0 * prediction_target + target_square
+    after_error = (
+        factor.square() * prediction_square
+        - 2.0 * factor * prediction_target
+        + target_square
+    )
+    log_factor = factor.log()
+    model.log_stress_scale.add_(log_factor)
+    if bool(
+        get_cfg(cfg, "constitutive_pretraining.preserve_force_mass_ratio", True)
+    ):
+        model.log_mass_scale.add_(log_factor)
+    frame_relative_after = torch.stack(
+        [
+            torch.sqrt(
+                (
+                    factor.square() * square
+                    - 2.0 * factor * cross
+                    + reference
+                ).clamp_min(0.0)
+                / reference.clamp_min(1.0e-12)
+            )
+            for square, cross, reference in frame_moments
+        ]
+    )
+    return {
+        "scale_factor": float(factor.item()),
+        "physical_modulus": float(model.log_stress_scale.exp().item()),
+        "mass_scale": float(model.log_mass_scale.exp().item()),
+        "relative_rmse_before": float(
+            torch.sqrt(before_error.clamp_min(0.0) / target_square.clamp_min(1.0e-12)).item()
+        ),
+        "relative_rmse_after": float(
+            torch.sqrt(after_error.clamp_min(0.0) / target_square.clamp_min(1.0e-12)).item()
+        ),
+        "median_frame_relative_rmse_after": float(
+            frame_relative_after.median().item()
+        ),
+        "frame_scale_q05": float(torch.quantile(frame_factors, 0.05).item()),
+        "frame_scale_median": float(frame_factors.median().item()),
+        "frame_scale_q95": float(torch.quantile(frame_factors, 0.95).item()),
+        "admissible_frames": float(admissible_frames),
+        "requested_frames": float(requested_frames),
+        "admissible_coverage": float(admissible_frames / max(requested_frames, 1)),
+    }
+
+
+def _exact_constitutive_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    transformed_prediction = normalizers.stress.transform(prediction)
+    transformed_target = normalizers.stress.transform(target)
+    transformed, parts = robust_stress_loss(
+        transformed_prediction,
+        transformed_target,
+        ranking_target=target,
+        peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
+        peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    scale = normalizers.stress.reference_scale.to(
+        prediction.device, prediction.dtype
+    ).clamp_min(1.0e-8)
+    physical = F.huber_loss(
+        (prediction - target) / scale,
+        torch.zeros_like(prediction),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    total = transformed + float(
+        get_cfg(cfg, "loss.stress_physical_weight", 0.25)
+    ) * physical
+    return total, {
+        "loss": total.detach(),
+        "stress_transformed": transformed.detach(),
+        "stress_physical": physical.detach(),
+        "stress_peak": parts["stress_peak"],
+    }
+
+
+def train_constitutive_epoch(
+    model: CHPGNS,
+    cases: list[ValveCase],
+    cache: CHPCaseCache,
+    normalizers: CHPNormalizers,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+    *,
+    epoch: int,
+) -> dict[str, float]:
+    """Train only the shared potential on exact, admissible geometries."""
+
+    model.train()
+    rng = np.random.default_rng(int(cfg.get("seed", 42)) + 7919 * int(epoch))
+    case_count = min(
+        int(get_cfg(cfg, "constitutive_pretraining.cases_per_epoch", 128)),
+        len(cases),
+    )
+    frames_per_case = max(
+        int(get_cfg(cfg, "constitutive_pretraining.frames_per_case", 8)), 1
+    )
+    case_indices = rng.choice(len(cases), size=case_count, replace=False)
+    parameters = _constitutive_parameters(model)
+    totals: dict[str, float] = {}
+    used_frames = 0
+    skipped_frames = 0
+    for case_index_value in tqdm(
+        case_indices, desc="constitutive-pretrain", leave=False
+    ):
+        case_index = int(case_index_value)
+        case = cases[case_index]
+        trajectory = cache.get(case_index)
+        frame_candidates = rng.permutation(np.arange(1, case.num_steps))
+        losses: list[torch.Tensor] = []
+        optimizer.zero_grad(set_to_none=True)
+        for frame_value in frame_candidates:
+            frame = int(frame_value)
+            exact_position = (
+                trajectory.static.reference_position
+                + trajectory.displacement[frame]
+            )
+            if not is_admissible_training_state(
+                trajectory.static, exact_position, cfg
+            ):
+                skipped_frames += 1
+                continue
+            prediction, _ = model.nodal_stress_at(
+                trajectory.static, exact_position
+            )
+            mask = ~trajectory.static.prescribed_mask
+            if not bool(mask.any().item()):
+                mask = torch.ones_like(mask)
+            loss, metrics = _exact_constitutive_loss(
+                prediction[mask, :1],
+                trajectory.stress[frame, mask, :1],
+                normalizers,
+                cfg,
+            )
+            if not bool(torch.isfinite(loss).item()):
+                skipped_frames += 1
+                continue
+            losses.append(loss)
+            _accumulate(totals, metrics)
+            used_frames += 1
+            if len(losses) >= frames_per_case:
+                break
+        if not losses:
+            continue
+        torch.stack(losses).mean().backward()
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            parameters,
+            float(get_cfg(cfg, "constitutive_pretraining.grad_clip_norm", 10.0)),
+        )
+        if not bool(torch.isfinite(gradient_norm).item()):
+            raise FloatingPointError("non-finite constitutive pretraining gradient")
+        optimizer.step()
+    averaged = {key: value / max(used_frames, 1) for key, value in totals.items()}
+    averaged.update(
+        {
+            "used_frames": float(used_frames),
+            "skipped_frames": float(skipped_frames),
+            "physical_modulus": float(model.log_stress_scale.detach().exp().item()),
+        }
+    )
+    return averaged
+
+
+def run_constitutive_pretraining(
+    model: CHPGNS,
+    train_cases: list[ValveCase],
+    val_cases: list[ValveCase] | None,
+    train_cache: CHPCaseCache,
+    val_cache: CHPCaseCache | None,
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+    output_dir: Path,
+    *,
+    amp_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Calibrate and pretrain the potential before coupled rollouts."""
+
+    if not bool(get_cfg(cfg, "constitutive_pretraining.enabled", True)):
+        return {"enabled": False}
+    history: dict[str, Any] = {
+        "enabled": True,
+        "calibration": calibrate_constitutive_modulus(
+            model, train_cases, train_cache, cfg
+        ),
+        "epochs": [],
+    }
+    initial_validation = (
+        evaluate_teacher_forced_stress(
+            model, val_cases, val_cache, cfg, amp_dtype=amp_dtype
+        )
+        if val_cases is not None and val_cache is not None
+        else {}
+    )
+    history["initial_validation"] = initial_validation
+    best_metric = float(
+        initial_validation.get("teacher_stress_relative_rmse", float("inf"))
+    )
+    best_state = {
+        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+    }
+    optimizer = torch.optim.Adam(
+        _constitutive_parameters(model),
+        lr=float(get_cfg(cfg, "constitutive_pretraining.lr", 1.0e-3)),
+        weight_decay=0.0,
+    )
+    epochs = max(int(get_cfg(cfg, "constitutive_pretraining.epochs", 2)), 0)
+    for epoch in range(1, epochs + 1):
+        train_metrics = train_constitutive_epoch(
+            model,
+            train_cases,
+            train_cache,
+            normalizers,
+            optimizer,
+            cfg,
+            epoch=epoch,
+        )
+        validation = (
+            evaluate_teacher_forced_stress(
+                model, val_cases, val_cache, cfg, amp_dtype=amp_dtype
+            )
+            if val_cases is not None and val_cache is not None
+            else {}
+        )
+        metric = float(validation.get("teacher_stress_relative_rmse", float("inf")))
+        if metric < best_metric:
+            best_metric = metric
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        history["epochs"].append(
+            {"epoch": epoch, "train": train_metrics, "validation": validation}
+        )
+    model.load_state_dict(best_state)
+    history["selected_teacher_stress_relative_rmse"] = best_metric
+    _save_json(output_dir / "constitutive_pretraining.json", history)
+    return history
+
+
 def run_chp_training(cfg: dict[str, Any]) -> Path:
     """Train CHP-GNS using BF16 neural blocks and FP32 mechanics on CUDA."""
 
@@ -562,13 +957,39 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
     )
 
     model = CHPGNS(cfg, material_dim=material_dim).to(device)
+    base_lr = float(get_cfg(cfg, "training.lr", 1.0e-4))
+    weight_decay = float(get_cfg(cfg, "training.weight_decay", 1.0e-6))
+    constitutive_parameters = _constitutive_parameters(model)
+    constitutive_ids = {id(parameter) for parameter in constitutive_parameters}
+    network_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if id(parameter) not in constitutive_ids
+    ]
     optimizer_kwargs: dict[str, Any] = {
-        "lr": float(get_cfg(cfg, "training.lr", 1.0e-4)),
-        "weight_decay": float(get_cfg(cfg, "training.weight_decay", 1.0e-6)),
+        "lr": base_lr,
+        "weight_decay": weight_decay,
     }
     if bool(get_cfg(cfg, "training.fused_optimizer", True)):
         optimizer_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": network_parameters,
+                "lr": base_lr,
+                "weight_decay": weight_decay,
+                "name": "network",
+            },
+            {
+                "params": constitutive_parameters,
+                "lr": base_lr
+                * float(get_cfg(cfg, "training.constitutive_lr_scale", 0.1)),
+                "weight_decay": 0.0,
+                "name": "constitutive",
+            },
+        ],
+        **optimizer_kwargs,
+    )
     stages = get_cfg(cfg, "training.curriculum", None)
     epochs = int(get_cfg(cfg, "training.epochs", 16))
     train_count = _limited_count(
@@ -612,6 +1033,25 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
     start_epoch = 1
     history = _load_json(output_dir / "history.json", default=[])
     resume = _resolve_resume(cfg, output_dir)
+    if resume is None:
+        pretraining = run_constitutive_pretraining(
+            model,
+            train_dataset.cases,
+            val_dataset.cases if val_dataset is not None else None,
+            train_cache,
+            val_cache,
+            normalizers,
+            cfg,
+            output_dir,
+            amp_dtype=amp_dtype,
+        )
+        if pretraining.get("enabled"):
+            selected = float(
+                pretraining.get(
+                    "selected_teacher_stress_relative_rmse", float("inf")
+                )
+            )
+            print(f"constitutive pretraining selected teacher rRMSE={selected:.4g}")
     if resume is not None:
         checkpoint = _torch_load(resume, device)
         if int(checkpoint.get("schema_version", 0)) != CHPGNS.checkpoint_schema_version:
@@ -779,10 +1219,7 @@ def train_chp_epoch(
         maximum_resamples = int(get_cfg(cfg, "training.maximum_start_resamples", 16))
         while True:
             trajectory = cache.get_slice(case_index, start, start + horizon + 1)
-            position = trajectory.static.reference_position + trajectory.displacement[0]
-            if is_admissible_training_state(
-                trajectory.static, position, cfg
-            ):
+            if is_admissible_training_window(trajectory, cfg):
                 break
             resamples += 1
             if resamples > maximum_resamples:
@@ -796,6 +1233,7 @@ def train_chp_epoch(
         totals["start_resamples"] = totals.get("start_resamples", 0.0) + (
             float(resamples) * horizon
         )
+        position = trajectory.static.reference_position + trajectory.displacement[0]
         velocity = trajectory.velocity[0]
         moving = ~(trajectory.static.fixed_mask | trajectory.static.prescribed_mask)
         noise, noise_scale = geometry_safe_state_noise(
@@ -841,6 +1279,29 @@ def train_chp_epoch(
                     step_loss, metrics = chp_step_loss(
                         output, trajectory, step + 1, normalizers, cfg
                     )
+                    exact_position = (
+                        trajectory.static.reference_position
+                        + trajectory.displacement[step + 1]
+                    )
+                    exact_stress, _ = model.nodal_stress_at(
+                        trajectory.static, exact_position
+                    )
+                    exact_mask = ~trajectory.static.prescribed_mask
+                    if not bool(exact_mask.any().item()):
+                        exact_mask = torch.ones_like(exact_mask)
+                    exact_constitutive, exact_metrics = _exact_constitutive_loss(
+                        exact_stress[exact_mask, :1],
+                        trajectory.stress[step + 1, exact_mask, :1],
+                        normalizers,
+                        cfg,
+                    )
+                    step_loss = step_loss + float(
+                        get_cfg(cfg, "loss.exact_constitutive", 0.5)
+                    ) * exact_constitutive
+                    metrics["exact_constitutive"] = exact_metrics["loss"]
+                    metrics["exact_stress_physical"] = exact_metrics[
+                        "stress_physical"
+                    ]
                 if not bool(torch.isfinite(step_loss).item()):
                     raise FloatingPointError(
                         f"non-finite CHP loss for {case.case_id} at frame {start + offset}"
@@ -899,17 +1360,20 @@ def evaluate_chp_rollouts(
     pressure_sign = float(get_cfg(cfg, "data.pressure_sign", 1.0))
     device = cache.device
     accum = {
-        "u_error": torch.zeros((), device=device),
-        "u_reference": torch.zeros((), device=device),
-        "final_error": torch.zeros((), device=device),
-        "final_reference": torch.zeros((), device=device),
-        "stress_error": torch.zeros((), device=device),
-        "stress_reference": torch.zeros((), device=device),
-        "p95_error": torch.zeros((), device=device),
-        "p95_reference": torch.zeros((), device=device),
-        "penetration": torch.zeros((), device=device),
-        "momentum": torch.zeros((), device=device),
-        "energy": torch.zeros((), device=device),
+        key: torch.zeros((), device=device, dtype=torch.float64)
+        for key in (
+            "u_error",
+            "u_reference",
+            "final_error",
+            "final_reference",
+            "stress_error",
+            "stress_reference",
+            "p95_error",
+            "p95_reference",
+            "penetration",
+            "momentum",
+            "energy",
+        )
     }
     evaluated_steps = 0
     diverged = 0
@@ -950,8 +1414,37 @@ def evaluate_chp_rollouts(
                     prescribed_velocity=trajectory.velocity[step + 1],
                 )
             state = CHPState(output.next_position, output.next_velocity)
+            finite_step = (
+                torch.isfinite(state.position).all()
+                & torch.isfinite(state.velocity).all()
+                & torch.isfinite(output.nodal_stress).all()
+                & torch.isfinite(output.internal_force).all()
+                & torch.isfinite(output.contact_force).all()
+                & torch.isfinite(output.energy_diagnostics["work_energy_balance"])
+            )
+            predicted_deformation = invariants(
+                deformation_gradient(
+                    state.position,
+                    trajectory.static.cells,
+                    trajectory.static.dm_inv,
+                )
+            )
+            predicted_domain_valid = (
+                torch.isfinite(predicted_deformation.j).all()
+                & torch.isfinite(predicted_deformation.i2_bar).all()
+                & (
+                    predicted_deformation.j.min()
+                    >= float(get_cfg(cfg, "validation.minimum_predicted_j", 1.0e-4))
+                )
+                & (
+                    predicted_deformation.i2_bar.max()
+                    <= float(
+                        get_cfg(cfg, "validation.maximum_predicted_i2_bar", 1.0e6)
+                    )
+                )
+            )
             if (
-                not bool(torch.isfinite(state.position).all().item())
+                not bool((finite_step & predicted_domain_valid).item())
                 or float(state.position.abs().max().item()) > divergence_limit
             ):
                 case_diverged = True
@@ -976,33 +1469,39 @@ def evaluate_chp_rollouts(
             )
             u_error = state.position[moving] - exact_position[moving]
             u_reference = trajectory.displacement[step + 1, moving]
-            accum["u_error"] += u_error.square().sum()
-            accum["u_reference"] += u_reference.square().sum()
+            accum["u_error"] += u_error.double().square().sum()
+            accum["u_reference"] += u_reference.double().square().sum()
             stress_mask = ~trajectory.static.prescribed_mask
             if not bool(stress_mask.any().item()):
                 stress_mask = torch.ones_like(trajectory.static.prescribed_mask)
             target_stress = trajectory.stress[step + 1, stress_mask, :1]
             stress_error = output.nodal_stress[stress_mask, :1] - target_stress
-            accum["stress_error"] += stress_error.square().sum()
-            accum["stress_reference"] += target_stress.square().sum()
+            accum["stress_error"] += stress_error.double().square().sum()
+            accum["stress_reference"] += target_stress.double().square().sum()
             threshold = torch.quantile(target_stress.abs().reshape(-1), 0.95)
             peak = target_stress.abs() >= threshold
-            accum["p95_error"] += stress_error[peak].square().sum()
-            accum["p95_reference"] += target_stress[peak].square().sum()
-            accum["penetration"] += output.energy_diagnostics["max_penetration"]
+            accum["p95_error"] += stress_error[peak].double().square().sum()
+            accum["p95_reference"] += target_stress[peak].double().square().sum()
+            accum["penetration"] += output.energy_diagnostics[
+                "max_penetration"
+            ].double()
             resultant = output.internal_force + output.contact_force
-            accum["momentum"] += torch.linalg.vector_norm(resultant.sum(0))
-            accum["energy"] += output.energy_diagnostics["work_energy_balance"].abs()
+            accum["momentum"] += torch.linalg.vector_norm(
+                resultant.double().sum(0)
+            )
+            accum["energy"] += output.energy_diagnostics[
+                "work_energy_balance"
+            ].double().abs()
             evaluated_steps += 1
         exact_final = (
             trajectory.static.reference_position
             + trajectory.displacement[min(steps, case.num_steps - 1)]
         )
         final_error = state.position[moving] - exact_final[moving]
-        accum["final_error"] += final_error.square().sum()
+        accum["final_error"] += final_error.double().square().sum()
         accum["final_reference"] += trajectory.displacement[
             min(steps, case.num_steps - 1), moving
-        ].square().sum()
+        ].double().square().sum()
         diverged += int(case_diverged)
     eps = torch.tensor(1.0e-12, device=device)
     result = {
@@ -1033,7 +1532,10 @@ def evaluate_chp_rollouts(
     if diverged:
         divergence_floor = 1.0e6 * diverged / max(count, 1)
         for key in ROLLOUT_METRIC_KEYS:
-            result[key] = max(float(result[key]), divergence_floor)
+            value = float(result[key])
+            result[key] = (
+                max(value, divergence_floor) if math.isfinite(value) else divergence_floor
+            )
     return result
 
 
@@ -1058,6 +1560,11 @@ def evaluate_teacher_forced_stress(
     reference = torch.zeros((), device=cache.device)
     peak_error = torch.zeros((), device=cache.device)
     peak_reference = torch.zeros((), device=cache.device)
+    requested_frames = 0
+    admissible_frames = 0
+    inverted_frames = 0
+    near_singular_frames = 0
+    extreme_i2_frames = 0
     for case_index_value in tqdm(
         case_indices, desc="teacher-stress", leave=False
     ):
@@ -1067,9 +1574,26 @@ def evaluate_teacher_forced_stress(
         frames = np.linspace(1, case.num_steps - 1, min(frame_count, case.num_steps - 1))
         for frame_value in np.unique(frames.round().astype(int)):
             frame = int(frame_value)
+            requested_frames += 1
             exact_position = (
                 trajectory.static.reference_position + trajectory.displacement[frame]
             )
+            admissible, minimum_j, maximum_i2 = training_state_admissibility(
+                trajectory.static, exact_position, cfg
+            )
+            if not admissible:
+                if minimum_j <= 0.0:
+                    inverted_frames += 1
+                elif minimum_j < float(
+                    get_cfg(cfg, "training.minimum_start_j", 1.0e-2)
+                ):
+                    near_singular_frames += 1
+                if minimum_j > 0.0 and maximum_i2 > float(
+                    get_cfg(cfg, "training.maximum_start_i2_bar", 1.0e5)
+                ):
+                    extreme_i2_frames += 1
+                continue
+            admissible_frames += 1
             with _autocast(cache.device, amp_dtype):
                 prediction, _ = model.nodal_stress_at(
                     trajectory.static, exact_position
@@ -1086,13 +1610,27 @@ def evaluate_teacher_forced_stress(
             peak_error += residual[peak].square().sum()
             peak_reference += target[peak].square().sum()
     eps = torch.tensor(1.0e-12, device=cache.device)
+    relative = (
+        torch.sqrt(error / reference.clamp_min(eps))
+        if admissible_frames and bool((reference > eps).item())
+        else error.new_tensor(float("inf"))
+    )
+    peak_relative = (
+        torch.sqrt(peak_error / peak_reference.clamp_min(eps))
+        if admissible_frames and bool((peak_reference > eps).item())
+        else error.new_tensor(float("inf"))
+    )
     return {
-        "teacher_stress_relative_rmse": float(
-            torch.sqrt(error / reference.clamp_min(eps)).item()
+        "teacher_stress_relative_rmse": float(relative.item()),
+        "teacher_stress_p95_relative_rmse": float(peak_relative.item()),
+        "teacher_stress_admissible_coverage": float(
+            admissible_frames / max(requested_frames, 1)
         ),
-        "teacher_stress_p95_relative_rmse": float(
-            torch.sqrt(peak_error / peak_reference.clamp_min(eps)).item()
-        ),
+        "teacher_stress_requested_frames": float(requested_frames),
+        "teacher_stress_admissible_frames": float(admissible_frames),
+        "teacher_stress_inverted_frames": float(inverted_frames),
+        "teacher_stress_near_singular_frames": float(near_singular_frames),
+        "teacher_stress_extreme_i2_frames": float(extreme_i2_frames),
     }
 
 

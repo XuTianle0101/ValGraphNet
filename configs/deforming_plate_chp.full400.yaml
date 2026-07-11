@@ -16,6 +16,9 @@ model:
   vector_dim: 16
   cell_dim: 64
   potential_order: 2
+  # The first I1-bar coefficient defines shape only; log_stress_scale is the
+  # identifiable physical modulus used by both stress and internal force.
+  normalize_potential_scale: true
   # High-order invariant powers need scale-aware positive initialization:
   # full-400 trajectories contain valid compressed cells with I2_bar > 600.
   potential_i1_init: [0.5, 1.0e-6]
@@ -46,6 +49,8 @@ loss:
   position: 1.0
   velocity: 1.0
   stress: 1.0
+  stress_physical_weight: 0.25
+  exact_constitutive: 0.5
   work_energy: 0.1
   penetration: 1.0
   residual: 0.01
@@ -53,6 +58,19 @@ loss:
   huber_delta: 1.0
   peak_fraction: 0.1
   peak_weight: 0.5
+
+constitutive_pretraining:
+  enabled: true
+  calibration_cases: 32
+  calibration_frames: 8
+  minimum_scale_factor: 1.0e-3
+  maximum_scale_factor: 1.0e4
+  preserve_force_mass_ratio: true
+  epochs: 2
+  cases_per_epoch: 128
+  frames_per_case: 8
+  lr: 1.0e-3
+  grad_clip_norm: 10.0
 
 training:
   device: cuda
@@ -77,6 +95,7 @@ training:
   maximum_start_resamples: 16
   trajectories_per_epoch: 1000
   lr: 1.0e-4
+  constitutive_lr_scale: 0.1
   weight_decay: 1.0e-6
   warmup_steps: 500
   grad_clip_norm: 1.0
@@ -98,4 +117,6 @@ validation:
   enforce_teacher_stress_gate: true
   gpu_case_cache_size: 2
   divergence_position: 10.0
+  minimum_predicted_j: 1.0e-4
+  maximum_predicted_i2_bar: 1.0e6
   native_reference_file: outputs/deforming_plate_chp_evidence/native/metrics.json

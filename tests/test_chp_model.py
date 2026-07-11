@@ -7,6 +7,8 @@ from valgraphnet.chp_model import (
     CHPState,
     PairForceHeads,
     build_chp_static,
+    radius_contact_pairs,
+    tetra_surface_node_mask,
     unique_undirected_pairs,
 )
 from valgraphnet.data.case import ValveCase
@@ -87,10 +89,39 @@ def test_pair_force_scatter_has_exact_zero_resultant():
     torch.testing.assert_close(assembled.sum(0), torch.zeros(3), atol=1.0e-6, rtol=0)
 
 
+def test_reference_contact_gap_has_zero_force_and_dissipation():
+    heads = PairForceHeads(4)
+    reference = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    scalar = torch.zeros(2, 4)
+    velocity = torch.tensor([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]])
+    pairs = torch.tensor([[0], [1]])
+    force, penetration, dissipation = heads.contact_force(
+        scalar,
+        reference,
+        velocity,
+        pairs,
+        radius=0.03,
+        reference_position=reference,
+    )
+    torch.testing.assert_close(force, torch.zeros_like(force))
+    torch.testing.assert_close(penetration, torch.zeros_like(penetration))
+    torch.testing.assert_close(dissipation, torch.zeros_like(dissipation))
+
+
 def test_unique_undirected_pairs_removes_reverse_duplicates():
     edges = torch.tensor([[0, 1, 2, 3, 2], [1, 0, 3, 2, 2]])
     pairs = unique_undirected_pairs(edges, 4)
     assert torch.equal(pairs, torch.tensor([[0, 2], [1, 3]]))
+
+
+def test_tetra_surface_mask_excludes_interior_vertex():
+    cells = torch.tensor(
+        [[4, 1, 2, 3], [0, 4, 2, 3], [0, 1, 4, 3], [0, 1, 2, 4]]
+    )
+    assert torch.equal(
+        tetra_surface_node_mask(cells, 5),
+        torch.tensor([True, True, True, True, False]),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
@@ -101,3 +132,22 @@ def test_chp_model_cuda_forward_uses_gpu():
     output = model(static, state)
     assert output.next_position.is_cuda
     assert output.cell_stress_tensor.is_cuda
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_contact_search_keeps_only_cross_body_pairs():
+    position = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.005, 0.005, 0.0], [0.006, 0.006, 0.0]],
+        device="cuda",
+    )
+    pairs = radius_contact_pairs(
+        position,
+        torch.zeros((2, 0), dtype=torch.long, device="cuda"),
+        torch.zeros(4, dtype=torch.bool, device="cuda"),
+        0.03,
+        max_neighbors=4,
+        prescribed_mask=torch.tensor([True, True, False, False], device="cuda"),
+    )
+    prescribed = torch.tensor([True, True, False, False], device="cuda")
+    assert pairs.shape[1] == 4
+    assert torch.all(prescribed[pairs[0]] ^ prescribed[pairs[1]])
