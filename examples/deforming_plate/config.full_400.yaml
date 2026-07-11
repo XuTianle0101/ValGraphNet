@@ -10,10 +10,11 @@ data:
   train_case_split: train
   val_case_split: val
   test_case_split: test
-  preprocess_output_dir: preprocessed_dataset/deforming_plate_full_400
-  # Input/target statistics were fitted on all 1,000 training trajectories in
-  # the existing 200-frame run; reuse them without reading any test labels.
-  stats_source_dir: preprocessed_dataset/deforming_plate_full_case_backed
+  preprocess_output_dir: preprocessed_dataset/deforming_plate_full_400_sampled_stats
+  # Fit normalization on evenly spaced full-400 train-only frames. Reusing the
+  # old 200-frame statistics underestimates late displacement/stress scales.
+  stats_num_cases: 128
+  stats_steps_per_case: 8
   train_split: train
   val_split: valid
   test_split: test
@@ -51,7 +52,7 @@ training:
   lr_decay_rate: 0.9999917
   weight_decay: 0.0
   num_workers: 0
-  output_dir: outputs/deforming_plate_full_400
+  output_dir: outputs/deforming_plate_full_400_sampled_stats
   save_every: 1
   save_latest: true
   resume_from: auto
@@ -60,7 +61,7 @@ training:
   amp_dtype: bfloat16
 
 rollout:
-  output_dir: outputs/deforming_plate_full_400/rollout_eval
+  output_dir: outputs/deforming_plate_full_400_sampled_stats/rollout_eval
   frame_skip: 20
   make_gif: false
   gif_name: animation.gif

@@ -2,7 +2,7 @@ import json
 
 import torch
 
-from examples.deforming_plate.dataset import radius_world_edges
+from examples.deforming_plate.dataset import evenly_spaced_steps, radius_world_edges
 from examples.deforming_plate.preprocess import preprocess_cache_is_compatible
 
 
@@ -42,6 +42,19 @@ def test_radius_world_edges_neighbor_limit_is_deterministic():
     second = radius_world_edges(world_pos, 2.0, mesh_edge_index, max_neighbors=4)
 
     assert torch.equal(first, second)
+
+
+def test_full_trajectory_stats_sampling_covers_early_and_late_frames():
+    assert evenly_spaced_steps(399, 8).tolist() == [
+        0,
+        57,
+        114,
+        171,
+        227,
+        284,
+        341,
+        398,
+    ]
 
 
 def test_preprocess_cache_rejects_stale_graph_settings(tmp_path):

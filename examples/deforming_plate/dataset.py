@@ -354,11 +354,24 @@ def rollout_masks(node_type: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, 
     return moving, obj, clamped
 
 
+def evenly_spaced_steps(num_steps: int, count: int) -> np.ndarray:
+    """Return deterministic endpoints-inclusive frame indices for train-only stats."""
+
+    if num_steps <= 0 or count <= 0:
+        raise ValueError("num_steps and count must be positive")
+    return np.linspace(
+        0,
+        num_steps - 1,
+        num=min(int(count), int(num_steps)),
+    ).round().astype(np.int64)
+
+
 def fit_stats(
     sequences: list[DeformingPlateSequence],
     world_edge_radius: float,
     max_world_neighbors: int | None = None,
     max_steps: int | None = None,
+    sample_steps_per_sequence: int | None = None,
     eps: float = 1.0e-8,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Fit edge and target normalization stats from raw sequences."""
@@ -372,10 +385,17 @@ def fit_stats(
             if max_steps is None
             else min(sequence.num_steps - 1, int(max_steps))
         )
-        for step in range(steps):
+        if sample_steps_per_sequence is None or sample_steps_per_sequence >= steps:
+            selected_steps = range(steps)
+        else:
+            selected_steps = evenly_spaced_steps(
+                steps,
+                int(sample_steps_per_sequence),
+            )
+        for step in selected_steps:
             sample = make_graph_sample(
                 sequence,
-                step,
+                int(step),
                 edge_stats=None,
                 node_stats=None,
                 world_edge_radius=world_edge_radius,

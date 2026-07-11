@@ -386,6 +386,14 @@ def _fit_case_backed_stats(
     case_root = Path(get_cfg(cfg, "data.case_dir"))
     split_file = Path(get_cfg(cfg, "data.case_split_file", case_root / "splits.json"))
     train_ids = read_split_file(split_file, str(get_cfg(cfg, "data.train_case_split", "train")))
+    requested_cases = int(get_cfg(cfg, "data.stats_num_cases", len(train_ids)))
+    if requested_cases < len(train_ids):
+        indices = np.linspace(
+            0,
+            len(train_ids) - 1,
+            num=max(requested_cases, 1),
+        ).round().astype(np.int64)
+        train_ids = [train_ids[int(index)] for index in indices]
     sequences = (
         _load_case_sequence(str(case_root / case_id))
         for case_id in tqdm(train_ids, desc="load case-backed stats")
@@ -394,6 +402,7 @@ def _fit_case_backed_stats(
         sequences,
         world_edge_radius=float(get_cfg(cfg, "graph.world_edge_radius", 0.03)),
         max_world_neighbors=get_cfg(cfg, "graph.max_world_neighbors", None),
+        sample_steps_per_sequence=get_cfg(cfg, "data.stats_steps_per_case", None),
     )
 
 
