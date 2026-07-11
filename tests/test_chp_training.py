@@ -8,6 +8,7 @@ import torch
 from valgraphnet.chp_model import CHPGNS, CHPState
 from valgraphnet.chp_train import (
     ROLLOUT_METRIC_KEYS,
+    acceleration_frame_scores,
     curriculum_horizon,
     fit_chp_normalizers,
     integration_consistent_targets,
@@ -122,4 +123,51 @@ def test_normalizers_are_finite_invertible_and_do_not_clip_stress():
     torch.testing.assert_close(recovered, values, rtol=1.0e-5, atol=1.0e-3)
     assert torch.isfinite(normalizers.displacement_scale).all()
     assert torch.isfinite(normalizers.velocity_scale).all()
+    assert torch.isfinite(normalizers.acceleration_scale).all()
+    torch.testing.assert_close(
+        normalizers.acceleration_scale,
+        torch.tensor(1.0e-8),
+    )
     assert stress_frame_scores(case).shape == (5,)
+
+
+def test_acceleration_normalizer_uses_free_nodes_and_nonunit_dt():
+    velocity = np.zeros((3, 3, 3), dtype=np.float32)
+    velocity[1, 0] = np.asarray([2.0, 4.0, 6.0])
+    velocity[2, 0] = np.asarray([14.0, 20.0, 26.0])
+    velocity[:, 1:] = 100.0
+    case = SimpleNamespace(
+        num_steps=3,
+        num_nodes=3,
+        stress_dim=1,
+        times=np.asarray([0.0, 2.0, 6.0], dtype=np.float32),
+        displacement=np.zeros_like(velocity),
+        velocity=velocity,
+        stress=np.ones((3, 3, 1), dtype=np.float32),
+        fixed_mask=np.asarray([False, True, False]),
+        prescribed_mask=np.asarray([False, False, True]),
+    )
+    normalizers = fit_chp_normalizers(
+        [case], max_cases=1, frames_per_case=2, nodes_per_frame=3
+    )
+    torch.testing.assert_close(
+        normalizers.acceleration_scale,
+        torch.sqrt(torch.tensor(64.0 / 6.0)),
+    )
+    np.testing.assert_allclose(
+        acceleration_frame_scores(case),
+        np.asarray(
+            [np.sqrt(14.0 / 3.0), np.sqrt(50.0 / 3.0), 0.0],
+            dtype=np.float32,
+        ),
+        rtol=1.0e-6,
+    )
+
+    state = normalizers.state_dict()
+    restored = type(normalizers).from_state_dict(state)
+    torch.testing.assert_close(
+        restored.acceleration_scale, normalizers.acceleration_scale
+    )
+    state.pop("acceleration_scale")
+    legacy = type(normalizers).from_state_dict(state)
+    torch.testing.assert_close(legacy.acceleration_scale, legacy.velocity_scale)

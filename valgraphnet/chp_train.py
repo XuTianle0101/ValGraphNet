@@ -48,27 +48,38 @@ class CHPNormalizers:
     displacement_scale: torch.Tensor
     velocity_scale: torch.Tensor
     stress: AsinhStressTransform
+    acceleration_scale: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.acceleration_scale is None:
+            self.acceleration_scale = self.velocity_scale.detach().clone()
 
     def to(self, device: torch.device | str) -> "CHPNormalizers":
         return CHPNormalizers(
-            self.displacement_scale.to(device),
-            self.velocity_scale.to(device),
-            self.stress.to(device),
+            displacement_scale=self.displacement_scale.to(device),
+            velocity_scale=self.velocity_scale.to(device),
+            stress=self.stress.to(device),
+            acceleration_scale=self.acceleration_scale.to(device),
         )
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "displacement_scale": self.displacement_scale.cpu(),
             "velocity_scale": self.velocity_scale.cpu(),
+            "acceleration_scale": self.acceleration_scale.cpu(),
             "stress": self.stress.state_dict(),
         }
 
     @classmethod
     def from_state_dict(cls, state: dict[str, Any]) -> "CHPNormalizers":
+        velocity_scale = state["velocity_scale"].float()
         return cls(
             displacement_scale=state["displacement_scale"].float(),
-            velocity_scale=state["velocity_scale"].float(),
+            velocity_scale=velocity_scale,
             stress=AsinhStressTransform.from_state_dict(state["stress"]),
+            acceleration_scale=state.get(
+                "acceleration_scale", velocity_scale
+            ).float(),
         )
 
 
@@ -235,6 +246,7 @@ def fit_chp_normalizers(
     case_indices = np.linspace(0, len(cases) - 1, case_count).round().astype(int)
     delta_samples: list[torch.Tensor] = []
     velocity_samples: list[torch.Tensor] = []
+    acceleration_samples: list[torch.Tensor] = []
     stress_samples: list[torch.Tensor] = []
     for case_index in case_indices:
         case = cases[int(case_index)]
@@ -242,12 +254,56 @@ def fit_chp_normalizers(
         frames = np.linspace(0, case.num_steps - 2, frame_count).round().astype(int)
         node_count = min(max(int(nodes_per_frame), 1), case.num_nodes)
         nodes = np.linspace(0, case.num_nodes - 1, node_count).round().astype(int)
+        moving = ~(
+            np.asarray(
+                getattr(case, "fixed_mask", np.zeros(case.num_nodes, dtype=bool)),
+                dtype=bool,
+            )
+            | np.asarray(
+                getattr(
+                    case,
+                    "prescribed_mask",
+                    np.zeros(case.num_nodes, dtype=bool),
+                ),
+                dtype=bool,
+            )
+        )
+        free_nodes = np.flatnonzero(moving)
+        acceleration_node_count = min(node_count, free_nodes.size)
+        acceleration_nodes = (
+            free_nodes[
+                np.linspace(0, free_nodes.size - 1, acceleration_node_count)
+                .round()
+                .astype(int)
+            ]
+            if acceleration_node_count
+            else np.empty(0, dtype=np.int64)
+        )
         for frame in frames:
             delta = case.displacement[frame + 1, nodes] - case.displacement[frame, nodes]
             delta_samples.append(torch.from_numpy(np.array(delta, copy=True)).float())
             velocity_samples.append(
                 torch.from_numpy(np.array(case.velocity[frame + 1, nodes], copy=True)).float()
             )
+            if acceleration_nodes.size:
+                if hasattr(case, "times"):
+                    dt = float(case.times[frame + 1] - case.times[frame])
+                else:
+                    dt = 1.0
+                if not math.isfinite(dt) or dt <= 0.0:
+                    raise ValueError("trajectory times must be finite and increasing")
+                acceleration_samples.append(
+                    torch.from_numpy(
+                        np.array(
+                            (
+                                case.velocity[frame + 1, acceleration_nodes]
+                                - case.velocity[frame, acceleration_nodes]
+                            )
+                            / dt,
+                            copy=True,
+                        )
+                    ).float()
+                )
             if case.stress_dim:
                 stress_samples.append(
                     torch.from_numpy(
@@ -256,12 +312,22 @@ def fit_chp_normalizers(
                 )
     if not stress_samples:
         raise ValueError("CHP-GNS requires at least one nodal stress label channel")
+    if not acceleration_samples:
+        raise ValueError("CHP-GNS requires at least one moving acceleration sample")
     delta_values = torch.cat(delta_samples, dim=0)
     velocity_values = torch.cat(velocity_samples, dim=0)
+    acceleration_values = torch.cat(acceleration_samples, dim=0)
     displacement_scale = delta_values.square().mean(0).sqrt().clamp_min(1.0e-6)
     velocity_scale = velocity_values.square().mean(0).sqrt().clamp_min(1.0e-6)
+    # A scalar scale preserves rotational invariance of the acceleration loss.
+    acceleration_scale = acceleration_values.square().mean().sqrt().clamp_min(1.0e-8)
     stress = AsinhStressTransform.fit(stress_samples)
-    return CHPNormalizers(displacement_scale, velocity_scale, stress)
+    return CHPNormalizers(
+        displacement_scale=displacement_scale,
+        velocity_scale=velocity_scale,
+        stress=stress,
+        acceleration_scale=acceleration_scale,
+    )
 
 
 def stress_frame_scores(case: ValveCase) -> np.ndarray:
@@ -277,6 +343,51 @@ def stress_frame_scores(case: ValveCase) -> np.ndarray:
         stress_mask = np.ones(case.num_nodes, dtype=bool)
     stress = np.asarray(case.stress[:, stress_mask, :1], dtype=np.float64)
     return np.sqrt(np.mean(np.square(stress), axis=(1, 2))).astype(np.float32)
+
+
+def acceleration_frame_scores(case: ValveCase) -> np.ndarray:
+    """Free-node finite-difference acceleration RMS for active-frame sampling."""
+
+    moving = ~(
+        np.asarray(case.fixed_mask, dtype=bool)
+        | np.asarray(case.prescribed_mask, dtype=bool)
+    )
+    scores = np.zeros(case.num_steps, dtype=np.float32)
+    if not moving.any() or case.num_steps < 2:
+        return scores
+    dt = np.diff(np.asarray(case.times, dtype=np.float64))
+    if not np.isfinite(dt).all() or np.any(dt <= 0.0):
+        raise ValueError("trajectory times must be finite and increasing")
+    acceleration = np.diff(
+        np.asarray(case.velocity[:, moving], dtype=np.float64), axis=0
+    ) / dt[:, None, None]
+    scores[:-1] = np.sqrt(np.mean(np.square(acceleration), axis=(1, 2))).astype(
+        np.float32
+    )
+    return scores
+
+
+def build_acceleration_sampling_scores(
+    cases: list[ValveCase], cache_path: str | Path | None = None
+) -> list[np.ndarray]:
+    path = Path(cache_path) if cache_path is not None else None
+    if path is not None and path.exists():
+        try:
+            saved = torch.load(path, map_location="cpu", weights_only=False)
+            if saved.get("case_ids") == [case.case_id for case in cases]:
+                return [np.asarray(value, dtype=np.float32) for value in saved["scores"]]
+        except (OSError, RuntimeError, ValueError, TypeError):
+            pass
+    scores = [
+        acceleration_frame_scores(case)
+        for case in tqdm(cases, desc="acceleration-index")
+    ]
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"case_ids": [case.case_id for case in cases], "scores": scores}, path
+        )
+    return scores
 
 
 @torch.no_grad()
@@ -968,6 +1079,608 @@ def run_constitutive_pretraining(
     return history
 
 
+def exact_dynamics_loss(
+    output: PhysicalStep,
+    input_state: CHPState,
+    trajectory: CHPDeviceCase,
+    next_step: int,
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+    *,
+    contact_pairs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise the force-driven update on an exact, noise-free state."""
+
+    static = trajectory.static
+    exact_position = static.reference_position + trajectory.displacement[next_step]
+    dt = trajectory.times[next_step] - trajectory.times[next_step - 1]
+    target_velocity, target_acceleration = integration_consistent_targets(
+        input_state, exact_position, dt
+    )
+    moving = ~(static.fixed_mask | static.prescribed_mask)
+    if not bool(moving.any().item()):
+        raise ValueError("exact dynamics pretraining requires at least one moving node")
+    target_acceleration_moving = target_acceleration[moving]
+    global_scale = normalizers.acceleration_scale.clamp_min(1.0e-8)
+    frame_scale = torch.maximum(
+        global_scale,
+        target_acceleration_moving.square().mean().sqrt().detach(),
+    )
+    position_loss = F.huber_loss(
+        (output.next_position[moving] - exact_position[moving])
+        / (dt.abs().square() * frame_scale).clamp_min(1.0e-8),
+        torch.zeros_like(exact_position[moving]),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    velocity_loss = F.huber_loss(
+        (output.next_velocity[moving] - target_velocity[moving])
+        / (dt.abs() * frame_scale).clamp_min(1.0e-8),
+        torch.zeros_like(target_velocity[moving]),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    acceleration_element = F.huber_loss(
+        (output.acceleration[moving] - target_acceleration_moving) / frame_scale,
+        torch.zeros_like(target_acceleration_moving),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+        reduction="none",
+    )
+    acceleration_base = acceleration_element.mean()
+    target_norm = torch.linalg.vector_norm(target_acceleration_moving, dim=1)
+    peak_fraction = float(
+        get_cfg(cfg, "dynamics_pretraining.active_node_fraction", 0.2)
+    )
+    peak_count = max(int(math.ceil(target_norm.numel() * peak_fraction)), 1)
+    peak_nodes = torch.topk(target_norm, k=peak_count, sorted=False).indices
+    acceleration_peak = acceleration_element[peak_nodes].mean()
+    acceleration_loss = 0.5 * acceleration_base + 0.5 * acceleration_peak
+    stress_mask = ~static.prescribed_mask
+    if not bool(stress_mask.any().item()):
+        stress_mask = torch.ones_like(static.prescribed_mask)
+    stress_target = trajectory.stress[next_step, stress_mask, :1]
+    stress_prediction = output.nodal_stress[stress_mask, :1]
+    stress_loss, _ = robust_stress_loss(
+        normalizers.stress.transform(stress_prediction),
+        normalizers.stress.transform(stress_target),
+        ranking_target=stress_target,
+        peak_fraction=float(get_cfg(cfg, "loss.peak_fraction", 0.1)),
+        peak_weight=float(get_cfg(cfg, "loss.peak_weight", 0.5)),
+        delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+    )
+    projection_free = (
+        (output.energy_diagnostics["integration_update_scale"] >= 1.0 - 1.0e-7)
+        & (output.energy_diagnostics["integration_valid"] >= 0.5)
+    ).to(acceleration_loss.dtype)
+    effective_mass = (
+        static.lumped_mass.reshape(-1, 1)
+        * output.energy_diagnostics["mass_scale"]
+    )
+    residual_acceleration = output.residual_force / effective_mass
+    residual_moving = residual_acceleration[moving]
+    correction_target = (
+        target_acceleration_moving
+        - (output.acceleration[moving] - residual_moving).detach()
+    ).detach()
+    correction_norm = torch.linalg.vector_norm(correction_target, dim=1)
+    direction_mask = correction_norm > (
+        float(get_cfg(cfg, "dynamics_pretraining.active_threshold", 0.05))
+        * global_scale
+    )
+    if contact_pairs is not None and contact_pairs.numel():
+        contact_nodes = torch.zeros_like(moving)
+        contact_nodes[contact_pairs.reshape(-1).long()] = True
+        direction_mask = direction_mask & ~contact_nodes[moving]
+    if bool(direction_mask.any().item()):
+        selected_correction = correction_target[direction_mask].float()
+        correction_unit = selected_correction / torch.linalg.vector_norm(
+            selected_correction, dim=1, keepdim=True
+        ).clamp_min(global_scale.detach().float() * 0.05)
+        directional_projection = (
+            residual_moving[direction_mask].float()
+            / frame_scale.detach().float()
+            * correction_unit
+        ).sum(dim=1)
+        direction_loss = (1.0 - directional_projection).mean()
+    else:
+        direction_loss = acceleration_loss.new_zeros(())
+    quiet_mask = target_norm <= (
+        float(get_cfg(cfg, "dynamics_pretraining.active_threshold", 0.05))
+        * global_scale
+    )
+    quiet_loss = (
+        (residual_moving[quiet_mask] / global_scale).square().mean()
+        if bool(quiet_mask.any().item())
+        else acceleration_loss.new_zeros(())
+    )
+    state_loss = projection_free * (
+        float(get_cfg(cfg, "dynamics_pretraining.position_weight", 0.25))
+        * position_loss
+        + float(get_cfg(cfg, "dynamics_pretraining.velocity_weight", 0.25))
+        * velocity_loss
+        + float(get_cfg(cfg, "dynamics_pretraining.acceleration_weight", 1.0))
+        * acceleration_loss
+        + float(get_cfg(cfg, "dynamics_pretraining.direction_weight", 0.25))
+        * direction_loss
+        + float(get_cfg(cfg, "dynamics_pretraining.quiet_weight", 0.05))
+        * quiet_loss
+        + float(get_cfg(cfg, "dynamics_pretraining.stress_weight", 0.1))
+        * stress_loss
+    )
+    residual_loss = (
+        output.energy_diagnostics["residual_norm"]
+        / output.energy_diagnostics["residual_reference"].clamp_min(1.0e-12)
+    ).square()
+    total = (
+        state_loss
+        + float(get_cfg(cfg, "dynamics_pretraining.residual_weight", 1.0e-3))
+        * residual_loss
+        + float(get_cfg(cfg, "loss.negative_j", 10.0))
+        * output.energy_diagnostics["negative_j"]
+    )
+    return total, {
+        "loss": total.detach(),
+        "position": position_loss.detach(),
+        "velocity": velocity_loss.detach(),
+        "acceleration": acceleration_loss.detach(),
+        "acceleration_base": acceleration_base.detach(),
+        "acceleration_peak": acceleration_peak.detach(),
+        "direction": direction_loss.detach(),
+        "quiet": quiet_loss.detach(),
+        "stress": stress_loss.detach(),
+        "residual": residual_loss.detach(),
+        "integration_backtrack": (1.0 - projection_free).detach(),
+    }
+
+
+@torch.no_grad()
+def evaluate_teacher_forced_dynamics(
+    model: CHPGNS,
+    cases: list[ValveCase],
+    cache: CHPCaseCache,
+    cfg: dict[str, Any],
+    normalizers: CHPNormalizers,
+    *,
+    amp_dtype: torch.dtype,
+) -> dict[str, float]:
+    """Measure exact-state one-step dynamics without touching the test split."""
+
+    model.eval()
+    case_count = min(
+        int(get_cfg(cfg, "dynamics_pretraining.validation_cases", 10)),
+        len(cases),
+    )
+    frames_per_case = max(
+        int(get_cfg(cfg, "dynamics_pretraining.validation_frames", 8)), 1
+    )
+    case_indices = np.linspace(0, len(cases) - 1, case_count).round().astype(int)
+    device = cache.device
+    totals = {
+        key: torch.zeros((), device=device, dtype=torch.float64)
+        for key in (
+            "a_error",
+            "a_reference",
+            "a_prediction",
+            "a_cross",
+            "active_error",
+            "active_reference",
+            "active_prediction",
+            "active_cross",
+            "delta_error",
+            "delta_reference",
+            "stress_error",
+            "stress_reference",
+            "residual_square",
+            "residual_count",
+            "saturated",
+            "node_count",
+            "backtrack",
+            "failure",
+        )
+    }
+    used_frames = 0
+    pressure_sign = float(get_cfg(cfg, "data.pressure_sign", 1.0))
+    for case_index_value in case_indices:
+        case_index = int(case_index_value)
+        case = cases[case_index]
+        trajectory = cache.get(case_index)
+        frames = np.linspace(
+            0,
+            case.num_steps - 2,
+            min(frames_per_case, case.num_steps - 1),
+        )
+        for frame_value in np.unique(frames.round().astype(int)):
+            frame = int(frame_value)
+            state = CHPState(
+                trajectory.static.reference_position
+                + trajectory.displacement[frame],
+                trajectory.velocity[frame],
+            )
+            pairs = contact_pairs_at(trajectory, state, cfg)
+            dt = trajectory.times[frame + 1] - trajectory.times[frame]
+            with _autocast(device, amp_dtype):
+                output = model(
+                    trajectory.static,
+                    state,
+                    contact_pairs=pairs,
+                    external_force=external_force_at(
+                        trajectory, frame, pressure_sign
+                    ),
+                    dt=dt,
+                    time_fraction=trajectory.time_fraction[frame],
+                    prescribed_position=(
+                        trajectory.static.reference_position
+                        + trajectory.displacement[frame + 1]
+                    ),
+                    prescribed_velocity=trajectory.velocity[frame + 1],
+                )
+            moving = ~(
+                trajectory.static.fixed_mask
+                | trajectory.static.prescribed_mask
+            )
+            if not bool(moving.any().item()):
+                continue
+            exact_next = (
+                trajectory.static.reference_position
+                + trajectory.displacement[frame + 1]
+            )
+            target_velocity, target_acceleration = integration_consistent_targets(
+                state, exact_next, dt
+            )
+            prediction = output.acceleration[moving].double()
+            target = target_acceleration[moving].double()
+            error = prediction - target
+            totals["a_error"] += error.square().sum()
+            totals["a_reference"] += target.square().sum()
+            totals["a_prediction"] += prediction.square().sum()
+            totals["a_cross"] += (prediction * target).sum()
+            active = torch.linalg.vector_norm(target, dim=1) > (
+                float(get_cfg(cfg, "dynamics_pretraining.active_threshold", 0.05))
+                * normalizers.acceleration_scale.double()
+            )
+            if bool(active.any().item()):
+                totals["active_error"] += error[active].square().sum()
+                totals["active_reference"] += target[active].square().sum()
+                totals["active_prediction"] += prediction[active].square().sum()
+                totals["active_cross"] += (prediction[active] * target[active]).sum()
+            predicted_delta = output.next_position[moving] - state.position[moving]
+            target_delta = exact_next[moving] - state.position[moving]
+            totals["delta_error"] += (
+                predicted_delta.double() - target_delta.double()
+            ).square().sum()
+            totals["delta_reference"] += target_delta.double().square().sum()
+            stress_mask = ~trajectory.static.prescribed_mask
+            stress_target = trajectory.stress[frame + 1, stress_mask, :1].double()
+            stress_error = (
+                output.nodal_stress[stress_mask, :1].double() - stress_target
+            )
+            totals["stress_error"] += stress_error.square().sum()
+            totals["stress_reference"] += stress_target.square().sum()
+            residual = (
+                output.residual_force[moving]
+                / (
+                    trajectory.static.lumped_mass.reshape(-1, 1)[moving]
+                    * output.energy_diagnostics["mass_scale"]
+                )
+            )
+            residual_norm = torch.linalg.vector_norm(residual.double(), dim=1)
+            totals["residual_square"] += residual_norm.square().sum()
+            totals["residual_count"] += residual_norm.numel()
+            totals["saturated"] += (
+                residual_norm >= 0.95 * model.residual_acceleration_cap
+            ).double().sum()
+            totals["node_count"] += residual_norm.numel()
+            totals["backtrack"] += (
+                output.energy_diagnostics["integration_update_scale"]
+                < 1.0 - 1.0e-7
+            ).double()
+            totals["failure"] += (
+                output.energy_diagnostics["integration_valid"] < 0.5
+            ).double()
+            used_frames += 1
+    eps = torch.tensor(1.0e-12, device=device, dtype=torch.float64)
+    acceleration_relative = torch.sqrt(
+        totals["a_error"] / totals["a_reference"].clamp_min(eps)
+    )
+    acceleration_cosine = totals["a_cross"] / torch.sqrt(
+        totals["a_prediction"].clamp_min(eps)
+        * totals["a_reference"].clamp_min(eps)
+    )
+    active_relative = torch.sqrt(
+        totals["active_error"] / totals["active_reference"].clamp_min(eps)
+    )
+    active_cosine = totals["active_cross"] / torch.sqrt(
+        totals["active_prediction"].clamp_min(eps)
+        * totals["active_reference"].clamp_min(eps)
+    )
+    return {
+        "acceleration_relative_rmse": float(acceleration_relative.item()),
+        "acceleration_cosine": float(acceleration_cosine.item()),
+        "active_acceleration_relative_rmse": float(active_relative.item()),
+        "active_acceleration_cosine": float(active_cosine.item()),
+        "position_increment_relative_rmse": float(
+            torch.sqrt(
+                totals["delta_error"]
+                / totals["delta_reference"].clamp_min(eps)
+            ).item()
+        ),
+        "one_step_stress_relative_rmse": float(
+            torch.sqrt(
+                totals["stress_error"]
+                / totals["stress_reference"].clamp_min(eps)
+            ).item()
+        ),
+        "residual_acceleration_rms": float(
+            torch.sqrt(
+                totals["residual_square"]
+                / totals["residual_count"].clamp_min(1.0)
+            ).item()
+        ),
+        "residual_saturation_fraction": float(
+            (totals["saturated"] / totals["node_count"].clamp_min(1.0)).item()
+        ),
+        "integration_backtrack_fraction": float(
+            (totals["backtrack"] / max(used_frames, 1)).item()
+        ),
+        "integration_failure_fraction": float(
+            (totals["failure"] / max(used_frames, 1)).item()
+        ),
+        "frames": float(used_frames),
+    }
+
+
+def _dynamics_pretraining_parameters(
+    model: CHPGNS,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    residual = list(model.residual_channel.parameters())
+    residual_ids = {id(parameter) for parameter in residual}
+    processor: list[torch.nn.Parameter] = []
+    for module in (
+        model.node_encoder,
+        model.vector_encoder,
+        model.processor,
+    ):
+        processor.extend(
+            parameter
+            for parameter in module.parameters()
+            if id(parameter) not in residual_ids
+        )
+    return processor, residual
+
+
+def train_exact_dynamics_epoch(
+    model: CHPGNS,
+    cases: list[ValveCase],
+    cache: CHPCaseCache,
+    sampling_scores: list[np.ndarray],
+    normalizers: CHPNormalizers,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+    *,
+    epoch: int,
+    amp_dtype: torch.dtype,
+) -> dict[str, float]:
+    """Fit exact one-step acceleration before exposing the model to noise."""
+
+    model.train()
+    model.processor.activation_checkpointing = False
+    rng = np.random.default_rng(int(cfg.get("seed", 42)) + 7919 * int(epoch))
+    indices = rng.permutation(len(cases))
+    requested = int(
+        get_cfg(cfg, "dynamics_pretraining.trajectories_per_epoch", len(cases))
+    )
+    indices = indices[: min(requested, len(indices))]
+    pressure_sign = float(get_cfg(cfg, "data.pressure_sign", 1.0))
+    totals: dict[str, float] = {}
+    used = 0
+    nonfinite_losses = 0
+    nonfinite_gradients = 0
+    parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    for case_index_value in tqdm(indices, desc="dynamics-pretrain", leave=False):
+        case_index = int(case_index_value)
+        case = cases[case_index]
+        start, _ = select_rollout_start(
+            case.num_steps, 1, sampling_scores[case_index], rng
+        )
+        trajectory = cache.get_slice(case_index, start, start + 2)
+        if not is_admissible_training_window(trajectory, cfg):
+            continue
+        state = CHPState(
+            trajectory.static.reference_position + trajectory.displacement[0],
+            trajectory.velocity[0],
+        )
+        pairs = contact_pairs_at(trajectory, state, cfg)
+        dt = trajectory.times[1] - trajectory.times[0]
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast(cache.device, amp_dtype):
+            output = model(
+                trajectory.static,
+                state,
+                contact_pairs=pairs,
+                external_force=external_force_at(trajectory, 0, pressure_sign),
+                dt=dt,
+                time_fraction=trajectory.time_fraction[0],
+                prescribed_position=(
+                    trajectory.static.reference_position
+                    + trajectory.displacement[1]
+                ),
+                prescribed_velocity=trajectory.velocity[1],
+                detach_pair_force_features=True,
+            )
+            loss, metrics = exact_dynamics_loss(
+                output,
+                state,
+                trajectory,
+                1,
+                normalizers,
+                cfg,
+                contact_pairs=pairs,
+            )
+        if not bool(torch.isfinite(loss).item()):
+            nonfinite_losses += 1
+            continue
+        loss.backward()
+        finite_gradient = all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in parameters
+        )
+        if not finite_gradient:
+            nonfinite_gradients += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            parameters,
+            float(get_cfg(cfg, "dynamics_pretraining.grad_clip_norm", 1.0)),
+        )
+        if not bool(torch.isfinite(gradient_norm).item()):
+            nonfinite_gradients += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
+        optimizer.step()
+        _accumulate(totals, metrics)
+        used += 1
+    averaged = {key: value / max(used, 1) for key, value in totals.items()}
+    averaged["steps"] = float(used)
+    averaged["nonfinite_losses"] = float(nonfinite_losses)
+    averaged["nonfinite_gradients"] = float(nonfinite_gradients)
+    return averaged
+
+
+def run_dynamics_pretraining(
+    model: CHPGNS,
+    train_cases: list[ValveCase],
+    val_cases: list[ValveCase] | None,
+    train_cache: CHPCaseCache,
+    val_cache: CHPCaseCache | None,
+    sampling_scores: list[np.ndarray],
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+    output_dir: Path,
+    *,
+    amp_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Pretrain bounded residual dynamics on exact states and select on val."""
+
+    if not bool(get_cfg(cfg, "dynamics_pretraining.enabled", True)):
+        return {"enabled": False}
+    if val_cases is None or val_cache is None:
+        raise ValueError("dynamics pretraining requires a validation split")
+    processor_parameters, residual_parameters = _dynamics_pretraining_parameters(model)
+    selected_ids = {
+        id(parameter)
+        for parameter in (*processor_parameters, *residual_parameters)
+    }
+    original_requires_grad = {
+        id(parameter): parameter.requires_grad for parameter in model.parameters()
+    }
+    for parameter in model.parameters():
+        parameter.requires_grad_(id(parameter) in selected_ids)
+    base_lr = float(get_cfg(cfg, "dynamics_pretraining.lr", 1.0e-4))
+    head_warmup_lr = float(
+        get_cfg(cfg, "dynamics_pretraining.head_warmup_lr", 5.0e-3)
+    )
+    joint_head_lr = float(
+        get_cfg(
+            cfg,
+            "dynamics_pretraining.joint_head_lr",
+            base_lr
+            * float(
+                get_cfg(cfg, "dynamics_pretraining.residual_lr_scale", 5.0)
+            ),
+        )
+    )
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": processor_parameters, "lr": 0.0},
+            {
+                "params": residual_parameters,
+                "lr": head_warmup_lr,
+            },
+        ],
+        weight_decay=float(
+            get_cfg(cfg, "dynamics_pretraining.weight_decay", 1.0e-6)
+        ),
+    )
+    history: dict[str, Any] = {"enabled": True, "epochs": []}
+    try:
+        initial = evaluate_teacher_forced_dynamics(
+            model,
+            val_cases,
+            val_cache,
+            cfg,
+            normalizers,
+            amp_dtype=amp_dtype,
+        )
+        history["initial_validation"] = initial
+        best_score = max(
+            initial["active_acceleration_relative_rmse"],
+            initial["one_step_stress_relative_rmse"],
+        )
+        best_state = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+        epochs = max(int(get_cfg(cfg, "dynamics_pretraining.epochs", 2)), 0)
+        head_warmup_epochs = max(
+            int(get_cfg(cfg, "dynamics_pretraining.head_warmup_epochs", 1)), 0
+        )
+        for epoch in range(1, epochs + 1):
+            if epoch <= head_warmup_epochs:
+                optimizer.param_groups[0]["lr"] = 0.0
+                optimizer.param_groups[1]["lr"] = head_warmup_lr
+            else:
+                optimizer.param_groups[0]["lr"] = base_lr
+                optimizer.param_groups[1]["lr"] = joint_head_lr
+            train_metrics = train_exact_dynamics_epoch(
+                model,
+                train_cases,
+                train_cache,
+                sampling_scores,
+                normalizers,
+                optimizer,
+                cfg,
+                epoch=epoch,
+                amp_dtype=amp_dtype,
+            )
+            validation = evaluate_teacher_forced_dynamics(
+                model,
+                val_cases,
+                val_cache,
+                cfg,
+                normalizers,
+                amp_dtype=amp_dtype,
+            )
+            score = max(
+                validation["active_acceleration_relative_rmse"],
+                validation["one_step_stress_relative_rmse"],
+            )
+            if score < best_score:
+                best_score = score
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+            history["epochs"].append(
+                {
+                    "epoch": epoch,
+                    "train": train_metrics,
+                    "validation": validation,
+                    "score": score,
+                    "processor_lr": optimizer.param_groups[0]["lr"],
+                    "residual_head_lr": optimizer.param_groups[1]["lr"],
+                }
+            )
+        model.load_state_dict(best_state)
+        history["selected_score"] = best_score
+    finally:
+        for parameter in model.parameters():
+            parameter.requires_grad_(original_requires_grad[id(parameter)])
+    _save_json(output_dir / "dynamics_pretraining.json", history)
+    return history
+
+
 def run_chp_training(cfg: dict[str, Any]) -> Path:
     """Train CHP-GNS using BF16 neural blocks and FP32 mechanics on CUDA."""
 
@@ -984,9 +1697,21 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
 
     normalizer_path = output_dir / "normalizers.pt"
     if normalizer_path.exists():
-        normalizers = CHPNormalizers.from_state_dict(
-            _torch_load(normalizer_path, "cpu")
-        )
+        normalizer_state = _torch_load(normalizer_path, "cpu")
+        if "acceleration_scale" in normalizer_state:
+            normalizers = CHPNormalizers.from_state_dict(normalizer_state)
+        else:
+            normalizers = fit_chp_normalizers(
+                train_dataset.cases,
+                max_cases=int(get_cfg(cfg, "training.normalizer_cases", 128)),
+                frames_per_case=int(
+                    get_cfg(cfg, "training.normalizer_frames", 8)
+                ),
+                nodes_per_frame=int(
+                    get_cfg(cfg, "training.normalizer_nodes", 256)
+                ),
+            )
+            torch.save(normalizers.state_dict(), normalizer_path)
     else:
         normalizers = fit_chp_normalizers(
             train_dataset.cases,
@@ -1096,6 +1821,27 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                 )
             )
             print(f"constitutive pretraining selected teacher rRMSE={selected:.4g}")
+        dynamics_sampling_scores = build_acceleration_sampling_scores(
+            train_dataset.cases,
+            output_dir / "acceleration_sampling_scores.pt",
+        )
+        dynamics_pretraining = run_dynamics_pretraining(
+            model,
+            train_dataset.cases,
+            val_dataset.cases if val_dataset is not None else None,
+            train_cache,
+            val_cache,
+            dynamics_sampling_scores,
+            normalizers,
+            cfg,
+            output_dir,
+            amp_dtype=amp_dtype,
+        )
+        if dynamics_pretraining.get("enabled"):
+            selected = float(
+                dynamics_pretraining.get("selected_score", float("inf"))
+            )
+            print(f"dynamics pretraining selected minimax={selected:.4g}")
     if resume is not None:
         checkpoint = _torch_load(resume, device)
         validate_chp_checkpoint_semantics(checkpoint, source=resume)
@@ -1215,6 +1961,59 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                 "teacher-forced stress gate failed: "
                 f"{teacher_relative:.4g} >= {teacher_threshold:.4g}"
             )
+        if (
+            bool(get_cfg(cfg, "validation.enforce_rollout_pilot_gate", False))
+            and epoch == gate_epoch
+        ):
+            moving_relative = float(
+                rollout_metrics.get(
+                    "moving_displacement_relative_rmse", float("inf")
+                )
+            )
+            stress_relative = float(
+                rollout_metrics.get("stress_relative_rmse", float("inf"))
+            )
+            diverged_cases = float(
+                rollout_metrics.get("diverged_cases", float("inf"))
+            )
+            moving_threshold = float(
+                get_cfg(
+                    cfg,
+                    "validation.pilot_moving_relative_rmse_threshold",
+                    0.80,
+                )
+            )
+            stress_threshold = float(
+                get_cfg(
+                    cfg,
+                    "validation.pilot_stress_relative_rmse_threshold",
+                    0.65,
+                )
+            )
+            passed = (
+                moving_relative < moving_threshold
+                and stress_relative < stress_threshold
+                and diverged_cases == 0.0
+            )
+            if not passed:
+                failure = {
+                    "epoch": epoch,
+                    "moving_displacement_relative_rmse": moving_relative,
+                    "moving_threshold": moving_threshold,
+                    "stress_relative_rmse": stress_relative,
+                    "stress_threshold": stress_threshold,
+                    "diverged_cases": diverged_cases,
+                    "action": "stop before K=2 and revise force identifiability",
+                }
+                _save_json(
+                    output_dir / "rollout_pilot_gate_failure.json", failure
+                )
+                raise RuntimeError(
+                    "K=1 rollout pilot gate failed: "
+                    f"moving={moving_relative:.4g}, "
+                    f"stress={stress_relative:.4g}, "
+                    f"diverged={diverged_cases:.0f}"
+                )
     return output_dir / "best.pt"
 
 

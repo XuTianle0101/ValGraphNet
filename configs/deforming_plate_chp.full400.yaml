@@ -80,6 +80,28 @@ constitutive_pretraining:
   lr: 1.0e-3
   grad_clip_norm: 10.0
 
+dynamics_pretraining:
+  enabled: true
+  epochs: 3
+  head_warmup_epochs: 1
+  trajectories_per_epoch: 500
+  validation_cases: 10
+  validation_frames: 8
+  lr: 1.0e-4
+  head_warmup_lr: 1.0e-3
+  joint_head_lr: 5.0e-4
+  weight_decay: 1.0e-6
+  grad_clip_norm: 1.0
+  position_weight: 0.25
+  velocity_weight: 0.25
+  acceleration_weight: 1.0
+  direction_weight: 0.25
+  quiet_weight: 0.05
+  active_node_fraction: 0.2
+  active_threshold: 0.05
+  stress_weight: 0.1
+  residual_weight: 1.0e-3
+
 training:
   device: cuda
   amp: true
@@ -123,6 +145,9 @@ validation:
   teacher_stress_frames: 16
   teacher_stress_threshold: 0.50
   enforce_teacher_stress_gate: true
+  enforce_rollout_pilot_gate: true
+  pilot_moving_relative_rmse_threshold: 0.80
+  pilot_stress_relative_rmse_threshold: 0.65
   gpu_case_cache_size: 2
   divergence_position: 10.0
   minimum_predicted_j: 1.0e-4

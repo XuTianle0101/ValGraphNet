@@ -307,7 +307,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 2
+    dynamics_schema_version = 3
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -372,7 +372,7 @@ class CHPGNS(nn.Module):
             nn.Linear(self.scalar_dim, self.scalar_dim),
             nn.LayerNorm(self.scalar_dim),
         )
-        self.vector_encoder = VectorChannelLinear(3, self.vector_dim)
+        self.vector_encoder = VectorChannelLinear(4, self.vector_dim)
         self.processor = HierarchicalScalarVectorProcessor(
             self.scalar_dim,
             self.vector_dim,
@@ -492,6 +492,7 @@ class CHPGNS(nn.Module):
         time_fraction: float | torch.Tensor = 0.0,
         prescribed_position: torch.Tensor | None = None,
         prescribed_velocity: torch.Tensor | None = None,
+        detach_pair_force_features: bool = False,
     ) -> PhysicalStep:
         position = state.position.float()
         velocity = state.velocity.float()
@@ -501,6 +502,22 @@ class CHPGNS(nn.Module):
             external_force = torch.zeros_like(position)
         else:
             external_force = external_force.float()
+        step_dt = torch.as_tensor(dt, device=position.device, dtype=position.dtype)
+        boundary_target_velocity = torch.zeros_like(position)
+        if bool(static.prescribed_mask.any().item()):
+            if prescribed_position is not None:
+                prescribed_target = (
+                    prescribed_position.float() - position
+                ) / step_dt
+            elif prescribed_velocity is not None:
+                prescribed_target = prescribed_velocity.float()
+            else:
+                prescribed_target = velocity
+            boundary_target_velocity = torch.where(
+                static.prescribed_mask[:, None],
+                prescribed_target,
+                boundary_target_velocity,
+            )
         time = torch.as_tensor(time_fraction, device=position.device, dtype=position.dtype)
         scalar_input = torch.stack(
             [
@@ -514,7 +531,15 @@ class CHPGNS(nn.Module):
             dim=1,
         )
         scalar = self.node_encoder(scalar_input)
-        vector_input = torch.stack([displacement, velocity, external_force], dim=1)
+        vector_input = torch.stack(
+            [
+                displacement,
+                velocity,
+                external_force,
+                boundary_target_velocity,
+            ],
+            dim=1,
+        )
         vector = self.vector_encoder(vector_input)
         scalar, vector = self.processor(scalar, vector, position, static.hierarchy)
 
@@ -552,7 +577,6 @@ class CHPGNS(nn.Module):
         nodal_mass = static.lumped_mass.reshape(-1) * mass_scale
         contact_scale = self.log_contact_scale.clamp(-20.0, 10.0).exp()
         damping_scale = self.log_damping_scale.clamp(-20.0, 10.0).exp()
-        step_dt = torch.as_tensor(dt, device=position.device, dtype=position.dtype)
         raw_residual = self.residual_channel(vector)[:, 0]
         residual_norm = torch.linalg.vector_norm(raw_residual, dim=1, keepdim=True)
         cap_ratio = self.residual_acceleration_cap / max(
@@ -573,6 +597,10 @@ class CHPGNS(nn.Module):
             + step_dt.square()
             * torch.linalg.vector_norm(
                 external_acceleration, dim=1, keepdim=True
+            )
+            + step_dt.abs()
+            * torch.linalg.vector_norm(
+                boundary_target_velocity, dim=1, keepdim=True
             )
         )
         activity = diffuse_node_activity(
@@ -617,11 +645,12 @@ class CHPGNS(nn.Module):
         contact = torch.zeros_like(position)
         total_force = torch.zeros_like(position)
         current_fields = initial_fields
+        force_scalar = scalar.detach() if detach_pair_force_features else scalar
         for substep in range(max(self.contact_substeps, 1)):
             if substep:
                 current_fields = self.constitutive_fields(static, current_position)
             damping, damping_rate = self.force_heads.mesh_damping(
-                scalar,
+                force_scalar,
                 current_position,
                 current_velocity,
                 mesh_pairs,
@@ -629,7 +658,7 @@ class CHPGNS(nn.Module):
                 nodal_mass,
             )
             contact, penetration, contact_rate = self.force_heads.contact_force(
-                scalar,
+                force_scalar,
                 current_position,
                 current_velocity,
                 contact_pairs,
@@ -838,6 +867,9 @@ class CHPGNS(nn.Module):
                 ),
                 "residual_activity_mean": activity_gate.mean(),
                 "residual_activity_max": activity_gate.max(),
+                "boundary_drive_max": torch.linalg.vector_norm(
+                    boundary_target_velocity, dim=1
+                ).max(),
                 "integration_update_scale": minimum_update_scale,
                 "integration_valid": integration_valid.to(position.dtype),
                 "integration_domain_penalty": integration_domain_penalty,
