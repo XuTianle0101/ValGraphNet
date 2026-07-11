@@ -1964,6 +1964,7 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
     device = _require_cuda(cfg)
     output_dir = Path(get_cfg(cfg, "training.output_dir", "outputs/chp_gns"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    _assert_no_gate_failure_artifact(output_dir, context="training/resume")
     train_dataset, val_dataset = _build_chp_datasets(cfg)
     material_dim = max(
         case.material_features.shape[1]
@@ -2230,6 +2231,21 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
         history = [item for item in history if int(item["epoch"]) != epoch]
         history.append(record)
         _save_json(output_dir / "history.json", sorted(history, key=lambda x: x["epoch"]))
+        score_label = f"{score:.4g}" if score is not None else "not-evaluated"
+        print(
+            f"epoch={epoch:02d} K={horizon:02d} loss={train_metrics['loss']:.5g} "
+            f"score={score_label} peak={peak_gib:.2f}GiB "
+            f"time={record['seconds']:.1f}s"
+        )
+        _enforce_scientific_gates(
+            epoch,
+            stages,
+            teacher_metrics,
+            rollout_metrics,
+            cfg,
+            output_dir,
+        )
+        gate_status = _scientific_gate_status(epoch, stages, cfg)
         checkpoint_score = float(score) if score is not None else 1.0e30
         checkpoint_best = min(best_score, checkpoint_score)
         if not math.isfinite(checkpoint_best):
@@ -2246,105 +2262,19 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             checkpoint_best,
             rollout_metrics,
             material_dim,
+            scientific_gate_status=gate_status,
         )
         torch.save(payload, output_dir / "latest.pt")
-        if score is not None and score < best_score:
+        if (
+            gate_status in {"passed", "not_required"}
+            and score is not None
+            and score < best_score
+        ):
             best_score = score
             payload["best_score"] = best_score
             torch.save(payload, output_dir / "best.pt")
-        score_label = f"{score:.4g}" if score is not None else "not-evaluated"
-        print(
-            f"epoch={epoch:02d} K={horizon:02d} loss={train_metrics['loss']:.5g} "
-            f"score={score_label} peak={peak_gib:.2f}GiB "
-            f"time={record['seconds']:.1f}s"
-        )
-        gate_epoch = _teacher_gate_epoch(stages)
-        teacher_relative = float(
-            teacher_metrics.get("teacher_stress_relative_rmse", float("inf"))
-        )
-        teacher_threshold = float(
-            get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
-        )
-        if (
-            bool(get_cfg(cfg, "validation.enforce_teacher_stress_gate", True))
-            and epoch == gate_epoch
-            and teacher_relative >= teacher_threshold
-        ):
-            teacher_source = str(
-                teacher_metrics.get("teacher_stress_source", "unavailable")
-            )
-            failure = {
-                "epoch": epoch,
-                "teacher_stress_relative_rmse": teacher_relative,
-                "teacher_stress_source": teacher_source,
-                "teacher_stress_label_coverage": teacher_metrics.get(
-                    "teacher_stress_label_coverage", 0.0
-                ),
-                "threshold": teacher_threshold,
-                "action": (
-                    "stop rollout curriculum and revise constitutive model/data"
-                    if teacher_source == "cell_tensor"
-                    else "stop rollout curriculum and add full tensor labels"
-                ),
-            }
-            _save_json(output_dir / "teacher_stress_gate_failure.json", failure)
-            raise RuntimeError(
-                "teacher-forced stress gate failed: "
-                f"{teacher_relative:.4g} >= {teacher_threshold:.4g}"
-            )
-        if (
-            bool(get_cfg(cfg, "validation.enforce_rollout_pilot_gate", False))
-            and epoch == gate_epoch
-        ):
-            moving_relative = float(
-                rollout_metrics.get(
-                    "moving_displacement_relative_rmse", float("inf")
-                )
-            )
-            stress_relative = float(
-                rollout_metrics.get("stress_relative_rmse", float("inf"))
-            )
-            diverged_cases = float(
-                rollout_metrics.get("diverged_cases", float("inf"))
-            )
-            moving_threshold = float(
-                get_cfg(
-                    cfg,
-                    "validation.pilot_moving_relative_rmse_threshold",
-                    0.80,
-                )
-            )
-            stress_threshold = float(
-                get_cfg(
-                    cfg,
-                    "validation.pilot_stress_relative_rmse_threshold",
-                    0.65,
-                )
-            )
-            passed = (
-                moving_relative < moving_threshold
-                and stress_relative < stress_threshold
-                and diverged_cases == 0.0
-            )
-            if not passed:
-                failure = {
-                    "epoch": epoch,
-                    "moving_displacement_relative_rmse": moving_relative,
-                    "moving_threshold": moving_threshold,
-                    "stress_relative_rmse": stress_relative,
-                    "stress_threshold": stress_threshold,
-                    "diverged_cases": diverged_cases,
-                    "action": "stop before K=2 and revise force identifiability",
-                }
-                _save_json(
-                    output_dir / "rollout_pilot_gate_failure.json", failure
-                )
-                raise RuntimeError(
-                    "K=1 rollout pilot gate failed: "
-                    f"moving={moving_relative:.4g}, "
-                    f"stress={stress_relative:.4g}, "
-                    f"diverged={diverged_cases:.0f}"
-                )
+    if not (output_dir / "best.pt").exists():
+        raise RuntimeError("CHP-GNS produced no scientifically eligible best checkpoint")
     return output_dir / "best.pt"
 
 
@@ -3002,7 +2932,9 @@ def load_chp_checkpoint(
     if device.type != "cuda":
         raise ValueError("CHP-GNS inference is GPU-only")
     checkpoint = _torch_load(path, device)
-    validate_chp_checkpoint_semantics(checkpoint, source=path)
+    validate_chp_checkpoint_semantics(
+        checkpoint, source=path, require_scientific_gate=True
+    )
     effective_cfg = checkpoint.get("config", cfg)
     model = CHPGNS(
         effective_cfg, material_dim=int(checkpoint.get("material_dim", 0))
@@ -3017,6 +2949,7 @@ def validate_chp_checkpoint_semantics(
     checkpoint: dict[str, Any],
     *,
     source: str | Path = "checkpoint",
+    require_scientific_gate: bool = False,
 ) -> None:
     """Reject schema-v2 files whose dynamics had older force semantics."""
 
@@ -3040,6 +2973,19 @@ def validate_chp_checkpoint_semantics(
             f"{source}; found={mismatched}, expected={expected}. "
             "Start a fresh run instead of reinterpreting a legacy residual head."
         )
+    if require_scientific_gate:
+        source_path = Path(source)
+        if source_path != Path("checkpoint"):
+            _assert_no_gate_failure_artifact(
+                source_path.resolve().parent,
+                context="inference/evaluation",
+            )
+        status = str(checkpoint.get("scientific_gate_status", "missing"))
+        if status not in {"passed", "not_required"}:
+            raise ValueError(
+                "checkpoint did not pass the configured scientific gates: "
+                f"{source}; scientific_gate_status={status!r}"
+            )
 
 
 def _build_chp_datasets(
@@ -3076,6 +3022,8 @@ def _checkpoint_payload(
     best_score: float,
     rollout_metrics: dict[str, float],
     material_dim: int,
+    *,
+    scientific_gate_status: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": CHPGNS.checkpoint_schema_version,
@@ -3083,6 +3031,7 @@ def _checkpoint_payload(
         "residual_parameterization": CHPGNS.residual_parameterization,
         "residual_gate": CHPGNS.residual_gate,
         "architecture": "CHP-GNS",
+        "scientific_gate_status": str(scientific_gate_status),
         "epoch": int(epoch),
         "score": float(score),
         "best_score": float(best_score),
@@ -3153,6 +3102,119 @@ def _teacher_gate_epoch(stages: Iterable[dict[str, int]] | None) -> int:
             break
         total += int(stage["epochs"])
     return max(total, 1)
+
+
+def _scientific_gate_status(
+    epoch: int,
+    stages: Iterable[dict[str, int]] | None,
+    cfg: dict[str, Any],
+) -> str:
+    required = bool(
+        get_cfg(cfg, "validation.enforce_teacher_stress_gate", True)
+    ) or bool(get_cfg(cfg, "validation.enforce_rollout_pilot_gate", False))
+    if not required:
+        return "not_required"
+    return "passed" if int(epoch) >= _teacher_gate_epoch(stages) else "pending"
+
+
+def _assert_no_gate_failure_artifact(
+    directory: str | Path,
+    *,
+    context: str,
+) -> None:
+    root = Path(directory)
+    markers = (
+        root / "teacher_stress_gate_failure.json",
+        root / "rollout_pilot_gate_failure.json",
+    )
+    failed = [marker for marker in markers if marker.is_file()]
+    if failed:
+        names = ", ".join(marker.name for marker in failed)
+        raise RuntimeError(
+            f"CHP-GNS scientific gate already failed; refusing {context}: {names}. "
+            "Use a new output directory after revising the model or data."
+        )
+
+
+def _enforce_scientific_gates(
+    epoch: int,
+    stages: Iterable[dict[str, int]] | None,
+    teacher_metrics: dict[str, Any],
+    rollout_metrics: dict[str, Any],
+    cfg: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    gate_epoch = _teacher_gate_epoch(stages)
+    if int(epoch) != gate_epoch:
+        return
+    teacher_relative = float(
+        teacher_metrics.get("teacher_stress_relative_rmse", float("inf"))
+    )
+    teacher_threshold = float(
+        get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
+    )
+    if (
+        bool(get_cfg(cfg, "validation.enforce_teacher_stress_gate", True))
+        and teacher_relative >= teacher_threshold
+    ):
+        teacher_source = str(
+            teacher_metrics.get("teacher_stress_source", "unavailable")
+        )
+        failure = {
+            "epoch": int(epoch),
+            "teacher_stress_relative_rmse": teacher_relative,
+            "teacher_stress_source": teacher_source,
+            "teacher_stress_label_coverage": teacher_metrics.get(
+                "teacher_stress_label_coverage", 0.0
+            ),
+            "threshold": teacher_threshold,
+            "action": (
+                "stop rollout curriculum and revise constitutive model/data"
+                if teacher_source == "cell_tensor"
+                else "stop rollout curriculum and add full tensor labels"
+            ),
+        }
+        _save_json(output_dir / "teacher_stress_gate_failure.json", failure)
+        raise RuntimeError(
+            "teacher-forced stress gate failed: "
+            f"{teacher_relative:.4g} >= {teacher_threshold:.4g}"
+        )
+    if not bool(get_cfg(cfg, "validation.enforce_rollout_pilot_gate", False)):
+        return
+    moving_relative = float(
+        rollout_metrics.get("moving_displacement_relative_rmse", float("inf"))
+    )
+    stress_relative = float(
+        rollout_metrics.get("stress_relative_rmse", float("inf"))
+    )
+    diverged_cases = float(rollout_metrics.get("diverged_cases", float("inf")))
+    moving_threshold = float(
+        get_cfg(cfg, "validation.pilot_moving_relative_rmse_threshold", 0.80)
+    )
+    stress_threshold = float(
+        get_cfg(cfg, "validation.pilot_stress_relative_rmse_threshold", 0.65)
+    )
+    passed = (
+        moving_relative < moving_threshold
+        and stress_relative < stress_threshold
+        and diverged_cases == 0.0
+    )
+    if not passed:
+        failure = {
+            "epoch": int(epoch),
+            "moving_displacement_relative_rmse": moving_relative,
+            "moving_threshold": moving_threshold,
+            "stress_relative_rmse": stress_relative,
+            "stress_threshold": stress_threshold,
+            "diverged_cases": diverged_cases,
+            "action": "stop before K=2 and revise force identifiability",
+        }
+        _save_json(output_dir / "rollout_pilot_gate_failure.json", failure)
+        raise RuntimeError(
+            "K=1 rollout pilot gate failed: "
+            f"moving={moving_relative:.4g}, stress={stress_relative:.4g}, "
+            f"diverged={diverged_cases:.0f}"
+        )
 
 
 def _curriculum_stage_ends(stages: Iterable[dict[str, int]] | None) -> set[int]:

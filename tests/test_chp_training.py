@@ -8,6 +8,9 @@ import torch
 from valgraphnet.chp_model import CHPGNS, CHPState
 from valgraphnet.chp_train import (
     ROLLOUT_METRIC_KEYS,
+    _assert_no_gate_failure_artifact,
+    _enforce_scientific_gates,
+    _scientific_gate_status,
     acceleration_frame_scores,
     curriculum_horizon,
     fit_chp_normalizers,
@@ -89,6 +92,52 @@ def test_checkpoint_rejects_ambiguous_legacy_residual_semantics():
         "residual_gate": CHPGNS.residual_gate,
     }
     validate_chp_checkpoint_semantics(current)
+    with pytest.raises(ValueError, match="did not pass"):
+        validate_chp_checkpoint_semantics(
+            current, require_scientific_gate=True
+        )
+    validate_chp_checkpoint_semantics(
+        {**current, "scientific_gate_status": "passed"},
+        require_scientific_gate=True,
+    )
+
+
+def test_failed_scientific_gate_blocks_resume_and_best_eligibility(tmp_path):
+    stages = [{"horizon": 1, "epochs": 4}, {"horizon": 2, "epochs": 3}]
+    cfg = {
+        "validation": {
+            "enforce_teacher_stress_gate": True,
+            "teacher_stress_threshold": 0.5,
+        }
+    }
+    assert _scientific_gate_status(3, stages, cfg) == "pending"
+    assert _scientific_gate_status(4, stages, cfg) == "passed"
+    assert _scientific_gate_status(
+        1,
+        stages,
+        {
+            "validation": {
+                "enforce_teacher_stress_gate": False,
+                "enforce_rollout_pilot_gate": False,
+            }
+        },
+    ) == "not_required"
+
+    with pytest.raises(RuntimeError, match="teacher-forced stress gate failed"):
+        _enforce_scientific_gates(
+            4,
+            stages,
+            {
+                "teacher_stress_relative_rmse": 0.7,
+                "teacher_stress_source": "nodal_scalar_vm_fallback",
+            },
+            {},
+            cfg,
+            tmp_path,
+        )
+    assert (tmp_path / "teacher_stress_gate_failure.json").is_file()
+    with pytest.raises(RuntimeError, match="refusing training/resume"):
+        _assert_no_gate_failure_artifact(tmp_path, context="training/resume")
 
 
 def test_native_reference_loads_shared_evaluator_summary(tmp_path):

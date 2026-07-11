@@ -41,7 +41,9 @@ def run_chp_rollouts(
 
     device = _require_cuda(cfg)
     checkpoint = _torch_load(checkpoint_path, device)
-    validate_chp_checkpoint_semantics(checkpoint, source=checkpoint_path)
+    validate_chp_checkpoint_semantics(
+        checkpoint, source=checkpoint_path, require_scientific_gate=True
+    )
     effective_cfg = deepcopy(checkpoint.get("config", cfg))
     effective_cfg["data"] = deepcopy(cfg.get("data", effective_cfg.get("data", {})))
     effective_cfg["training"] = {
