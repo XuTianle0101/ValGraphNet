@@ -307,6 +307,9 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
+    dynamics_schema_version = 1
+    residual_parameterization = "acceleration_reference_v1"
+    residual_gate = "local_topology_v1"
 
     def __init__(self, cfg: dict[str, Any], material_dim: int = 0) -> None:
         super().__init__()
@@ -317,7 +320,33 @@ class CHPGNS(nn.Module):
         self.material_dim = int(material_dim)
         self.contact_radius = float(get_cfg(cfg, "contact.radius", 0.03))
         self.contact_substeps = int(model_cfg.get("contact_substeps", 2))
-        self.residual_limit = float(model_cfg.get("residual_force_limit", 0.1))
+        self.residual_acceleration_reference = float(
+            model_cfg.get("residual_acceleration_reference", 1.9e-4)
+        )
+        self.residual_acceleration_cap = float(
+            model_cfg.get("residual_acceleration_cap", 3.0e-3)
+        )
+        self.integration_minimum_j = float(
+            model_cfg.get("integration_minimum_j", 1.0e-4)
+        )
+        self.integration_maximum_i2_bar = float(
+            model_cfg.get("integration_maximum_i2_bar", 1.0e6)
+        )
+        self.integration_backtracks = int(
+            model_cfg.get("integration_backtracks", 8)
+        )
+        self.residual_activity_scale = float(
+            model_cfg.get("residual_activity_scale", 1.0e-2)
+        )
+        self.residual_activity_diffusion_steps = int(
+            model_cfg.get("residual_activity_diffusion_steps", 2)
+        )
+        if self.residual_acceleration_reference <= 0.0:
+            raise ValueError("residual_acceleration_reference must be positive")
+        if self.residual_acceleration_cap <= 0.0:
+            raise ValueError("residual_acceleration_cap must be positive")
+        if self.residual_activity_scale <= 0.0:
+            raise ValueError("residual_activity_scale must be positive")
         self.normalize_potential_scale = bool(
             model_cfg.get("normalize_potential_scale", True)
         )
@@ -523,34 +552,64 @@ class CHPGNS(nn.Module):
         nodal_mass = static.lumped_mass.reshape(-1) * mass_scale
         contact_scale = self.log_contact_scale.clamp(-20.0, 10.0).exp()
         damping_scale = self.log_damping_scale.clamp(-20.0, 10.0).exp()
+        step_dt = torch.as_tensor(dt, device=position.device, dtype=position.dtype)
         raw_residual = self.residual_channel(vector)[:, 0]
         residual_norm = torch.linalg.vector_norm(raw_residual, dim=1, keepdim=True)
-        residual = (
-            self.residual_limit
-            * torch.tanh(residual_norm)
+        cap_ratio = self.residual_acceleration_cap / max(
+            self.residual_acceleration_reference, 1.0e-12
+        )
+        residual_acceleration = (
+            self.residual_acceleration_reference
+            * cap_ratio
+            * torch.tanh(residual_norm / cap_ratio)
             * raw_residual
             / residual_norm.clamp_min(1.0e-8)
         )
+        external_acceleration = external_force / nodal_mass[:, None]
         activity = (
             torch.linalg.vector_norm(displacement, dim=1, keepdim=True)
-            + torch.linalg.vector_norm(velocity, dim=1, keepdim=True)
-            + torch.linalg.vector_norm(external_force, dim=1, keepdim=True)
+            + step_dt.abs()
+            * torch.linalg.vector_norm(velocity, dim=1, keepdim=True)
+            + step_dt.square()
+            * torch.linalg.vector_norm(
+                external_acceleration, dim=1, keepdim=True
+            )
         )
-        residual = residual * torch.tanh(activity)
+        activity = diffuse_node_activity(
+            activity,
+            static.mesh_edge_index,
+            rounds=self.residual_activity_diffusion_steps,
+        )
+        activity_gate = torch.tanh(
+            activity / max(self.residual_activity_scale, 1.0e-8)
+        )
+        dynamic_mask = ~(static.fixed_mask | static.prescribed_mask)
+        activity_gate = activity_gate * dynamic_mask[:, None]
+        residual_acceleration = residual_acceleration * activity_gate
+        # The source dataset has no physical dt/density pair (meta.json stores
+        # dt=0), so the bounded learned correction is identifiable as an
+        # acceleration.  Multiplication by lumped mass preserves the public
+        # force contract and keeps its state effect independent of the fitted
+        # effective inertia scale.
+        residual = residual_acceleration * nodal_mass[:, None]
         active_prescribed_mask = (
             static.prescribed_mask
             if bool(static.prescribed_mask.any().item())
             else None
         )
-        step_dt = torch.as_tensor(dt, device=position.device, dtype=position.dtype)
         substep_dt = step_dt / max(self.contact_substeps, 1)
         current_position = position
         current_velocity = velocity
         external_work = position.new_zeros(())
         boundary_work = position.new_zeros(())
+        residual_work = position.new_zeros(())
         damping_dissipation = position.new_zeros(())
         contact_dissipation = position.new_zeros(())
+        projection_dissipation = position.new_zeros(())
+        integration_domain_penalty = position.new_zeros(())
         max_penetration = position.new_zeros(())
+        minimum_update_scale = position.new_ones(())
+        integration_valid = torch.ones((), dtype=torch.bool, device=position.device)
         damping = torch.zeros_like(position)
         contact = torch.zeros_like(position)
         total_force = torch.zeros_like(position)
@@ -605,8 +664,48 @@ class CHPGNS(nn.Module):
                 prescribed_position=substep_target,
                 prescribed_velocity=prescribed_velocity,
             )
-            substep_displacement = integrated.position - current_position
+            proposal_penalty = tetrahedral_domain_penalty(
+                integrated.position,
+                static.cells,
+                static.dm_inv,
+                minimum_j=self.integration_minimum_j,
+                maximum_i2_bar=self.integration_maximum_i2_bar,
+            )
+            integration_domain_penalty = torch.maximum(
+                integration_domain_penalty, proposal_penalty
+            )
+            accepted_position, update_scale, update_valid = backtrack_tetrahedral_update(
+                current_position,
+                integrated.position,
+                static.cells,
+                static.dm_inv,
+                fixed_mask=static.fixed_mask,
+                prescribed_mask=active_prescribed_mask,
+                minimum_j=self.integration_minimum_j,
+                maximum_i2_bar=self.integration_maximum_i2_bar,
+                max_backtracks=self.integration_backtracks,
+            )
+            minimum_update_scale = torch.minimum(minimum_update_scale, update_scale)
+            integration_valid = integration_valid & update_valid
+            derived_velocity = (accepted_position - current_position) / substep_dt
+            free_mask = ~static.fixed_mask
+            if active_prescribed_mask is not None:
+                free_mask = free_mask & ~active_prescribed_mask
+            accepted_velocity = torch.where(
+                free_mask[:, None], derived_velocity, integrated.velocity
+            )
+            proposal_kinetic = 0.5 * (
+                nodal_mass[:, None] * integrated.velocity.square()
+            ).sum()
+            accepted_kinetic = 0.5 * (
+                nodal_mass[:, None] * accepted_velocity.square()
+            ).sum()
+            projection_dissipation = projection_dissipation + (
+                proposal_kinetic - accepted_kinetic
+            ).clamp_min(0.0)
+            substep_displacement = accepted_position - current_position
             external_work = external_work + (external_force * substep_displacement).sum()
+            residual_work = residual_work + (residual * substep_displacement).sum()
             if active_prescribed_mask is not None:
                 reaction = (
                     nodal_mass[:, None] * integrated.acceleration - total_force
@@ -617,8 +716,8 @@ class CHPGNS(nn.Module):
                 ).sum()
             damping_dissipation = damping_dissipation + damping_rate * substep_dt
             contact_dissipation = contact_dissipation + contact_rate * substep_dt
-            current_position = integrated.position
-            current_velocity = integrated.velocity
+            current_position = accepted_position
+            current_velocity = accepted_velocity
 
         acceleration = (current_velocity - velocity) / step_dt
         final_fields = self.constitutive_fields(static, current_position)
@@ -646,8 +745,10 @@ class CHPGNS(nn.Module):
             - potential_before
             - external_work
             - boundary_work
+            - residual_work
             + damping_dissipation
             + contact_dissipation
+            + projection_dissipation
         )
         return PhysicalStep(
             next_position=current_position,
@@ -666,15 +767,28 @@ class CHPGNS(nn.Module):
                 "kinetic_after": kinetic_after,
                 "external_work": external_work,
                 "boundary_work": boundary_work,
+                "residual_work": residual_work,
                 "work_energy_balance": energy_balance,
                 "damping_dissipation": damping_dissipation,
                 "contact_dissipation": contact_dissipation,
+                "projection_dissipation": projection_dissipation,
                 "max_penetration": max_penetration,
                 "negative_j": torch.maximum(
-                    initial_fields.inversion_barrier.mean(),
-                    final_fields.inversion_barrier.mean(),
+                    torch.maximum(
+                        initial_fields.inversion_barrier.mean(),
+                        final_fields.inversion_barrier.mean(),
+                    ),
+                    integration_domain_penalty,
                 ),
-                "residual_norm": residual.square().mean().sqrt(),
+                "residual_norm": residual_acceleration.square().mean().sqrt(),
+                "residual_reference": position.new_tensor(
+                    self.residual_acceleration_reference
+                ),
+                "residual_activity_mean": activity_gate.mean(),
+                "residual_activity_max": activity_gate.max(),
+                "integration_update_scale": minimum_update_scale,
+                "integration_valid": integration_valid.to(position.dtype),
+                "integration_domain_penalty": integration_domain_penalty,
                 "stress_scale": self.log_stress_scale.clamp(-20.0, 30.0).exp(),
                 "mass_scale": mass_scale,
                 "contact_scale": contact_scale,
@@ -691,6 +805,125 @@ def unique_undirected_pairs(edge_index: torch.Tensor, num_nodes: int) -> torch.T
     keep = src != dst
     encoded = torch.unique(src[keep] * int(num_nodes) + dst[keep], sorted=True)
     return torch.stack([encoded // int(num_nodes), encoded % int(num_nodes)], dim=0)
+
+
+def diffuse_node_activity(
+    activity: torch.Tensor,
+    edge_index: torch.Tensor,
+    *,
+    rounds: int = 2,
+) -> torch.Tensor:
+    """Diffuse a non-negative node gate locally without a graph-wide broadcast."""
+
+    if activity.ndim != 2 or activity.shape[1] != 1:
+        raise ValueError("activity must have shape [N, 1]")
+    if edge_index.numel() == 0 or int(rounds) <= 0:
+        return activity
+    src, dst = edge_index.long()
+    degree = torch.bincount(dst, minlength=activity.shape[0]).to(activity.dtype)
+    degree = degree[:, None] + 1.0
+    value = activity
+    for _ in range(int(rounds)):
+        aggregate = value.clone()
+        aggregate.index_add_(0, dst, value[src])
+        value = aggregate / degree
+    return value
+
+
+def tetrahedral_domain_penalty(
+    position: torch.Tensor,
+    cells: torch.Tensor,
+    dm_inv: torch.Tensor,
+    *,
+    minimum_j: float = 1.0e-4,
+    maximum_i2_bar: float = 1.0e6,
+) -> torch.Tensor:
+    """Differentiable penalty on a raw proposal before safety projection."""
+
+    state = invariants(deformation_gradient(position, cells, dm_inv))
+    proposal_j = torch.nan_to_num(
+        state.j,
+        nan=-1.0e3,
+        posinf=1.0e3,
+        neginf=-1.0e3,
+    )
+    j_violation = F.relu(float(minimum_j) - proposal_j)
+    overflow = float(maximum_i2_bar) * math.exp(10.0)
+    proposal_i2 = torch.nan_to_num(
+        state.i2_bar,
+        nan=overflow,
+        posinf=overflow,
+        neginf=overflow,
+    ).clamp_min(1.0e-12)
+    i2_violation = F.relu(
+        torch.log(proposal_i2 / max(float(maximum_i2_bar), 1.0e-12))
+    )
+    return (
+        j_violation.square().mean()
+        + j_violation.square().max()
+        + i2_violation.square().mean()
+        + i2_violation.square().max()
+    )
+
+
+def backtrack_tetrahedral_update(
+    current_position: torch.Tensor,
+    proposed_position: torch.Tensor,
+    cells: torch.Tensor,
+    dm_inv: torch.Tensor,
+    *,
+    fixed_mask: torch.Tensor | None = None,
+    prescribed_mask: torch.Tensor | None = None,
+    minimum_j: float = 1.0e-4,
+    maximum_i2_bar: float = 1.0e6,
+    max_backtracks: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select the largest admissible free-node update in one batched GPU pass.
+
+    The scalar scale and validity flag remain device tensors so this safeguard
+    does not introduce a CUDA-to-host synchronization at every rollout step.
+    Constrained nodes retain their proposed values; consequently ``valid`` can
+    be false when a prescribed update itself leaves the constitutive domain.
+    """
+
+    free = torch.ones(
+        current_position.shape[0], dtype=torch.bool, device=current_position.device
+    )
+    if fixed_mask is not None:
+        free &= ~fixed_mask.bool()
+    if prescribed_mask is not None:
+        free &= ~prescribed_mask.bool()
+    delta = proposed_position - current_position
+    exponent = torch.arange(
+        max(int(max_backtracks), 0) + 1,
+        device=current_position.device,
+        dtype=current_position.dtype,
+    )
+    scales = torch.pow(current_position.new_tensor(0.5), exponent)
+    scales = torch.cat([scales, scales.new_zeros(1)])
+    with torch.no_grad():
+        candidate = (
+            current_position.detach()[None]
+            + scales[:, None, None] * delta.detach()[None]
+        )
+        candidate = torch.where(
+            free[None, :, None], candidate, proposed_position.detach()[None]
+        )
+        state = invariants(deformation_gradient(candidate, cells, dm_inv))
+        valid = (
+            torch.isfinite(state.j).all(dim=1)
+            & torch.isfinite(state.i2_bar).all(dim=1)
+            & (state.j.amin(dim=1) >= float(minimum_j))
+            & (state.i2_bar.amax(dim=1) <= float(maximum_i2_bar))
+        )
+        has_valid = valid.any()
+        first_valid = valid.to(torch.int64).argmax()
+        accepted_scale = torch.where(
+            has_valid, scales[first_valid], scales.new_zeros(())
+        )
+    accepted = current_position + accepted_scale * delta
+    accepted = torch.where(free[:, None], accepted, proposed_position)
+    return accepted, accepted_scale, has_valid
 
 
 def tetra_surface_node_mask(cells: torch.Tensor, num_nodes: int) -> torch.Tensor:

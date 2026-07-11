@@ -510,14 +510,23 @@ def chp_step_loss(
         + diagnostics["potential_after"].abs()
         + diagnostics["external_work"].abs()
         + diagnostics["boundary_work"].abs()
+        + diagnostics["residual_work"].abs()
+        + diagnostics["projection_dissipation"].abs()
     ).detach().clamp_min(1.0e-8)
     work_loss = F.huber_loss(
         diagnostics["work_energy_balance"] / work_scale,
         torch.zeros_like(diagnostics["work_energy_balance"]),
         delta=1.0,
     )
+    projection_free = (
+        diagnostics["integration_update_scale"] >= 1.0 - 1.0e-7
+    ).to(work_loss.dtype)
+    work_loss = work_loss * projection_free * diagnostics["integration_valid"]
     penetration_loss = diagnostics["max_penetration"].square()
-    residual_loss = output.residual_force.square().mean()
+    residual_loss = (
+        diagnostics["residual_norm"]
+        / diagnostics["residual_reference"].clamp_min(1.0e-12)
+    ).square()
     negative_j_loss = diagnostics["negative_j"]
 
     total = (
@@ -541,6 +550,18 @@ def chp_step_loss(
         "penetration": penetration_loss.detach(),
         "residual": residual_loss.detach(),
         "negative_j": negative_j_loss.detach(),
+        "integration_update_scale": diagnostics[
+            "integration_update_scale"
+        ].detach(),
+        "integration_backtrack": (
+            diagnostics["integration_update_scale"] < 1.0 - 1.0e-7
+        ).to(total.dtype).detach(),
+        "integration_failure": (
+            diagnostics["integration_valid"] < 0.5
+        ).to(total.dtype).detach(),
+        "integration_domain": diagnostics[
+            "integration_domain_penalty"
+        ].detach(),
     }
 
 
@@ -1054,8 +1075,7 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             print(f"constitutive pretraining selected teacher rRMSE={selected:.4g}")
     if resume is not None:
         checkpoint = _torch_load(resume, device)
-        if int(checkpoint.get("schema_version", 0)) != CHPGNS.checkpoint_schema_version:
-            raise ValueError(f"unsupported CHP checkpoint schema: {resume}")
+        validate_chp_checkpoint_semantics(checkpoint, source=resume)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -1373,9 +1393,13 @@ def evaluate_chp_rollouts(
             "penetration",
             "momentum",
             "energy",
+            "backtrack",
+            "integration_failure",
+            "proposal_domain",
         )
     }
     evaluated_steps = 0
+    attempted_steps = 0
     diverged = 0
     divergence_limit = float(get_cfg(cfg, "validation.divergence_position", 10.0))
     for case_index_value in tqdm(case_indices, desc="rollout-val", leave=False):
@@ -1394,6 +1418,7 @@ def evaluate_chp_rollouts(
             moving = ~trajectory.static.fixed_mask
         case_diverged = False
         for step in range(steps):
+            attempted_steps += 1
             dt = trajectory.times[step + 1] - trajectory.times[step]
             span = (trajectory.times[-1] - trajectory.times[0]).clamp_min(1.0e-8)
             phase = (trajectory.times[step] - trajectory.times[0]) / span
@@ -1421,7 +1446,18 @@ def evaluate_chp_rollouts(
                 & torch.isfinite(output.internal_force).all()
                 & torch.isfinite(output.contact_force).all()
                 & torch.isfinite(output.energy_diagnostics["work_energy_balance"])
+                & (output.energy_diagnostics["integration_valid"] >= 0.5)
             )
+            accum["backtrack"] += (
+                output.energy_diagnostics["integration_update_scale"]
+                < 1.0 - 1.0e-7
+            ).double()
+            accum["integration_failure"] += (
+                output.energy_diagnostics["integration_valid"] < 0.5
+            ).double()
+            accum["proposal_domain"] += (
+                output.energy_diagnostics["integration_domain_penalty"] > 0.0
+            ).double()
             predicted_deformation = invariants(
                 deformation_gradient(
                     state.position,
@@ -1527,6 +1563,15 @@ def evaluate_chp_rollouts(
         "mean_penetration": float((accum["penetration"] / max(evaluated_steps, 1)).item()),
         "mean_momentum_residual": float((accum["momentum"] / max(evaluated_steps, 1)).item()),
         "mean_work_energy_error": float((accum["energy"] / max(evaluated_steps, 1)).item()),
+        "integration_backtrack_fraction": float(
+            (accum["backtrack"] / max(attempted_steps, 1)).item()
+        ),
+        "integration_failure_fraction": float(
+            (accum["integration_failure"] / max(attempted_steps, 1)).item()
+        ),
+        "raw_proposal_domain_violation_fraction": float(
+            (accum["proposal_domain"] / max(attempted_steps, 1)).item()
+        ),
         "evaluated_steps": float(evaluated_steps),
     }
     if diverged:
@@ -1644,8 +1689,7 @@ def load_chp_checkpoint(
     if device.type != "cuda":
         raise ValueError("CHP-GNS inference is GPU-only")
     checkpoint = _torch_load(path, device)
-    if int(checkpoint.get("schema_version", 0)) != CHPGNS.checkpoint_schema_version:
-        raise ValueError("legacy checkpoints cannot populate the CHP physical decoder")
+    validate_chp_checkpoint_semantics(checkpoint, source=path)
     effective_cfg = checkpoint.get("config", cfg)
     model = CHPGNS(
         effective_cfg, material_dim=int(checkpoint.get("material_dim", 0))
@@ -1654,6 +1698,35 @@ def load_chp_checkpoint(
     model.eval()
     normalizers = CHPNormalizers.from_state_dict(checkpoint["normalizers"]).to(device)
     return model, normalizers, checkpoint
+
+
+def validate_chp_checkpoint_semantics(
+    checkpoint: dict[str, Any],
+    *,
+    source: str | Path = "checkpoint",
+) -> None:
+    """Reject schema-v2 files whose dynamics had older force semantics."""
+
+    if int(checkpoint.get("schema_version", 0)) != CHPGNS.checkpoint_schema_version:
+        raise ValueError(
+            f"legacy checkpoint cannot populate the CHP physical decoder: {source}"
+        )
+    expected = {
+        "dynamics_schema_version": CHPGNS.dynamics_schema_version,
+        "residual_parameterization": CHPGNS.residual_parameterization,
+        "residual_gate": CHPGNS.residual_gate,
+    }
+    mismatched = {
+        key: checkpoint.get(key)
+        for key, value in expected.items()
+        if checkpoint.get(key) != value
+    }
+    if mismatched:
+        raise ValueError(
+            "checkpoint dynamics semantics are missing or incompatible: "
+            f"{source}; found={mismatched}, expected={expected}. "
+            "Start a fresh run instead of reinterpreting a legacy residual head."
+        )
 
 
 def _build_chp_datasets(
@@ -1693,6 +1766,9 @@ def _checkpoint_payload(
 ) -> dict[str, Any]:
     return {
         "schema_version": CHPGNS.checkpoint_schema_version,
+        "dynamics_schema_version": CHPGNS.dynamics_schema_version,
+        "residual_parameterization": CHPGNS.residual_parameterization,
+        "residual_gate": CHPGNS.residual_gate,
         "architecture": "CHP-GNS",
         "epoch": int(epoch),
         "score": float(score),

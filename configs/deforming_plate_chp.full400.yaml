@@ -30,7 +30,15 @@ model:
   inversion_stiffness: 10.0
   minimum_j: 0.0
   contact_substeps: 2
-  residual_force_limit: 0.1
+  # Train-only acceleration statistics: free-node P99 ~=1.9e-4.  The bounded
+  # correction may cover the P99.9 tail but cannot bypass the constitutive law.
+  residual_acceleration_reference: 1.9e-4
+  residual_acceleration_cap: 3.0e-3
+  residual_activity_scale: 1.0e-2
+  residual_activity_diffusion_steps: 2
+  integration_minimum_j: 1.0e-4
+  integration_maximum_i2_bar: 1.0e6
+  integration_backtracks: 8
   activation_checkpointing: true
   # DeepMind publishes unit-spaced frames rather than SI time. These learned,
   # positive scales initialize the constitutive stress and effective inertia in

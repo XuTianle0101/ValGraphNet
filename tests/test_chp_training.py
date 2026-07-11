@@ -2,8 +2,10 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
+from valgraphnet.chp_model import CHPGNS
 from valgraphnet.chp_train import (
     ROLLOUT_METRIC_KEYS,
     curriculum_horizon,
@@ -12,6 +14,7 @@ from valgraphnet.chp_train import (
     load_native_reference,
     select_rollout_start,
     stress_frame_scores,
+    validate_chp_checkpoint_semantics,
 )
 
 
@@ -49,6 +52,19 @@ def test_minimax_checkpoint_cannot_trade_stress_for_displacement():
     stress_regression = {**balanced, "stress_relative_rmse": 1.1}
     assert minimax_checkpoint_score(balanced, native) == 0.8
     assert minimax_checkpoint_score(stress_regression, native) == 1.1
+
+
+def test_checkpoint_rejects_ambiguous_legacy_residual_semantics():
+    legacy = {"schema_version": CHPGNS.checkpoint_schema_version}
+    with pytest.raises(ValueError, match="dynamics semantics"):
+        validate_chp_checkpoint_semantics(legacy)
+    current = {
+        "schema_version": CHPGNS.checkpoint_schema_version,
+        "dynamics_schema_version": CHPGNS.dynamics_schema_version,
+        "residual_parameterization": CHPGNS.residual_parameterization,
+        "residual_gate": CHPGNS.residual_gate,
+    }
+    validate_chp_checkpoint_semantics(current)
 
 
 def test_native_reference_loads_shared_evaluator_summary(tmp_path):

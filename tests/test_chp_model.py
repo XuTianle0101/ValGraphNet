@@ -6,12 +6,15 @@ from valgraphnet.chp_model import (
     CHPGNS,
     CHPState,
     PairForceHeads,
+    backtrack_tetrahedral_update,
     build_chp_static,
     radius_contact_pairs,
+    tetrahedral_domain_penalty,
     tetra_surface_node_mask,
     unique_undirected_pairs,
 )
 from valgraphnet.data.case import ValveCase
+from valgraphnet.mechanics import deformation_gradient
 
 
 def _case() -> ValveCase:
@@ -82,6 +85,25 @@ def test_reference_state_remains_static_and_has_zero_stress():
     assert output.legacy_predictions(state)["delta_u"].shape == (4, 3)
 
 
+def test_residual_acceleration_preserves_force_contract():
+    static = build_chp_static(_case(), "cpu")
+    model = CHPGNS(_cfg()).eval()
+    translated = static.reference_position + torch.tensor([0.01, 0.0, 0.0])
+    state = CHPState(translated, torch.zeros_like(translated))
+    output = model(static, state)
+    effective_mass = (
+        static.lumped_mass * model.log_mass_scale.detach().exp()
+    )[:, None]
+    recovered = output.residual_force / effective_mass
+    torch.testing.assert_close(
+        recovered.square().mean().sqrt(),
+        output.energy_diagnostics["residual_norm"],
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+    assert torch.linalg.vector_norm(recovered, dim=1).max() <= 3.0e-3
+
+
 def test_pair_force_scatter_has_exact_zero_resultant():
     force = torch.randn(3, 3)
     pairs = torch.tensor([[0, 0, 1], [1, 2, 3]])
@@ -122,6 +144,73 @@ def test_tetra_surface_mask_excludes_interior_vertex():
         tetra_surface_node_mask(cells, 5),
         torch.tensor([True, True, True, True, False]),
     )
+
+
+def test_tetrahedral_update_backtracks_inversion_but_keeps_prescribed_node():
+    case = _case()
+    current = torch.from_numpy(case.nodes.copy())
+    proposed = current.clone()
+    proposed[1, 0] = -1.0
+    proposed[2, 1] = 1.1
+    accepted, scale, valid = backtrack_tetrahedral_update(
+        current,
+        proposed,
+        torch.from_numpy(case.cells),
+        torch.from_numpy(case.dm_inv),
+        prescribed_mask=torch.tensor([False, False, True, False]),
+        minimum_j=1.0e-4,
+    )
+    assert valid
+    assert 0.0 < float(scale) < 1.0
+    torch.testing.assert_close(accepted[2], proposed[2])
+    determinant = torch.linalg.det(
+        deformation_gradient(
+            accepted, torch.from_numpy(case.cells), torch.from_numpy(case.dm_inv)
+        )
+    )
+    assert determinant.min() >= 1.0e-4
+
+
+def test_tetrahedral_update_reports_infeasible_prescribed_motion():
+    case = _case()
+    current = torch.from_numpy(case.nodes.copy())
+    proposed = current.clone()
+    proposed[1, 0] = -1.0
+    accepted, scale, valid = backtrack_tetrahedral_update(
+        current,
+        proposed,
+        torch.from_numpy(case.cells),
+        torch.from_numpy(case.dm_inv),
+        prescribed_mask=torch.ones(4, dtype=torch.bool),
+        minimum_j=1.0e-4,
+    )
+    assert not valid
+    assert float(scale) == 0.0
+    torch.testing.assert_close(accepted, proposed)
+    determinant = torch.linalg.det(
+        deformation_gradient(
+            accepted, torch.from_numpy(case.cells), torch.from_numpy(case.dm_inv)
+        )
+    )
+    assert determinant.min() < 0.0
+
+
+def test_raw_tetrahedral_proposal_barrier_has_finite_gradient():
+    case = _case()
+    proposed = torch.from_numpy(case.nodes.copy()).requires_grad_(True)
+    inverted = proposed.clone()
+    inverted[1, 0] = -1.0
+    penalty = tetrahedral_domain_penalty(
+        inverted,
+        torch.from_numpy(case.cells),
+        torch.from_numpy(case.dm_inv),
+        minimum_j=1.0e-4,
+    )
+    penalty.backward()
+    assert penalty > 0.0
+    assert proposed.grad is not None
+    assert torch.isfinite(proposed.grad).all()
+    assert proposed.grad.abs().sum() > 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

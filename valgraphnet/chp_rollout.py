@@ -21,6 +21,7 @@ from valgraphnet.chp_train import (
     _torch_load,
     contact_pairs_at,
     external_force_at,
+    validate_chp_checkpoint_semantics,
 )
 from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
@@ -40,8 +41,7 @@ def run_chp_rollouts(
 
     device = _require_cuda(cfg)
     checkpoint = _torch_load(checkpoint_path, device)
-    if int(checkpoint.get("schema_version", 0)) != CHPGNS.checkpoint_schema_version:
-        raise ValueError("CHP rollout requires a schema-v2 checkpoint")
+    validate_chp_checkpoint_semantics(checkpoint, source=checkpoint_path)
     effective_cfg = deepcopy(checkpoint.get("config", cfg))
     effective_cfg["data"] = deepcopy(cfg.get("data", effective_cfg.get("data", {})))
     effective_cfg["training"] = {
@@ -125,7 +125,13 @@ def run_chp_rollouts(
                     prescribed_velocity=trajectory.velocity[step + 1],
                 )
             state = CHPState(physical.next_position, physical.next_velocity)
-            is_finite = bool(torch.isfinite(state.position).all().item())
+            is_finite = bool(
+                (
+                    torch.isfinite(state.position).all()
+                    & torch.isfinite(state.velocity).all()
+                    & (physical.energy_diagnostics["integration_valid"] >= 0.5)
+                ).item()
+            )
             if is_finite:
                 is_finite = float(state.position.abs().max().item()) < divergence_position
             if not is_finite:
@@ -146,6 +152,7 @@ def run_chp_rollouts(
                 {
                     key: float(value.detach().float().item())
                     for key, value in physical.energy_diagnostics.items()
+                    if value.numel() == 1
                 }
             )
 
