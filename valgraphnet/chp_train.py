@@ -288,6 +288,7 @@ def geometry_safe_state_noise(
     smoothing_steps: int = 4,
     minimum_j: float = 0.2,
     max_backtracks: int = 8,
+    maximum_invariant_growth: float = 2.0,
 ) -> tuple[torch.Tensor, float]:
     """Project 0.003 GPU noise onto the orientation-preserving state domain."""
 
@@ -305,16 +306,54 @@ def geometry_safe_state_noise(
         noise = noise * moving[:, None]
     rms = noise[moving].square().mean().sqrt().clamp_min(1.0e-12)
     noise = noise * (float(standard_deviation) / rms)
+    base_state = invariants(
+        deformation_gradient(position, static.cells, static.dm_inv)
+    )
+    base_j = base_state.j.min()
+    admissible_j = min(
+        float(minimum_j),
+        max(0.5 * float(base_j.item()), 1.0e-4),
+    )
+    admissible_i1 = max(
+        float(base_state.i1_bar.max().item()) * float(maximum_invariant_growth),
+        100.0,
+    )
+    admissible_i2 = max(
+        float(base_state.i2_bar.max().item()) * float(maximum_invariant_growth),
+        1_000.0,
+    )
     scale = 1.0
     for _ in range(max(int(max_backtracks), 0) + 1):
         candidate = position + scale * noise
-        j = invariants(
+        candidate_state = invariants(
             deformation_gradient(candidate, static.cells, static.dm_inv)
-        ).j
-        if bool((j.min() >= float(minimum_j)).item()):
+        )
+        admissible = (
+            (candidate_state.j.min() >= admissible_j)
+            & (candidate_state.i1_bar.max() <= admissible_i1)
+            & (candidate_state.i2_bar.max() <= admissible_i2)
+        )
+        if bool(admissible.item()):
             return scale * noise, float(scale)
         scale *= 0.5
     return torch.zeros_like(position), 0.0
+
+
+@torch.no_grad()
+def is_admissible_training_state(
+    static: CHPStatic,
+    position: torch.Tensor,
+    cfg: dict[str, Any],
+) -> bool:
+    """Reject source frames that already violate the potential domain."""
+
+    state = invariants(
+        deformation_gradient(position, static.cells, static.dm_inv)
+    )
+    minimum_j = float(get_cfg(cfg, "training.minimum_start_j", 1.0e-2))
+    maximum_i2 = float(get_cfg(cfg, "training.maximum_start_i2_bar", 1.0e5))
+    valid = (state.j.min() >= minimum_j) & (state.i2_bar.max() <= maximum_i2)
+    return bool(valid.item())
 
 
 def build_sampling_scores(
@@ -736,9 +775,27 @@ def train_chp_epoch(
         start, category = select_rollout_start(
             case.num_steps, horizon, sampling_scores[case_index], rng
         )
+        resamples = 0
+        maximum_resamples = int(get_cfg(cfg, "training.maximum_start_resamples", 16))
+        while True:
+            trajectory = cache.get_slice(case_index, start, start + horizon + 1)
+            position = trajectory.static.reference_position + trajectory.displacement[0]
+            if is_admissible_training_state(
+                trajectory.static, position, cfg
+            ):
+                break
+            resamples += 1
+            if resamples > maximum_resamples:
+                raise RuntimeError(
+                    f"{case.case_id}: no admissible start found after "
+                    f"{maximum_resamples} resamples"
+                )
+            start = int(rng.integers(0, case.num_steps - horizon))
+            category = "admissible-resample"
         category_counts[category] = category_counts.get(category, 0) + 1
-        trajectory = cache.get_slice(case_index, start, start + horizon + 1)
-        position = trajectory.static.reference_position + trajectory.displacement[0]
+        totals["start_resamples"] = totals.get("start_resamples", 0.0) + (
+            float(resamples) * horizon
+        )
         velocity = trajectory.velocity[0]
         moving = ~(trajectory.static.fixed_mask | trajectory.static.prescribed_mask)
         noise, noise_scale = geometry_safe_state_noise(
@@ -748,6 +805,9 @@ def train_chp_epoch(
             smoothing_steps=int(get_cfg(cfg, "training.noise_smoothing_steps", 4)),
             minimum_j=float(get_cfg(cfg, "training.noise_min_j", 0.2)),
             max_backtracks=int(get_cfg(cfg, "training.noise_backtracks", 8)),
+            maximum_invariant_growth=float(
+                get_cfg(cfg, "training.noise_maximum_invariant_growth", 2.0)
+            ),
         )
         position = position + noise
         totals["noise_scale"] = totals.get("noise_scale", 0.0) + noise_scale * horizon

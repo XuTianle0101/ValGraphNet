@@ -339,9 +339,18 @@ class CHPGNS(nn.Module):
         self.residual_channel = VectorChannelLinear(self.vector_dim, 1)
         self.potential = AnalyticPotential(
             order=int(model_cfg.get("potential_order", 2)),
+            i1_init=model_cfg.get("potential_i1_init", 0.5),
+            i2_init=model_cfg.get("potential_i2_init", 0.1),
+            j_init=model_cfg.get("potential_j_init", 1.0),
+            log_j_init=float(model_cfg.get("potential_log_j_init", 1.0)),
             fiber_order=int(model_cfg.get("fiber_order", 0)),
+            fiber_init=model_cfg.get("potential_fiber_init", 0.1),
             inversion_stiffness=float(model_cfg.get("inversion_stiffness", 10.0)),
             minimum_j=float(model_cfg.get("minimum_j", 0.0)),
+            determinant_eps=model_cfg.get("determinant_eps", None),
+            minimum_coefficient=float(
+                model_cfg.get("potential_minimum_coefficient", 1.0e-8)
+            ),
         )
         self.material_scale = (
             nn.Sequential(nn.Linear(self.material_dim, 32), nn.SiLU(), nn.Linear(32, 1))

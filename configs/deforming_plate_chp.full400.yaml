@@ -16,6 +16,13 @@ model:
   vector_dim: 16
   cell_dim: 64
   potential_order: 2
+  # High-order invariant powers need scale-aware positive initialization:
+  # full-400 trajectories contain valid compressed cells with I2_bar > 600.
+  potential_i1_init: [0.5, 1.0e-6]
+  potential_i2_init: [0.01, 1.0e-10]
+  potential_j_init: [1.0, 0.1]
+  potential_log_j_init: 1.0
+  potential_minimum_coefficient: 1.0e-12
   fiber_order: 0
   inversion_stiffness: 10.0
   minimum_j: 0.0
@@ -64,6 +71,10 @@ training:
   noise_smoothing_steps: 4
   noise_min_j: 0.2
   noise_backtracks: 8
+  noise_maximum_invariant_growth: 2.0
+  minimum_start_j: 0.01
+  maximum_start_i2_bar: 1.0e5
+  maximum_start_resamples: 16
   trajectories_per_epoch: 1000
   lr: 1.0e-4
   weight_decay: 1.0e-6
