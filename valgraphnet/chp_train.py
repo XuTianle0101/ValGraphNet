@@ -1821,6 +1821,32 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                 )
             )
             print(f"constitutive pretraining selected teacher rRMSE={selected:.4g}")
+            teacher_threshold = float(
+                get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
+            )
+            if (
+                bool(
+                    get_cfg(
+                        cfg,
+                        "validation.enforce_teacher_stress_gate",
+                        True,
+                    )
+                )
+                and selected >= teacher_threshold
+            ):
+                failure = {
+                    "stage": "constitutive_pretraining",
+                    "teacher_stress_relative_rmse": selected,
+                    "threshold": teacher_threshold,
+                    "action": "stop before dynamics and rollout training",
+                }
+                _save_json(
+                    output_dir / "teacher_stress_gate_failure.json", failure
+                )
+                raise RuntimeError(
+                    "pretrained teacher-forced stress gate failed: "
+                    f"{selected:.4g} >= {teacher_threshold:.4g}"
+                )
         dynamics_sampling_scores = build_acceleration_sampling_scores(
             train_dataset.cases,
             output_dir / "acceleration_sampling_scores.pt",
