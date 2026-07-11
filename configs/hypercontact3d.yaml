@@ -21,9 +21,10 @@ solver:
   minimum_version: "2.18"
   target_increments: 100
   minimum_increment: 1.0e-7
+  contact_formulation: surface_to_surface
+  # K = factor * E / h has units Pa/m; h is the minimum local block spacing.
+  # The dimensionless factor is included in the solver convergence study.
   contact_penalty_factor: 50.0
-  contact_tension_fraction: 0.0025
-  contact_search_factor: 0.05
   friction_coefficient: 0.0
 
 parameter_grid:

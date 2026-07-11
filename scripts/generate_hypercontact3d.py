@@ -27,7 +27,7 @@ import numpy as np
 import yaml
 
 
-GENERATOR_VERSION = "1.4"
+GENERATOR_VERSION = "1.9"
 SCHEMA_VERSION = 1
 
 
@@ -39,6 +39,7 @@ class BlockMesh:
     tetrahedra: np.ndarray
     bottom_nodes: np.ndarray
     top_nodes: np.ndarray
+    top_faces: np.ndarray
     divisions: tuple[int, int, int]
 
 
@@ -150,11 +151,26 @@ def generate_block_mesh(
 
     bottom = np.flatnonzero(np.isclose(nodes[:, 2], 0.0)).astype(np.int64)
     top = np.flatnonzero(np.isclose(nodes[:, 2], lz)).astype(np.int64)
+    top_set = set(int(node) for node in top)
+    # CalculiX C3D4 face labels: S1=(1,2,3), S2=(1,4,2),
+    # S3=(2,4,3), S4=(3,4,1). Store one-based element and face labels.
+    local_faces = ((0, 1, 2), (0, 3, 1), (1, 3, 2), (2, 3, 0))
+    top_faces: list[tuple[int, int]] = []
+    for element_index, tet in enumerate(tetrahedra, start=1):
+        for face_label, local_nodes in enumerate(local_faces, start=1):
+            if all(int(tet[local]) in top_set for local in local_nodes):
+                top_faces.append((element_index, face_label))
+    expected_top_faces = 2 * nx * ny
+    if len(top_faces) != expected_top_faces:
+        raise RuntimeError(
+            f"expected {expected_top_faces} top faces, found {len(top_faces)}"
+        )
     return BlockMesh(
         nodes=nodes,
         tetrahedra=np.asarray(tetrahedra, dtype=np.int64),
         bottom_nodes=bottom,
         top_nodes=top,
+        top_faces=np.asarray(top_faces, dtype=np.int64),
         divisions=(nx, ny, nz),
     )
 
@@ -286,13 +302,12 @@ def render_calculix_deck(
     min_spacing = min(
         size[0] / divisions[0], size[1] / divisions[1], size[2] / divisions[2]
     )
-    # CalculiX recommends 5--50 times the adjacent Young's modulus for the
-    # node-to-face linear penalty parameter.  The second and third values are
-    # the small tensile cutoff and dimensionless contact-search distance c0.
+    # A linear pressure-overclosure slope has units pressure / length. Scale
+    # the adjacent Young's modulus by the local inverse mesh length so the
+    # input remains dimensionally correct in SI units.
     young_modulus = 4.0 * c10 * (1.0 + poisson)
-    penalty = float(solver["contact_penalty_factor"]) * young_modulus
-    tension_cutoff = float(solver.get("contact_tension_fraction", 0.0025)) * c10
-    contact_search_factor = float(solver.get("contact_search_factor", 0.05))
+    penalty_factor = float(solver["contact_penalty_factor"])
+    penalty = penalty_factor * young_modulus / min_spacing
     indentation = float(case.load["indentation_m"])
     imposed_displacement = -(gap + indentation)
 
@@ -335,6 +350,10 @@ def render_calculix_deck(
     lines.extend(_format_ids(int(node) + 1 for node in block.bottom_nodes))
     lines.append("*NSET, NSET=BLOCK_TOP")
     lines.extend(_format_ids(int(node) + 1 for node in block.top_nodes))
+    lines.append("*SURFACE, NAME=BLOCK_CONTACT, TYPE=ELEMENT")
+    lines.extend(
+        f"{int(element)}, S{int(face)}" for element, face in block.top_faces
+    )
     lines.extend(
         [
             "*MATERIAL, NAME=BLOCK_MAT",
@@ -350,13 +369,11 @@ def render_calculix_deck(
             "2.1e11, 0.3",
             "*SHELL SECTION, ELSET=INDENTER, MATERIAL=INDENTER_MAT",
             _fmt(float(geometry["indenter_shell_thickness_m"])),
-            "*SURFACE, NAME=BLOCK_CONTACT, TYPE=NODE",
-            "BLOCK_TOP",
             "*SURFACE, NAME=INDENTER_CONTACT, TYPE=ELEMENT",
             "INDENTER, SPOS",
             "*SURFACE INTERACTION, NAME=CONTACT_PROPERTY",
             "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR",
-            f"{_fmt(penalty)}, {_fmt(tension_cutoff)}, {_fmt(contact_search_factor)}",
+            _fmt(penalty),
         ]
     )
     friction = float(solver.get("friction_coefficient", 0.0))
@@ -364,8 +381,8 @@ def render_calculix_deck(
         lines.extend(["*FRICTION", _fmt(friction)])
     lines.extend(
         [
-            "*CONTACT PAIR, INTERACTION=CONTACT_PROPERTY, TYPE=NODE TO SURFACE",
-            "BLOCK_CONTACT, INDENTER_CONTACT",
+            "*CONTACT PAIR, INTERACTION=CONTACT_PROPERTY, TYPE=SURFACE TO SURFACE",
+            "INDENTER_CONTACT, BLOCK_CONTACT",
             "*BOUNDARY",
             "BOTTOM, 1, 3, 0.",
             "INDENTER_NODES, 1, 2, 0.",
@@ -396,15 +413,17 @@ def render_calculix_deck(
         "block_tetrahedra": int(solid_element_count),
         "bottom_nodes": int(block.bottom_nodes.size),
         "top_nodes": int(block.top_nodes.size),
+        "top_contact_faces": int(block.top_faces.shape[0]),
         "indenter_nodes": int(sphere_node_count),
         "indenter_triangles": int(sphere.triangles.shape[0]),
         "indenter_kinematics": "uniform prescribed translation on all surface nodes",
         "minimum_spacing_m": float(min_spacing),
     }
     derived = {
-        "contact_penalty_parameter_pa": float(penalty),
-        "contact_search_factor": float(contact_search_factor),
-        "contact_tension_cutoff_pa": float(tension_cutoff),
+        "contact_formulation": "surface_to_surface",
+        "contact_characteristic_length_m": float(min_spacing),
+        "contact_penalty_factor": float(penalty_factor),
+        "contact_penalty_stiffness_pa_per_m": float(penalty),
         "d1_pa_inverse": float(d1),
         "imposed_indenter_displacement_m": float(imposed_displacement),
         "indenter_density_kg_m3": float(indenter_density),
@@ -477,12 +496,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
     penalty_factor = float(solver["contact_penalty_factor"])
     if not 5.0 <= penalty_factor <= 50.0:
         raise ValueError("solver.contact_penalty_factor must lie in the recommended [5, 50]")
-    tension_fraction = float(solver.get("contact_tension_fraction", 0.0025))
-    if not 0.0 < tension_fraction < 0.05:
-        raise ValueError("solver.contact_tension_fraction must lie in (0, 0.05)")
-    search_factor = float(solver.get("contact_search_factor", 0.05))
-    if not 0.0 < search_factor <= 1.0:
-        raise ValueError("solver.contact_search_factor must lie in (0, 1]")
+    if solver.get("contact_formulation") != "surface_to_surface":
+        raise ValueError(
+            "solver.contact_formulation must be surface_to_surface to avoid "
+            "mesh-dependent missed contact"
+        )
     _require_int_at_least(solver["target_increments"], 1, "solver.target_increments")
     _require_finite_positive(solver["minimum_increment"], "solver.minimum_increment")
     friction = float(solver.get("friction_coefficient", 0.0))

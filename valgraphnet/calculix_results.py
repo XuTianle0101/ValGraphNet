@@ -872,6 +872,7 @@ def convert_case(
     )
     metadata = {
         "case_id": str(entry["case_id"]),
+        "benchmark_provenance": dict(entry.get("benchmark_provenance", {})),
         "cell_representation": "four-node C3D4 linear tetrahedra",
         "contact_surface_mask": "BLOCK_TOP plus all prescribed INDENTER_NODES",
         "derived_kinematics": "V and A are finite differences with respect to static step time",
@@ -881,6 +882,8 @@ def convert_case(
         ),
         "frd": str(frd_path),
         "dat": str(dat_path) if dat_path.is_file() else None,
+        "deck_sha256": str(entry.get("deck_sha256", "")),
+        "derived_solver_parameters": derived_parameters,
         "num_cells": int(mesh.cells.shape[0]),
         "num_block_nodes": block_node_count,
         "num_frames": int(times.shape[0]),
@@ -888,6 +891,7 @@ def convert_case(
         "num_indenter_triangles": int(mesh.indenter_triangles.shape[0]),
         "num_nodes": int(mesh.nodes.shape[0]),
         "material_feature_names": list(MATERIAL_FEATURE_NAMES),
+        "mesh_statistics": dict(entry.get("mesh_statistics", {})),
         "parameters": parameters,
         "prepended_zero_reference_frame": prepended_reference,
         "schema_version": 2,
@@ -947,9 +951,22 @@ def convert_benchmark(
             if not force:
                 raise FileExistsError(f"refusing to replace converted case: {destination}")
             shutil.rmtree(destination)
+        enriched_entry = dict(entry)
+        enriched_entry["benchmark_provenance"] = {
+            key: manifest[key]
+            for key in (
+                "benchmark",
+                "config_sha256",
+                "generator_version",
+                "schema_version",
+                "solver",
+                "units",
+            )
+            if key in manifest
+        }
         record = convert_case(
             benchmark_root,
-            entry,
+            enriched_entry,
             destination,
             require_dat_stress=require_dat_stress,
         )

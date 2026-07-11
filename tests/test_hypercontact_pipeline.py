@@ -133,6 +133,8 @@ def test_conversion_writes_loadable_constitutive_case(tmp_path):
     assert metadata["stress_source"].startswith("CalculiX DAT")
     assert metadata["prepended_zero_reference_frame"]
     assert "quasi-static" in metadata["time_semantics"]
+    assert metadata["deck_sha256"] == entry["deck_sha256"]
+    assert metadata["derived_solver_parameters"]["step_duration"] == 1.0
 
 
 def test_explicit_contact_surface_and_prescribed_state_are_exact(tmp_path):

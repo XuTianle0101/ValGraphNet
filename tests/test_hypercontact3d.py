@@ -37,9 +37,8 @@ def _tiny_config():
             "minimum_version": "2.18",
             "target_increments": 20,
             "minimum_increment": 1e-7,
+            "contact_formulation": "surface_to_surface",
             "contact_penalty_factor": 50.0,
-            "contact_tension_fraction": 0.0025,
-            "contact_search_factor": 0.05,
             "friction_coefficient": 0.0,
         },
         "parameter_grid": {
@@ -83,6 +82,7 @@ def test_block_mesh_has_expected_counts_and_positive_orientations():
     assert mesh.tetrahedra.shape == (2 * 3 * 1 * 6, 4)
     assert mesh.bottom_nodes.size == (2 + 1) * (3 + 1)
     assert mesh.top_nodes.size == (2 + 1) * (3 + 1)
+    assert mesh.top_faces.shape == (2 * 2 * 3, 2)
     coordinates = mesh.nodes[mesh.tetrahedra]
     signed_six_volume = np.linalg.det(
         np.stack(
@@ -127,9 +127,9 @@ def test_deck_contains_hyperelastic_contact_rigid_body_and_full_outputs():
     required_cards = (
         "*ELEMENT, TYPE=C3D4, ELSET=BLOCK",
         "*HYPERELASTIC, NEO HOOKE",
-        "*SURFACE, NAME=BLOCK_CONTACT, TYPE=NODE",
+        "*SURFACE, NAME=BLOCK_CONTACT, TYPE=ELEMENT",
         "*SURFACE, NAME=INDENTER_CONTACT, TYPE=ELEMENT",
-        "*CONTACT PAIR, INTERACTION=CONTACT_PROPERTY, TYPE=NODE TO SURFACE",
+        "*CONTACT PAIR, INTERACTION=CONTACT_PROPERTY, TYPE=SURFACE TO SURFACE",
         "*STEP, NLGEOM",
         "*NODE FILE, FREQUENCY=1, GLOBAL=YES",
         "*EL FILE, FREQUENCY=1",
@@ -147,12 +147,14 @@ def test_deck_contains_hyperelastic_contact_rigid_body_and_full_outputs():
     assert "INDENTER_NODES, 3, 3," in deck
     assert metadata["mesh_statistics"]["block_tetrahedra"] == 6 * 2 * 2 * 1
     assert metadata["derived"]["d1_pa_inverse"] > 0.0
-    assert metadata["derived"]["contact_tension_cutoff_pa"] > 0.0
+    assert metadata["derived"]["contact_penalty_stiffness_pa_per_m"] > 0.0
+    assert metadata["derived"]["contact_characteristic_length_m"] > 0.0
+    assert metadata["derived"]["contact_formulation"] == "surface_to_surface"
     assert metadata["derived"]["imposed_indenter_displacement_m"] < 0.0
     assert metadata["derived"]["indenter_density_kg_m3"] == 7800.0
     assert metadata["derived"]["indenter_shell_thickness_m"] > 0.0
     assert metadata["derived"]["step_duration"] == 1.0
-    assert "BLOCK_CONTACT, INDENTER_CONTACT" in deck
+    assert "INDENTER_CONTACT, BLOCK_CONTACT" in deck
     in_element_block = False
     for line in deck.splitlines():
         if line.startswith("*ELEMENT"):
@@ -255,8 +257,8 @@ def test_numeric_yaml_strings_are_canonical_json_numbers():
     assert selected.material["c10_pa"] == 250000.0
 
 
-def test_chp_v1_4_config_is_gpu_bf16_quasistatic_and_reference_free():
-    path = Path("configs/hypercontact3d_chp.v1_4.yaml")
+def test_chp_v1_9_config_is_gpu_bf16_quasistatic_and_reference_free():
+    path = Path("configs/hypercontact3d_chp.v1_9.yaml")
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     assert config["training"]["device"] == "cuda"
@@ -275,3 +277,11 @@ def test_chp_v1_4_config_is_gpu_bf16_quasistatic_and_reference_free():
     assert requirements["full_integration_point_stress_tensor"]
     assert requirements["material_feature_names"]
     assert "quasi-static" in requirements["time_semantics"]
+
+
+def test_production_contact_is_face_based_and_penalty_is_dimensionless():
+    config = yaml.safe_load(Path("configs/hypercontact3d.yaml").read_text(encoding="utf-8"))
+    assert config["solver"]["contact_formulation"] == "surface_to_surface"
+    assert 5.0 <= config["solver"]["contact_penalty_factor"] <= 50.0
+    assert "contact_search_factor" not in config["solver"]
+    assert "contact_tension_fraction" not in config["solver"]

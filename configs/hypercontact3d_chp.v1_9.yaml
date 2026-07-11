@@ -1,12 +1,12 @@
-# CHP-GNS pilot for solver-backed HyperContact-3D v1.4 cases. CalculiX time is
+# CHP-GNS pilot for solver-backed HyperContact-3D v1.9 cases. CalculiX time is
 # a normalized quasi-static load parameter; V/A are path derivatives, not
 # physical transient kinematics. Neural blocks run in BF16 on CUDA while all
 # tetrahedral mechanics, determinants, stress, and assembly remain FP32.
 seed: 42
 
 data:
-  root: data/hypercontact3d_cases_v1_4
-  split_file: data/hypercontact3d_cases_v1_4/splits.json
+  root: data/hypercontact3d_cases_v1_9
+  split_file: data/hypercontact3d_cases_v1_9/splits.json
   train_split: train
   val_split: validation
   test_split: test_id
@@ -18,6 +18,9 @@ data:
       - time_semantics
       - contact_surface_mask
       - rigid_indenter.prescribed_displacement
+      - benchmark_provenance.generator_version
+      - derived_solver_parameters.contact_formulation
+      - derived_solver_parameters.contact_penalty_stiffness_pa_per_m
     required_files:
       - nodes.npy
       - elements.npy
@@ -141,7 +144,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/hypercontact3d_chp_v1_4_seed42
+  output_dir: outputs/hypercontact3d_chp_v1_9_seed42
   resume_from: auto
 
 validation:
