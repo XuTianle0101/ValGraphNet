@@ -11,6 +11,7 @@ from valgraphnet.chp_train import (
     _assert_no_gate_failure_artifact,
     _enforce_scientific_gates,
     _scientific_gate_status,
+    _save_constitutive_gate_artifact,
     acceleration_frame_scores,
     curriculum_horizon,
     fit_chp_normalizers,
@@ -152,6 +153,36 @@ def test_quasistatic_protocol_rejects_transient_losses_and_pretraining():
     transient_pretrain["dynamics_pretraining"]["enabled"] = True
     with pytest.raises(ValueError, match="dynamics pretraining"):
         validate_chp_problem_semantics(transient_pretrain)
+
+
+def test_failed_constitutive_gate_state_is_auditable_but_not_rollout_loadable(
+    tmp_path,
+):
+    path = tmp_path / "constitutive_gate.pt"
+    model = torch.nn.Linear(2, 1)
+    normalizers = SimpleNamespace(
+        state_dict=lambda: {"displacement_scale": torch.tensor(1.0)}
+    )
+    _save_constitutive_gate_artifact(
+        path,
+        model,
+        normalizers,
+        {"seed": 42},
+        material_dim=0,
+        pretraining={
+            "selected_teacher_stress_relative_rmse": 0.7,
+            "selected_teacher_stress_source": NODAL_STRESS_FALLBACK_SOURCE,
+            "selected_teacher_stress_label_coverage": 1.0,
+        },
+        threshold=0.5,
+        enforced=True,
+    )
+    artifact = torch.load(path, map_location="cpu", weights_only=False)
+    assert artifact["artifact_type"] == "constitutive_teacher_gate"
+    assert not artifact["teacher_stress_gate_passed"]
+    assert "no rollout claim" in artifact["scientific_scope"]
+    with pytest.raises(ValueError, match="legacy checkpoint"):
+        validate_chp_checkpoint_semantics(artifact, source=path)
 
 
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():

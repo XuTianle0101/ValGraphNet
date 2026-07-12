@@ -2306,14 +2306,25 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             teacher_threshold = float(
                 get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
             )
-            if (
-                bool(
-                    get_cfg(
-                        cfg,
-                        "validation.enforce_teacher_stress_gate",
-                        True,
-                    )
+            enforce_teacher_gate = bool(
+                get_cfg(
+                    cfg,
+                    "validation.enforce_teacher_stress_gate",
+                    True,
                 )
+            )
+            _save_constitutive_gate_artifact(
+                output_dir / "constitutive_gate.pt",
+                model,
+                normalizers,
+                cfg,
+                material_dim=material_dim,
+                pretraining=pretraining,
+                threshold=teacher_threshold,
+                enforced=enforce_teacher_gate,
+            )
+            if (
+                enforce_teacher_gate
                 and selected >= teacher_threshold
             ):
                 failure = {
@@ -3428,6 +3439,54 @@ def _checkpoint_payload(
         "material_dim": int(material_dim),
         "config": cfg,
     }
+
+
+def _save_constitutive_gate_artifact(
+    path: Path,
+    model: CHPGNS,
+    normalizers: CHPNormalizers,
+    cfg: dict[str, Any],
+    *,
+    material_dim: int,
+    pretraining: dict[str, Any],
+    threshold: float,
+    enforced: bool,
+) -> None:
+    """Preserve an auditable teacher-gate state without making it rollout-valid."""
+
+    selected = float(
+        pretraining.get("selected_teacher_stress_relative_rmse", float("inf"))
+    )
+    payload = {
+        # Deliberately distinct from the schema-v2 rollout checkpoint contract.
+        "schema_version": 1,
+        "artifact_type": "constitutive_teacher_gate",
+        "architecture": "CHP-GNS",
+        "dynamics_schema_version": CHPGNS.dynamics_schema_version,
+        "teacher_stress_relative_rmse": selected,
+        "teacher_stress_source": str(
+            pretraining.get("selected_teacher_stress_source", "unavailable")
+        ),
+        "teacher_stress_label_coverage": float(
+            pretraining.get("selected_teacher_stress_label_coverage", 0.0)
+        ),
+        "teacher_stress_threshold": float(threshold),
+        "teacher_stress_gate_enforced": bool(enforced),
+        "teacher_stress_gate_passed": bool(selected < float(threshold)),
+        "scientific_scope": "teacher-forced constitutive audit only; no rollout claim",
+        "material_dim": int(material_dim),
+        "model": {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        },
+        "normalizers": normalizers.state_dict(),
+        "config": cfg,
+        "pretraining": pretraining,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def _require_cuda(cfg: dict[str, Any]) -> torch.device:
