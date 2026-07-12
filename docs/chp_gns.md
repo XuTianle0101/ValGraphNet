@@ -132,15 +132,47 @@ and fiber directions before it is included in a paper claim.
 
 ## Current falsifiable evidence
 
-- The first low-order deforming-plate CHP pilot stopped at teacher-forced
-  stress rRMSE `0.69265 > 0.50`; no later rollout or test result from that run is
-  considered valid evidence.
-- Objective constitutive-ambiguity ratios are `0.03928` on deforming_plate and
-  `0.08519` on HyperContact, both below the pre-registered `0.10` cell-memory
-  trigger. Cell memory therefore remains disabled.
-- HyperContact v1.9 has 168/168 audited 101-frame cases, positive deformation
-  determinants (`min J=0.67518`), non-zero full cell/IP stress and solver
-  reactions. Reassembled Neo-Hookean internal force plus fixed reaction has a
-  worst-case relative residual of `2.08e-5`.
-- Valve/Abaqus remains blocked until real ODB files satisfying the strict
-  tensor/material/density/fiber contract are supplied.
+All numbers below are read from the cited local artifacts. `FINAL-VAL20` means
+that the validation result is complete and frozen; it does **not** mean that a
+final test result exists. `PARTIAL`, `DIAGNOSTIC ONLY`, and `FAILED GATE` rows
+must not be promoted to headline comparisons.
+
+| Evidence | Status and scope | Result | Local artifact |
+|---|---|---|---|
+| Native MGN | **FINAL-VAL20**; 20 evenly selected validation trajectories, all 400 frames | moving displacement rRMSE `1.291795`; final displacement rRMSE `210.644627`; stress rRMSE `0.769733`; P95-stress rRMSE `0.686852`; `0/20` diverged | `outputs/deforming_plate_chp_evidence/native_val20/metrics.json` |
+| Fair MGN | **PARTIAL (not final)**; training records currently reach epoch 5, but the only rollout is the epoch-3 validation checkpoint | moving `2.417227`; final `283.234955`; stress `0.658701`; P95 stress `0.688011`; `0/20` diverged. This is neither the completed 30-epoch result nor a frozen best-checkpoint result. | `outputs/deforming_plate_fair_mgn_full400_seed42/history.json` |
+| Low-order analytic CHP | **FAILED GATE** | constitutive-pretrain teacher rRMSE `0.718619`; after four K=1 epochs, teacher rRMSE `0.692647 > 0.50` and `16/20` validation rollouts diverged. K=2--16 and test were not run. | `outputs/deforming_plate_chp_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_full400_seed42/history.json`; `outputs/deforming_plate_chp_full400_seed42/teacher_stress_gate_failure.json` |
+| Raw ridge CHP | **FAILED GATE** before dynamics/rollout | selected teacher rRMSE `0.874068 > 0.50` | `outputs/deforming_plate_chp_ridge_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_ridge_full400_seed42/teacher_stress_gate_failure.json` |
+| Robust mask-aligned base CHP | **FAILED GATE** before dynamics/rollout | selected teacher rRMSE `0.520473 > 0.50` | `outputs/deforming_plate_chp_base_mask_aligned_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_base_mask_aligned_full400_seed42/teacher_stress_gate_failure.json` |
+| Normalized mask-aligned ridge-8 CHP | **FAILED GATE** before dynamics/rollout | selected teacher rRMSE `0.521642 > 0.50` | `outputs/deforming_plate_chp_ridge8_mask_aligned_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_ridge8_mask_aligned_full400_seed42/teacher_stress_gate_failure.json` |
+| GPU direct-control stress decoder | **DIAGNOSTIC ONLY**; fixed final epoch selected before validation; 20 train and 20 validation cases, 16 frames/case | post-hoc train rRMSE/P95 `0.211840/0.195026`; validation rRMSE/P95 `0.223264/0.181564`; RTX 4060 Ti CUDA BF16/FP32 peak allocation `0.101559 GiB` | `outputs/deforming_plate_constitutive_identifiability_seed20260712/metrics.val20.json`; `outputs/deforming_plate_constitutive_identifiability_seed20260712/provenance.json` |
+| HyperContact-3D v1.9 | **DATA AUDIT PASSED**, not a trained-model result | `168/168` 101-frame cases passed; full finite cell/IP Cauchy tensors and non-zero reactions; `min J=0.675179`; maximum cell stress `10.772040 MPa`; maximum reaction `682.881 N`; worst Neo-Hookean internal-force-plus-reaction relative residual `2.079e-5` | `outputs/hypercontact3d_v1_9_converted_audit.json` |
+| Valve/Abaqus | **BLOCKED** | no real ODB is present; full cell/IP stress, material, density, and fiber fields cannot be fabricated | `outputs/deforming_plate_chp_evidence/external_benchmark_status.json` |
+| Deforming-plate frozen test-once evaluation | **UNTOUCHED** for the current protocol | no frozen CHP/fair/MultiScale/repository test metric has been produced; the table contains validation or diagnostic evidence only | no result artifact by design |
+
+The direct-control row is a non-negative **scalar stress decoder**, not a scalar
+energy potential. It neither produces a full stress tensor nor generates
+internal force, so its low teacher-forced error is evidence of learnable signal
+in the invariant inputs, not evidence of constitutive consistency and not a
+CHP result.
+
+The ground-truth stress is not zero. The label-only audit reports a non-zero
+fraction of `0.946340`, absolute stress median `12.210 kPa`, P95 `86.556 kPa`,
+and maximum `1.155504 MPa` across the 100 deforming-plate test trajectories
+(`outputs/deforming_plate_chp_evidence/ground_truth_audit.json`). The
+`standard_reference` row has zero error only because it compares each truth
+array with itself. It is not a zero-valued physical solution. The native final
+displacement rRMSE is especially large because the final truth-displacement
+denominator is very small; its corresponding physical RMSE is `0.04434 m`.
+
+The current protocol's frozen model test-once evaluation has not been run.
+There are legacy pre-protocol test outputs in the repository and the preceding
+label-only test audit, so “untouched” here means no test inference or test score
+has been used for the current model/hyperparameter selection; it does not claim
+that the test files have never been read.
+
+Objective constitutive-ambiguity ratios are `0.03928` on deforming_plate and
+`0.08519` on HyperContact, both below the pre-registered `0.10` cell-memory
+trigger. Cell memory therefore remains disabled
+(`outputs/deforming_plate_chp_evidence/cell_memory_diagnostic.json` and
+`outputs/hypercontact3d_chp_evidence/cell_memory_diagnostic.json`).
