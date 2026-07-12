@@ -134,17 +134,19 @@ and fiber directions before it is included in a paper claim.
 
 All numbers below are read from the cited local artifacts. `FINAL-VAL20` means
 that the validation result is complete and frozen; it does **not** mean that a
-final test result exists. `PARTIAL`, `DIAGNOSTIC ONLY`, and `FAILED GATE` rows
-must not be promoted to headline comparisons.
+final test result exists. `PARTIAL`, `DIAGNOSTIC ONLY`, `FAILED GATE`, and
+`DYNAMICS/ROLLOUT INCOMPLETE` rows must not be promoted to headline
+comparisons.
 
 | Evidence | Status and scope | Result | Local artifact |
 |---|---|---|---|
 | Native MGN | **FINAL-VAL20**; 20 evenly selected validation trajectories, all 400 frames | moving displacement rRMSE `1.291795`; final displacement rRMSE `210.644627`; stress rRMSE `0.769733`; P95-stress rRMSE `0.686852`; `0/20` diverged | `outputs/deforming_plate_chp_evidence/native_val20/metrics.json` |
-| Fair MGN | **PARTIAL (not final)**; training records currently reach epoch 5, but the only rollout is the epoch-3 validation checkpoint | moving `2.417227`; final `283.234955`; stress `0.658701`; P95 stress `0.688011`; `0/20` diverged. This is neither the completed 30-epoch result nor a frozen best-checkpoint result. | `outputs/deforming_plate_fair_mgn_full400_seed42/history.json` |
+| Fair MGN | **PARTIAL (not final)**; training history currently reaches epoch 7 | The epoch-6 rollout regressed severely (moving `14.536056`; final `2177.868164`; stress `0.981129`; P95 stress `0.580530`; minimax score `11.252604`), so the best remains epoch 3: moving `2.417227`; final `283.234955`; stress `0.658701`; P95 stress `0.688011`; `0/20` diverged. Neither checkpoint is the completed 30-epoch result. | `outputs/deforming_plate_fair_mgn_full400_seed42/history.json` |
 | Low-order analytic CHP | **FAILED GATE** | constitutive-pretrain teacher rRMSE `0.718619`; after four K=1 epochs, teacher rRMSE `0.692647 > 0.50` and `16/20` validation rollouts diverged. K=2--16 and test were not run. | `outputs/deforming_plate_chp_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_full400_seed42/history.json`; `outputs/deforming_plate_chp_full400_seed42/teacher_stress_gate_failure.json` |
 | Raw ridge CHP | **FAILED GATE** before dynamics/rollout | selected teacher rRMSE `0.874068 > 0.50` | `outputs/deforming_plate_chp_ridge_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_ridge_full400_seed42/teacher_stress_gate_failure.json` |
 | Robust mask-aligned base CHP | **FAILED GATE** before dynamics/rollout | selected teacher rRMSE `0.520473 > 0.50` | `outputs/deforming_plate_chp_base_mask_aligned_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_base_mask_aligned_full400_seed42/teacher_stress_gate_failure.json` |
 | Normalized mask-aligned ridge-8 CHP | **FAILED GATE** before dynamics/rollout | selected teacher rRMSE `0.521642 > 0.50` | `outputs/deforming_plate_chp_ridge8_mask_aligned_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_ridge8_mask_aligned_full400_seed42/teacher_stress_gate_failure.json` |
+| Neural-feature potential CHP | **TEACHER GATE PASSED; DYNAMICS/ROLLOUT INCOMPLETE** | selected epoch-11 teacher rRMSE/P95 `0.232305/0.172312 < 0.50`; `317/320` requested frames were mechanically admissible (`0.990625` coverage). The selected dynamics-pretrain score was `0.999806`, with active-acceleration rRMSE `0.999806` and position-increment rRMSE `0.885165`, which does not demonstrate useful learned dynamics. K=1 epoch 1 completed, but epoch 2 stopped at `train_00040`, frame `340`, when the default FP32 gradient-norm reduction overflowed; diagnostic replay found that large individual gradients can still be finite. No K=1 validation rollout, K=2--16 result, or test claim exists. | `outputs/deforming_plate_chp_neural_feature_energy_full400_seed42/constitutive_pretraining.json`; `outputs/deforming_plate_chp_neural_feature_energy_full400_seed42/dynamics_pretraining.json`; `outputs/deforming_plate_chp_neural_feature_energy_full400_seed42/history.json`; `outputs/deforming_plate_chp_neural_feature_energy_seed42.stderr.log` |
 | GPU direct-control stress decoder | **DIAGNOSTIC ONLY**; fixed final epoch selected before validation; 20 train and 20 validation cases, 16 frames/case | post-hoc train rRMSE/P95 `0.211840/0.195026`; validation rRMSE/P95 `0.223264/0.181564`; RTX 4060 Ti CUDA BF16/FP32 peak allocation `0.101559 GiB` | `outputs/deforming_plate_constitutive_identifiability_seed20260712/metrics.val20.json`; `outputs/deforming_plate_constitutive_identifiability_seed20260712/provenance.json` |
 | HyperContact-3D v1.9 | **DATA AUDIT PASSED**, not a trained-model result | `168/168` 101-frame cases passed; full finite cell/IP Cauchy tensors and non-zero reactions; `min J=0.675179`; maximum cell stress `10.772040 MPa`; maximum reaction `682.881 N`; worst Neo-Hookean internal-force-plus-reaction relative residual `2.079e-5` | `outputs/hypercontact3d_v1_9_converted_audit.json` |
 | Valve/Abaqus | **BLOCKED** | no real ODB is present; full cell/IP stress, material, density, and fiber fields cannot be fabricated | `outputs/deforming_plate_chp_evidence/external_benchmark_status.json` |
@@ -155,6 +157,13 @@ energy potential. It neither produces a full stress tensor nor generates
 internal force, so its low teacher-forced error is evidence of learnable signal
 in the invariant inputs, not evidence of constitutive consistency and not a
 CHP result.
+
+The neural-feature potential teacher gate also uses deforming_plate's
+`nodal_scalar_vm_fallback`, because this dataset supplies only a nodal scalar
+stress label. It is a valid scalar teacher-gate pass for the shared potential,
+but it is **not** tensor-supervision evidence. The failed second K=1 epoch and
+absence of a K=1 validation rollout mean it is not yet evidence of stable
+state evolution, long-horizon accuracy, or an improvement over any baseline.
 
 The ground-truth stress is not zero. The label-only audit reports a non-zero
 fraction of `0.946340`, absolute stress median `12.210 kPa`, P95 `86.556 kPa`,
