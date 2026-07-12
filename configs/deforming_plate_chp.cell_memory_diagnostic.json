@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "dataset": "DeepMind deforming_plate full 400-frame export",
+  "case_root": "data/deforming_plate_cases_400",
+  "split_file": "data/deforming_plate_cases_400/splits.json",
+  "split_file_sha256": "9ef83c37572deba546dde185fb75ee1cb0f9a075d93039b1ac12c4259f35329f",
+  "split": "train",
+  "sampling": {
+    "cases": 20,
+    "frames": 20,
+    "cells": 512,
+    "max_samples": 50000,
+    "neighbors": 16
+  },
+  "samples": 50000,
+  "conditional_to_global_variance": 0.039279630743617115,
+  "trigger_threshold": 0.1,
+  "enable_cell_memory": false,
+  "stress_source": "objective cell mean/von-Mises invariants when tensor6 is available; otherwise tetra nodal scalar mean",
+  "conditioning": "strain invariants, optional fiber stretch, material features",
+  "decision": "Do not enable cell memory for the deforming_plate ablation because the train-only diagnostic does not exceed 0.10."
+}

@@ -25,7 +25,41 @@ from valgraphnet.chp_train import (
 )
 from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
-from valgraphnet.physical_evaluation import evaluate_prediction_directory
+from valgraphnet.physical_evaluation import (
+    evaluate_prediction_directory,
+    select_case_ids,
+)
+
+
+def _select_rollout_cases(
+    cases: list[Any], max_cases: int | None, case_selection: str
+) -> list[Any]:
+    """Apply the same deterministic subset policy used by physical metrics."""
+
+    selected_ids = select_case_ids(
+        [str(case.case_id) for case in cases], max_cases, case_selection
+    )
+    case_by_id = {str(case.case_id): case for case in cases}
+    if len(case_by_id) != len(cases):
+        raise ValueError("CHP rollout case ids must be unique")
+    return [case_by_id[case_id] for case_id in selected_ids]
+
+
+def _resolve_rollout_split(cfg: dict[str, Any], split: str | None) -> str:
+    """Prevent development-only ablation configs from touching held-out test data."""
+
+    if bool(get_cfg(cfg, "ablation.development_only", False)):
+        allowed = str(get_cfg(cfg, "ablation.evaluation_split", ""))
+        if not allowed or "test" in allowed.lower():
+            raise ValueError("development-only ablation has an unsafe evaluation split")
+        selected = allowed if split is None else str(split)
+        if selected != allowed:
+            raise ValueError(
+                "development-only CHP ablations may evaluate only "
+                f"{allowed!r}, not {selected!r}"
+            )
+        return selected
+    return str(split or get_cfg(cfg, "data.test_split", "test"))
 
 
 @torch.no_grad()
@@ -39,6 +73,7 @@ def run_chp_rollouts(
 ) -> dict[str, Any]:
     """Export complete GPU predictions and standardized physical metrics."""
 
+    requested_split = _resolve_rollout_split(cfg, split)
     device = _require_cuda(cfg)
     checkpoint = _torch_load(checkpoint_path, device)
     validate_chp_checkpoint_semantics(
@@ -63,18 +98,18 @@ def run_chp_rollouts(
         "data.split_file",
         get_cfg(effective_cfg, "data.case_split_file", None),
     )
-    selected_split = split or str(get_cfg(effective_cfg, "data.test_split", "test"))
+    selected_split = _resolve_rollout_split(effective_cfg, requested_split)
     if root is None or split_file is None:
         raise ValueError("CHP rollout requires data root and split file")
     dataset = ValveGraphDataset(
         root, effective_cfg, split=selected_split, split_file=split_file
     )
-    cases = dataset.cases
+    all_cases = dataset.cases
     limit = max_cases
     if limit is None:
         limit = get_cfg(cfg, "evaluation.max_cases", None)
-    if limit is not None:
-        cases = cases[: max(int(limit), 0)]
+    case_selection = str(get_cfg(cfg, "evaluation.case_selection", "head"))
+    cases = _select_rollout_cases(all_cases, limit, case_selection)
     cache = CHPCaseCache(
         cases,
         device,
@@ -216,6 +251,8 @@ def run_chp_rollouts(
         "checkpoint": str(Path(checkpoint_path).resolve()),
         "device": torch.cuda.get_device_name(device),
         "amp_dtype": str(amp_dtype).removeprefix("torch."),
+        "split": str(selected_split),
+        "case_selection": case_selection,
         "seconds": time.perf_counter() - start_time,
         "peak_memory_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
         "cases": manifest_cases,
@@ -228,6 +265,7 @@ def run_chp_rollouts(
         selected_split,
         output,
         output_path=output / "metrics.json",
-        max_cases=max_cases,
+        max_cases=limit,
+        case_selection=case_selection,
     )
     return {"manifest": manifest, "metrics": metrics}

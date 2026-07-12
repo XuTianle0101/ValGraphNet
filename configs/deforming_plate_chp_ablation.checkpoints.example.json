@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "checkpoints": {
+    "chp_full": {
+      "42": "outputs/deforming_plate_chp_ablation/chp_full_seed42/best.pt"
+    },
+    "one_step": {
+      "42": "outputs/deforming_plate_chp_ablation/one_step_seed42/best.pt"
+    },
+    "no_work_energy": {
+      "42": "outputs/deforming_plate_chp_ablation/no_work_energy_seed42/best.pt"
+    }
+  }
+}

@@ -1,0 +1,121 @@
+# Development-only CHP-GNS ablation protocol.  This matrix may materialize
+# training configs, but its runner can only evaluate existing checkpoints on
+# the fixed validation subset.  It has deliberately no test execution mode.
+schema_version: 1
+name: deforming_plate_chp_validation_ablation
+base_config: configs/deforming_plate_chp.full400.yaml
+seeds: [42]
+
+protocol:
+  development_only: true
+  evaluation_split: val
+  cases: 20
+  steps: 399
+  case_selection: even
+  require_cuda: true
+  require_bf16: true
+  require_scientific_gates: true
+  forbidden_split_tokens: [test, test_id, test_geometry_ood, test_material_ood]
+
+cell_memory_diagnostic:
+  result_file: configs/deforming_plate_chp.cell_memory_diagnostic.json
+  threshold: 0.10
+  split: train
+  command:
+    - .venv/Scripts/python.exe
+    - scripts/diagnose_cell_memory.py
+    - --case-root
+    - data/deforming_plate_cases_400
+    - --split-file
+    - data/deforming_plate_cases_400/splits.json
+    - --split
+    - train
+    - --cases
+    - "20"
+    - --frames
+    - "20"
+    - --cells
+    - "512"
+    - --max-samples
+    - "50000"
+    - --neighbors
+    - "16"
+    - --threshold
+    - "0.10"
+
+variants:
+  chp_full:
+    axis: reference
+    status: runnable
+    description: Constitutive potential, topology hierarchy, conservative contact, long-horizon curriculum, and work-energy loss.
+    overrides:
+      training:
+        output_dir: outputs/deforming_plate_chp_ablation/chp_full_seed42
+
+  one_step:
+    axis: rollout_training
+    status: runnable
+    description: Matched CHP-GNS trained only at K=1 for the same 16 epochs.
+    overrides:
+      training:
+        epochs: 16
+        curriculum:
+          - {horizon: 1, epochs: 16}
+        checkpoint_min_horizon: 1
+        output_dir: outputs/deforming_plate_chp_ablation/one_step_seed42
+
+  no_work_energy:
+    axis: work_energy
+    status: runnable
+    description: Matched CHP-GNS with only the work-energy loss weight set to zero.
+    overrides:
+      loss:
+        work_energy: 0.0
+      training:
+        output_dir: outputs/deforming_plate_chp_ablation/no_work_energy_seed42
+
+  direct_decoder:
+    axis: constitutive_decoder
+    status: blocked
+    missing_capability: matched_chp_direct_state_stress_decoder
+    blocked_reason: The repository has direct-decoder baselines, but none preserves the CHP processor, force update, parameter budget, and training protocol; labeling one as a single-factor ablation would be confounded.
+
+  flat_processor:
+    axis: hierarchy
+    status: blocked
+    missing_capability: flat_scalar_vector_processor_switch
+    blocked_reason: CHPGNS currently constructs HierarchicalScalarVectorProcessor unconditionally and exposes no matched flat processor.
+
+  unconstrained_contact:
+    axis: contact_conservation
+    status: blocked
+    missing_capability: unconstrained_pair_force_scatter
+    blocked_reason: PairForceHeads always scatters equal-and-opposite pair forces; there is no matched unconstrained contact head.
+
+  cell_memory:
+    axis: cell_memory
+    status: blocked
+    conditional_on: cell_memory_diagnostic
+    missing_capability: recurrent_cell_state
+    blocked_reason: No recurrent cell state is implemented. This variant is required only if the pinned train-only diagnostic exceeds 0.10.
+
+comparisons:
+  direct_decoder_vs_potential:
+    variants: [direct_decoder, chp_full]
+    required: true
+  flat_vs_hierarchy:
+    variants: [flat_processor, chp_full]
+    required: true
+  unconstrained_vs_action_reaction_contact:
+    variants: [unconstrained_contact, chp_full]
+    required: true
+  one_step_vs_long_horizon_curriculum:
+    variants: [one_step, chp_full]
+    required: true
+  without_vs_with_work_energy:
+    variants: [no_work_energy, chp_full]
+    required: true
+  without_vs_with_cell_memory:
+    variants: [chp_full, cell_memory]
+    required: true
+    conditional_on: cell_memory_diagnostic

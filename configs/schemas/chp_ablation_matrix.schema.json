@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valgraphnet.local/schemas/chp-ablation-matrix-v1.json",
+  "title": "Validation-only CHP-GNS ablation matrix",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "name",
+    "base_config",
+    "seeds",
+    "protocol",
+    "cell_memory_diagnostic",
+    "variants",
+    "comparisons"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "name": {"type": "string", "minLength": 1},
+    "base_config": {"type": "string", "minLength": 1},
+    "seeds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "integer"}
+    },
+    "protocol": {
+      "type": "object",
+      "required": [
+        "development_only",
+        "evaluation_split",
+        "cases",
+        "steps",
+        "case_selection",
+        "require_cuda",
+        "require_bf16",
+        "require_scientific_gates",
+        "forbidden_split_tokens"
+      ],
+      "properties": {
+        "development_only": {"const": true},
+        "evaluation_split": {"type": "string", "minLength": 1},
+        "cases": {"type": "integer", "minimum": 1},
+        "steps": {"type": "integer", "minimum": 1},
+        "case_selection": {"const": "even"},
+        "require_cuda": {"const": true},
+        "require_bf16": {"const": true},
+        "require_scientific_gates": {"const": true},
+        "forbidden_split_tokens": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
+    "variants": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["axis", "status"],
+        "properties": {
+          "axis": {"type": "string", "minLength": 1},
+          "status": {"enum": ["runnable", "blocked"]},
+          "description": {"type": "string"},
+          "overrides": {"type": "object"},
+          "conditional_on": {"const": "cell_memory_diagnostic"},
+          "missing_capability": {"type": "string"},
+          "blocked_reason": {"type": "string"}
+        }
+      }
+    },
+    "comparisons": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["variants", "required"],
+        "properties": {
+          "variants": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "required": {"type": "boolean"},
+          "conditional_on": {"const": "cell_memory_diagnostic"}
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}
