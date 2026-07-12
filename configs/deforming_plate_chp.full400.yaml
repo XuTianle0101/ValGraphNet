@@ -31,10 +31,16 @@ model:
   # The former 32-term ridge let one near-singular train frame own 99.96% of
   # calibration leverage, so it cannot be used as the controlled baseline.
   potential_ridge_terms: 0
-  potential_ridge_init: 1.0e-3
+  # When the stage-two ridge is enabled, coefficients represent curvature
+  # rather than raw energy and have a term-count-invariant total budget.
+  potential_ridge_init: 1.0
   potential_ridge_input_scales: [0.015, 0.018, 0.015]
   potential_ridge_beta: 2.0
   potential_ridge_center_limit: 4.0
+  potential_ridge_curvature_normalization: true
+  potential_ridge_mode: separable
+  potential_ridge_train_directions: false
+  potential_ridge_train_centers: false
   fiber_order: 0
   inversion_stiffness: 10.0
   minimum_j: 0.0

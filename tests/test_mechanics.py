@@ -226,6 +226,72 @@ def test_convex_ridge_basis_has_zero_reference_energy_and_stress():
     )
 
 
+def test_separable_ridge_has_term_invariant_curvature_budget():
+    scales = [0.015, 0.018, 0.015]
+    potential = AnalyticPotential(
+        ridge_terms=8,
+        ridge_init=1.0,
+        ridge_input_scales=scales,
+        ridge_curvature_normalization=True,
+        ridge_mode="separable",
+        ridge_train_directions=False,
+        ridge_train_centers=False,
+    )
+    directions = potential.ridge_directions
+    iso = directions[:, 2].abs() < 1.0e-7
+    vol = ~iso
+
+    assert int(iso.sum()) == 4
+    assert int(vol.sum()) == 4
+    torch.testing.assert_close(
+        directions[vol, :2], torch.zeros_like(directions[vol, :2])
+    )
+    assert not potential.raw_ridge_directions.requires_grad
+    assert not potential.raw_ridge_centers.requires_grad
+    expected_iso_budget = 2.0 * scales[0] * scales[1]
+    expected_vol_budget = scales[2] ** 2
+    torch.testing.assert_close(
+        potential._ridge_basis_scales[iso].sum(),
+        torch.tensor(expected_iso_budget),
+    )
+    torch.testing.assert_close(
+        potential._ridge_basis_scales[vol].sum(),
+        torch.tensor(expected_vol_budget),
+    )
+
+
+def test_curvature_normalized_ridge_tangent_is_scale_invariant():
+    common = {
+        "ridge_terms": 8,
+        "ridge_init": 1.0,
+        "ridge_curvature_normalization": True,
+        "ridge_mode": "separable",
+        "ridge_train_directions": False,
+        "ridge_train_centers": False,
+    }
+    first = AnalyticPotential(
+        **common, ridge_input_scales=[0.01, 0.01, 0.02]
+    ).double()
+    second = AnalyticPotential(
+        **common, ridge_input_scales=[0.02, 0.02, 0.04]
+    ).double()
+    strain = 1.0e-5
+    deformation = (1.0 + strain) * torch.eye(3, dtype=torch.float64)[None]
+    first_tangent = first(deformation).cauchy_stress[0, 0, 0] / strain
+    second_tangent = second(deformation).cauchy_stress[0, 0, 0] / strain
+    base_tangent = (
+        AnalyticPotential().double()(deformation).cauchy_stress[0, 0, 0]
+        / strain
+    )
+
+    torch.testing.assert_close(
+        first_tangent - base_tangent,
+        second_tangent - base_tangent,
+        rtol=1.0e-3,
+        atol=2.0e-4,
+    )
+
+
 def test_negative_determinant_barrier_is_finite_and_selective():
     determinant = torch.tensor([1.0, 0.0, -0.2], dtype=torch.float64)
     penalty = negative_j_barrier(determinant)

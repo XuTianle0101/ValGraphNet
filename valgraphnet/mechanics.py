@@ -397,6 +397,10 @@ class AnalyticPotential(nn.Module):
         ridge_input_scales: Sequence[float] = (1.0, 1.0, 1.0),
         ridge_beta: float = 2.0,
         ridge_center_limit: float = 4.0,
+        ridge_curvature_normalization: bool = False,
+        ridge_mode: str = "coupled",
+        ridge_train_directions: bool = True,
+        ridge_train_centers: bool = True,
     ) -> None:
         super().__init__()
         self.order = int(order)
@@ -408,6 +412,8 @@ class AnalyticPotential(nn.Module):
         self.ridge_terms = int(ridge_terms)
         self.ridge_beta = float(ridge_beta)
         self.ridge_center_limit = float(ridge_center_limit)
+        self.ridge_curvature_normalization = bool(ridge_curvature_normalization)
+        self.ridge_mode = str(ridge_mode).lower()
         if self.inversion_stiffness < 0.0:
             raise ValueError("inversion_stiffness must be non-negative")
         if self.minimum_coefficient < 0.0:
@@ -422,6 +428,8 @@ class AnalyticPotential(nn.Module):
             raise ValueError("ridge_beta must be strictly positive")
         if self.ridge_center_limit <= 0.0:
             raise ValueError("ridge_center_limit must be strictly positive")
+        if self.ridge_mode not in {"coupled", "separable"}:
+            raise ValueError("ridge_mode must be 'coupled' or 'separable'")
         ridge_scales = torch.as_tensor(list(ridge_input_scales), dtype=torch.float32)
         if ridge_scales.shape != (3,) or bool(torch.any(ridge_scales <= 0.0)):
             raise ValueError("ridge_input_scales must contain three positive values")
@@ -456,26 +464,19 @@ class AnalyticPotential(nn.Module):
                     torch.full((self.ridge_terms,), float(ridge_init), dtype=torch.float32)
                 )
             )
-            # Deterministic approximately uniform directions on S^2 provide
-            # coupled I1/I2/J ridge bases without changing the global RNG.
-            index = torch.arange(self.ridge_terms, dtype=torch.float32)
-            z = 1.0 - 2.0 * (index + 0.5) / float(self.ridge_terms)
-            azimuth = index * (math.pi * (3.0 - math.sqrt(5.0)))
-            radial = torch.sqrt((1.0 - z.square()).clamp_min(0.0))
-            directions = torch.stack(
-                [radial * torch.cos(azimuth), radial * torch.sin(azimuth), z],
-                dim=1,
+            directions, basis_scales, initial_centers = self._initial_ridge_geometry(
+                ridge_scales
             )
-            self.raw_ridge_directions = nn.Parameter(directions)
-            initial_centers = torch.linspace(
-                -0.625 * self.ridge_center_limit,
-                0.625 * self.ridge_center_limit,
-                self.ridge_terms,
+            self._ridge_basis_scales = basis_scales
+            self.raw_ridge_directions = nn.Parameter(
+                directions, requires_grad=bool(ridge_train_directions)
             )
             self.raw_ridge_centers = nn.Parameter(
-                torch.atanh(initial_centers / self.ridge_center_limit)
+                torch.atanh(initial_centers / self.ridge_center_limit),
+                requires_grad=bool(ridge_train_centers),
             )
         else:
+            self._ridge_basis_scales = torch.empty(0, dtype=torch.float32)
             self.register_parameter("raw_ridge", None)
             self.register_parameter("raw_ridge_directions", None)
             self.register_parameter("raw_ridge_centers", None)
@@ -514,7 +515,92 @@ class AnalyticPotential(nn.Module):
     def ridge_coefficients(self) -> torch.Tensor:
         if self.raw_ridge is None:
             return self.raw_i1.new_empty(0)
-        return functional.softplus(self.raw_ridge) + self.minimum_coefficient
+        coefficients = functional.softplus(self.raw_ridge) + self.minimum_coefficient
+        return coefficients * self._ridge_basis_scales.to(
+            device=coefficients.device, dtype=coefficients.dtype
+        )
+
+    def _initial_ridge_geometry(
+        self, ridge_scales: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return deterministic directions, curvature scales, and knots."""
+
+        if self.ridge_mode == "coupled":
+            index = torch.arange(self.ridge_terms, dtype=torch.float32)
+            z = 1.0 - 2.0 * (index + 0.5) / float(self.ridge_terms)
+            azimuth = index * (math.pi * (3.0 - math.sqrt(5.0)))
+            radial = torch.sqrt((1.0 - z.square()).clamp_min(0.0))
+            directions = torch.stack(
+                [radial * torch.cos(azimuth), radial * torch.sin(azimuth), z],
+                dim=1,
+            )
+            characteristic = ridge_scales.log().mean().mul(2.0).exp()
+            normalized_scale = 3.0 * characteristic / float(self.ridge_terms)
+            basis_scales = torch.ones(self.ridge_terms) * normalized_scale
+            centers = torch.linspace(
+                -0.625 * self.ridge_center_limit,
+                0.625 * self.ridge_center_limit,
+                self.ridge_terms,
+            )
+        else:
+            iso_terms = max(self.ridge_terms // 2, 1)
+            vol_terms = self.ridge_terms - iso_terms
+            iso_index = torch.arange(iso_terms, dtype=torch.float32)
+            iso_angle = 2.0 * math.pi * iso_index / float(iso_terms)
+            iso_directions = torch.stack(
+                [
+                    torch.cos(iso_angle),
+                    torch.sin(iso_angle),
+                    torch.zeros_like(iso_angle),
+                ],
+                dim=1,
+            )
+            if vol_terms:
+                vol_sign = torch.where(
+                    torch.arange(vol_terms) % 2 == 0,
+                    torch.ones(vol_terms),
+                    -torch.ones(vol_terms),
+                ).float()
+                vol_directions = torch.stack(
+                    [
+                        torch.zeros_like(vol_sign),
+                        torch.zeros_like(vol_sign),
+                        vol_sign,
+                    ],
+                    dim=1,
+                )
+                directions = torch.cat([iso_directions, vol_directions], dim=0)
+            else:
+                directions = iso_directions
+            iso_characteristic = ridge_scales[:2].log().mean().mul(2.0).exp()
+            iso_scale = 2.0 * iso_characteristic / float(iso_terms)
+            basis_scales = torch.ones(iso_terms) * iso_scale
+            if vol_terms:
+                vol_scale = ridge_scales[2].square() / float(vol_terms)
+                basis_scales = torch.cat(
+                    [
+                        basis_scales,
+                        torch.ones(vol_terms) * vol_scale,
+                    ]
+                )
+            iso_centers = torch.linspace(
+                -0.625 * self.ridge_center_limit,
+                0.625 * self.ridge_center_limit,
+                iso_terms,
+            )
+            vol_centers = (
+                torch.linspace(
+                    -0.625 * self.ridge_center_limit,
+                    0.625 * self.ridge_center_limit,
+                    vol_terms,
+                )
+                if vol_terms
+                else torch.empty(0)
+            )
+            centers = torch.cat([iso_centers, vol_centers])
+        if not self.ridge_curvature_normalization:
+            basis_scales = torch.ones_like(basis_scales)
+        return directions, basis_scales, centers
 
     @property
     def ridge_directions(self) -> torch.Tensor:

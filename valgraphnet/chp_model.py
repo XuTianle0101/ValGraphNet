@@ -526,6 +526,16 @@ class CHPGNS(nn.Module):
             ridge_center_limit=float(
                 model_cfg.get("potential_ridge_center_limit", 4.0)
             ),
+            ridge_curvature_normalization=bool(
+                model_cfg.get("potential_ridge_curvature_normalization", False)
+            ),
+            ridge_mode=str(model_cfg.get("potential_ridge_mode", "coupled")),
+            ridge_train_directions=bool(
+                model_cfg.get("potential_ridge_train_directions", True)
+            ),
+            ridge_train_centers=bool(
+                model_cfg.get("potential_ridge_train_centers", True)
+            ),
         )
         self.material_coefficient_count = (
             3 * self.potential.order
