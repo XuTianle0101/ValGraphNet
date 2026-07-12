@@ -23,7 +23,8 @@ from valgraphnet.data.case import discover_case_dirs, load_case
 from valgraphnet.data.valve_ood import validate_case_requirements
 
 
-AUDIT_SCHEMA_VERSION = 1
+AUDIT_SCHEMA_VERSION = 2
+REACTION_EQUILIBRIUM_TOLERANCE = 1.0e-3
 
 
 def _json_default(value: Any) -> Any:
@@ -178,6 +179,85 @@ def _minimum_j(case: Any, chunk_size: int) -> tuple[float, float]:
     return minimum, maximum
 
 
+def _neo_hookean_internal_force(case: Any, frame: int) -> np.ndarray:
+    """Reassemble the generator's Neo-Hookean force in float64."""
+
+    position = np.asarray(case.nodes, dtype=np.float64) + np.asarray(
+        case.displacement[int(frame)], dtype=np.float64
+    )
+    cells = np.asarray(case.cells, dtype=np.int64)
+    vertices = position[cells]
+    ds = np.stack(
+        (
+            vertices[:, 1] - vertices[:, 0],
+            vertices[:, 2] - vertices[:, 0],
+            vertices[:, 3] - vertices[:, 0],
+        ),
+        axis=-1,
+    )
+    deformation = ds @ np.asarray(case.dm_inv, dtype=np.float64)
+    determinant = np.linalg.det(deformation)
+    if not bool(np.isfinite(determinant).all()) or bool(np.any(determinant <= 0.0)):
+        raise ValueError("Neo-Hookean reaction check requires positive finite J")
+    right_cauchy_green = np.swapaxes(deformation, 1, 2) @ deformation
+    first_invariant = np.trace(right_cauchy_green, axis1=1, axis2=2)
+    cofactor = np.stack(
+        (
+            np.cross(deformation[:, :, 1], deformation[:, :, 2]),
+            np.cross(deformation[:, :, 2], deformation[:, :, 0]),
+            np.cross(deformation[:, :, 0], deformation[:, :, 1]),
+        ),
+        axis=-1,
+    )
+    derivative_i1_bar = (
+        2.0 * determinant[:, None, None] ** (-2.0 / 3.0) * deformation
+        - (2.0 / 3.0)
+        * first_invariant[:, None, None]
+        * determinant[:, None, None] ** (-5.0 / 3.0)
+        * cofactor
+    )
+    material = np.asarray(case.material_features, dtype=np.float64)
+    if material.shape[0] != case.num_cells or material.shape[1] < 1:
+        raise ValueError("material_features must provide per-cell C10")
+    c10 = material[:, 0]
+    derived = case.metadata.get("derived_solver_parameters", {})
+    d1 = float(derived.get("d1_pa_inverse", 0.0))
+    if bool(np.any(c10 <= 0.0)) or not np.isfinite(d1) or d1 <= 0.0:
+        raise ValueError("Neo-Hookean reaction check requires positive C10 and D1")
+    first_piola = (
+        c10[:, None, None] * derivative_i1_bar
+        + (2.0 / d1)
+        * (determinant - 1.0)[:, None, None]
+        * cofactor
+    )
+    contribution = -np.einsum(
+        "mij,mnj->mni",
+        first_piola,
+        np.asarray(case.shape_gradients, dtype=np.float64),
+    )
+    contribution *= np.asarray(
+        case.reference_volume[:, 0], dtype=np.float64
+    )[:, None, None]
+    internal = np.zeros((case.num_nodes, 3), dtype=np.float64)
+    for local_index in range(4):
+        np.add.at(internal, cells[:, local_index], contribution[:, local_index])
+    return internal
+
+
+def _fixed_reaction_relative_rmse(
+    case: Any, solver_force: np.ndarray, frame: int = -1
+) -> float:
+    fixed = np.asarray(case.fixed_mask, dtype=bool)
+    if not bool(fixed.any()):
+        raise ValueError("fixed reaction check requires fixed nodes")
+    target = np.asarray(solver_force[int(frame), fixed], dtype=np.float64)
+    reference = float(np.square(target).sum())
+    if not np.isfinite(reference) or reference <= 1.0e-30:
+        raise ValueError("fixed solver reaction is zero or non-finite")
+    internal = _neo_hookean_internal_force(case, int(frame))[fixed]
+    return float(np.sqrt(np.square(internal + target).sum() / reference))
+
+
 def _case_audit(
     case_dir: Path,
     split: str,
@@ -297,6 +377,19 @@ def _case_audit(
         errors.append("prescribed_mask.npy selects no nodes")
     if bool(np.any(fixed & prescribed)):
         errors.append("fixed and prescribed masks overlap")
+    reaction_relative_rmse = float("nan")
+    if force_finite and solver_force.shape == (case.num_steps, case.num_nodes, 3):
+        try:
+            reaction_relative_rmse = _fixed_reaction_relative_rmse(
+                case, solver_force, frame=-1
+            )
+            if reaction_relative_rmse > REACTION_EQUILIBRIUM_TOLERANCE:
+                errors.append(
+                    "Neo-Hookean fixed-reaction equilibrium rRMSE exceeds "
+                    f"{REACTION_EQUILIBRIUM_TOLERANCE}: {reaction_relative_rmse}"
+                )
+        except (ValueError, FloatingPointError) as exc:
+            errors.append(f"fixed-reaction equilibrium check failed: {exc}")
     fixed_exact = bool(
         fixed.any()
         and all(
@@ -369,6 +462,7 @@ def _case_audit(
         "cell_stress_abs_max_pa": cell_stress_abs_max,
         "integration_point_stress_abs_max_pa": ip_stress_abs_max,
         "solver_force_abs_max_n": solver_force_abs_max,
+        "neo_hookean_fixed_reaction_relative_rmse": reaction_relative_rmse,
         "complete_finite_cell_and_ip_tensors": complete_finite_tensors,
         "fixed_state_bit_exact": fixed_exact,
         "prescribed_state_spatially_bit_exact": prescribed_uniform,
@@ -448,6 +542,10 @@ def audit_hypercontact3d_dataset(
     minima = [float(row["minimum_j"]) for row in numeric_cases]
     maxima_stress = [float(row["cell_stress_abs_max_pa"]) for row in numeric_cases]
     maxima_force = [float(row["solver_force_abs_max_n"]) for row in numeric_cases]
+    reaction_relative = [
+        float(row.get("neo_hookean_fixed_reaction_relative_rmse", np.nan))
+        for row in numeric_cases
+    ]
     status = "passed" if not dataset_errors and not failed_cases else "failed"
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -487,6 +585,11 @@ def audit_hypercontact3d_dataset(
             "solver_force_nonzero_all_cases": all(
                 row.get("solver_force_abs_max_n", 0.0) > 0.0 for row in cases
             ),
+            "neo_hookean_fixed_reaction_equilibrium_all_cases": all(
+                np.isfinite(value)
+                and value <= REACTION_EQUILIBRIUM_TOLERANCE
+                for value in reaction_relative
+            ),
             "positive_j_all_frames_cells": all(
                 np.isfinite(row.get("minimum_j", np.nan)) and row.get("minimum_j", 0.0) > 0.0
                 for row in cases
@@ -507,6 +610,9 @@ def audit_hypercontact3d_dataset(
             "minimum_j": min(minima, default=None),
             "maximum_cell_stress_abs_pa": max(maxima_stress, default=None),
             "maximum_solver_force_abs_n": max(maxima_force, default=None),
+            "maximum_neo_hookean_fixed_reaction_relative_rmse": max(
+                reaction_relative, default=None
+            ),
         },
         "dataset_errors": dataset_errors,
         "cases": cases,

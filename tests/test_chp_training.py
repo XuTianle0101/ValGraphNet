@@ -17,6 +17,7 @@ from valgraphnet.chp_train import (
     integration_consistent_targets,
     minimax_checkpoint_score,
     pooled_positive_constitutive_scale,
+    reaction_equilibrium_loss,
     load_native_reference,
     select_rollout_start,
     stress_frame_scores,
@@ -106,6 +107,26 @@ def test_constitutive_scale_minimizes_the_pooled_gate_objective():
         + target_square
     )
     assert selected_error < median_error
+
+
+def test_fixed_reaction_equilibrium_loss_uses_action_reaction_sign():
+    internal = torch.tensor(
+        [[1.0, -2.0, 3.0], [0.5, 0.0, 0.0], [8.0, 8.0, 8.0]]
+    )
+    reaction = torch.tensor(
+        [[-1.0, 2.0, -3.0], [-0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    )
+    fixed = torch.tensor([True, True, False])
+
+    loss, relative = reaction_equilibrium_loss(internal, reaction, fixed)
+    torch.testing.assert_close(loss, torch.zeros(()))
+    torch.testing.assert_close(relative, torch.zeros(()))
+
+    wrong_sign_loss, wrong_sign_relative = reaction_equilibrium_loss(
+        internal, -reaction, fixed
+    )
+    assert wrong_sign_loss > 0.0
+    torch.testing.assert_close(wrong_sign_relative, torch.tensor(2.0))
 
 
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():

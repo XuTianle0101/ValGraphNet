@@ -29,7 +29,12 @@ from valgraphnet.chp_model import (
 from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
 from valgraphnet.data.case import ValveCase
-from valgraphnet.mechanics import deformation_gradient, invariants
+from valgraphnet.mechanics import (
+    deformation_gradient,
+    invariants,
+    project_cell_to_nodes,
+    von_mises,
+)
 from valgraphnet.physical_evaluation import (
     CELL_TENSOR_STRESS_SOURCE,
     NODAL_STRESS_FALLBACK_SOURCE,
@@ -116,6 +121,8 @@ class CHPDeviceCase:
     nodal_area: torch.Tensor
     pressure_mask: torch.Tensor
     time_fraction: torch.Tensor
+    solver_nodal_force: torch.Tensor
+    has_solver_nodal_force: bool
 
 
 class CHPCaseCache:
@@ -194,6 +201,10 @@ class CHPCaseCache:
             nodal_area=self._tensor(case.nodal_area, self.device, torch.float32),
             pressure_mask=self._tensor(case.pressure_mask, self.device, torch.bool),
             time_fraction=self._tensor(phase, self.device, torch.float32),
+            solver_nodal_force=self._tensor(
+                case.solver_nodal_force[frame_slice], self.device, torch.float32
+            ),
+            has_solver_nodal_force=case.has_solver_nodal_force,
         )
         self._gpu[key] = cached
         while len(self._gpu) > self.cache_size:
@@ -972,8 +983,12 @@ def calibrate_constitutive_modulus(
                 trajectory.static, exact_position, cfg
             ):
                 continue
-            nodal_prediction, cell_prediction = model.nodal_stress_at(
+            exact_fields = model.constitutive_fields(
                 trajectory.static, exact_position
+            )
+            cell_prediction = exact_fields.cauchy_stress
+            nodal_prediction = _nodal_stress_from_cell_tensor(
+                cell_prediction, trajectory.static
             )
             mask = ~trajectory.static.prescribed_mask
             if not bool(mask.any().item()):
@@ -1270,6 +1285,58 @@ def _supervised_constitutive_loss(
     )
 
 
+def _nodal_stress_from_cell_tensor(
+    cell_stress: torch.Tensor,
+    static: CHPStatic,
+) -> torch.Tensor:
+    return project_cell_to_nodes(
+        von_mises(cell_stress)[:, None],
+        static.cells,
+        static.num_nodes,
+        weights=static.volume,
+    )
+
+
+def reaction_equilibrium_loss(
+    internal_force: torch.Tensor,
+    solver_nodal_force: torch.Tensor,
+    reaction_mask: torch.Tensor,
+    *,
+    huber_delta: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dimensionless fixed-reaction equilibrium loss and physical rRMSE.
+
+    CalculiX ``FORC`` in HyperContact contains support reactions on the fixed
+    block surface.  With the internal-force sign convention used here, static
+    equilibrium is ``f_internal + f_reaction = 0`` on those nodes.  Contact
+    forces are intentionally not read as model inputs.
+    """
+
+    if internal_force.shape != solver_nodal_force.shape:
+        raise ValueError("internal and solver nodal forces must have matching shapes")
+    if reaction_mask.shape != internal_force.shape[:-1]:
+        raise ValueError("reaction_mask must have shape [N]")
+    if not bool(reaction_mask.any().item()):
+        zero = internal_force.new_zeros(())
+        return zero, zero
+    target = solver_nodal_force[reaction_mask]
+    residual = internal_force[reaction_mask] + target
+    reference_square = target.square().sum()
+    if not bool((reference_square > 1.0e-20).item()):
+        zero = internal_force.new_zeros(())
+        return zero, zero
+    scale = target.square().mean().sqrt().detach().clamp_min(1.0e-12)
+    loss = F.huber_loss(
+        residual / scale,
+        torch.zeros_like(residual),
+        delta=float(huber_delta),
+    )
+    relative = torch.sqrt(
+        residual.square().sum() / reference_square.clamp_min(1.0e-20)
+    )
+    return loss, relative
+
+
 def train_constitutive_epoch(
     model: CHPGNS,
     cases: list[ValveCase],
@@ -1330,6 +1397,28 @@ def train_constitutive_epoch(
                 normalizers,
                 cfg,
                 nodal_mask=mask,
+            )
+            reaction_weight = float(
+                get_cfg(cfg, "loss.reaction_equilibrium", 0.0)
+            )
+            if reaction_weight > 0.0 and not trajectory.has_solver_nodal_force:
+                raise ValueError(
+                    "reaction-equilibrium supervision requires solver_nodal_force.npy"
+                )
+            if trajectory.has_solver_nodal_force:
+                reaction_loss, reaction_relative = reaction_equilibrium_loss(
+                    exact_fields.internal_force,
+                    trajectory.solver_nodal_force[frame],
+                    trajectory.static.fixed_mask,
+                    huber_delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
+                )
+            else:
+                reaction_loss = loss.new_zeros(())
+                reaction_relative = loss.new_zeros(())
+            loss = loss + reaction_weight * reaction_loss
+            metrics["reaction_equilibrium"] = reaction_loss.detach()
+            metrics["reaction_equilibrium_relative_rmse"] = (
+                reaction_relative.detach()
             )
             if not bool(torch.isfinite(loss).item()):
                 skipped_frames += 1
@@ -2485,8 +2574,12 @@ def train_chp_epoch(
                         trajectory.static.reference_position
                         + trajectory.displacement[step + 1]
                     )
-                    exact_nodal_stress, exact_cell_stress = model.nodal_stress_at(
+                    exact_fields = model.constitutive_fields(
                         trajectory.static, exact_position
+                    )
+                    exact_cell_stress = exact_fields.cauchy_stress
+                    exact_nodal_stress = _nodal_stress_from_cell_tensor(
+                        exact_cell_stress, trajectory.static
                     )
                     exact_mask = ~trajectory.static.prescribed_mask
                     if not bool(exact_mask.any().item()):
@@ -2503,6 +2596,27 @@ def train_chp_epoch(
                     step_loss = step_loss + float(
                         get_cfg(cfg, "loss.exact_constitutive", 0.5)
                     ) * exact_constitutive
+                    reaction_weight = float(
+                        get_cfg(cfg, "loss.reaction_equilibrium", 0.0)
+                    )
+                    if reaction_weight > 0.0 and not trajectory.has_solver_nodal_force:
+                        raise ValueError(
+                            "reaction-equilibrium supervision requires "
+                            "solver_nodal_force.npy"
+                        )
+                    if trajectory.has_solver_nodal_force:
+                        reaction_loss, reaction_relative = reaction_equilibrium_loss(
+                            exact_fields.internal_force,
+                            trajectory.solver_nodal_force[step + 1],
+                            trajectory.static.fixed_mask,
+                            huber_delta=float(
+                                get_cfg(cfg, "loss.huber_delta", 1.0)
+                            ),
+                        )
+                    else:
+                        reaction_loss = step_loss.new_zeros(())
+                        reaction_relative = step_loss.new_zeros(())
+                    step_loss = step_loss + reaction_weight * reaction_loss
                     metrics["exact_constitutive"] = exact_metrics["loss"]
                     metrics["exact_stress_physical"] = exact_metrics[
                         "stress_physical"
@@ -2510,6 +2624,10 @@ def train_chp_epoch(
                     metrics["exact_stress_tensor_supervision"] = exact_metrics[
                         "stress_tensor_supervision"
                     ]
+                    metrics["reaction_equilibrium"] = reaction_loss.detach()
+                    metrics["reaction_equilibrium_relative_rmse"] = (
+                        reaction_relative.detach()
+                    )
                 if not bool(torch.isfinite(step_loss).item()):
                     raise FloatingPointError(
                         f"non-finite CHP loss for {case.case_id} at frame {start + offset}"
@@ -2958,6 +3076,8 @@ def evaluate_teacher_forced_stress(
             "cell_vm_reference",
             "cell_vm_peak_error",
             "cell_vm_peak_reference",
+            "reaction_error",
+            "reaction_reference",
         )
     }
     requested_frames = 0
@@ -2967,6 +3087,7 @@ def evaluate_teacher_forced_stress(
     extreme_i2_frames = 0
     tensor_label_frames = 0
     nodal_label_frames = 0
+    reaction_label_frames = 0
     for case_index_value in tqdm(
         case_indices, desc="teacher-stress", leave=False
     ):
@@ -2997,9 +3118,22 @@ def evaluate_teacher_forced_stress(
                 continue
             admissible_frames += 1
             with _autocast(cache.device, amp_dtype):
-                nodal_prediction, cell_prediction = model.nodal_stress_at(
-                    trajectory.static, exact_position
-                )
+                if hasattr(model, "constitutive_fields"):
+                    exact_fields = model.constitutive_fields(
+                        trajectory.static, exact_position
+                    )
+                    cell_prediction = exact_fields.cauchy_stress
+                    nodal_prediction = _nodal_stress_from_cell_tensor(
+                        cell_prediction, trajectory.static
+                    )
+                else:
+                    # Lightweight protocol fixtures may expose only the
+                    # historical observation helper.  Production CHPGNS
+                    # always takes the constitutive_fields branch above.
+                    exact_fields = None
+                    nodal_prediction, cell_prediction = model.nodal_stress_at(
+                        trajectory.static, exact_position
+                    )
             mask = ~trajectory.static.prescribed_mask
             if not bool(mask.any().item()):
                 mask = torch.ones_like(mask)
@@ -3031,6 +3165,22 @@ def evaluate_teacher_forced_stress(
                 accum["cell_vm_peak_error"] += residual_vm[cell_peak].square().sum()
                 accum["cell_vm_peak_reference"] += target_vm[cell_peak].square().sum()
                 tensor_label_frames += 1
+            if getattr(trajectory, "has_solver_nodal_force", False):
+                if exact_fields is None:
+                    raise ValueError(
+                        "solver reaction evaluation requires constitutive_fields"
+                    )
+                reaction_mask = trajectory.static.fixed_mask
+                reaction_target = trajectory.solver_nodal_force[frame, reaction_mask]
+                reaction_reference = reaction_target.square().sum()
+                if bool((reaction_reference > 1.0e-20).item()):
+                    reaction_residual = (
+                        exact_fields.internal_force[reaction_mask]
+                        + reaction_target
+                    )
+                    accum["reaction_error"] += reaction_residual.square().sum()
+                    accum["reaction_reference"] += reaction_reference
+                    reaction_label_frames += 1
     eps = torch.tensor(1.0e-12, device=cache.device)
 
     def relative(
@@ -3059,6 +3209,9 @@ def evaluate_teacher_forced_stress(
     )
     cell_vm_peak_relative = relative(
         "cell_vm_peak_error", "cell_vm_peak_reference", tensor_label_frames
+    )
+    reaction_relative = relative(
+        "reaction_error", "reaction_reference", reaction_label_frames
     )
     if tensor_label_frames:
         source = CELL_TENSOR_STRESS_SOURCE
@@ -3103,6 +3256,8 @@ def evaluate_teacher_forced_stress(
         "teacher_nodal_stress_relative_rmse": nodal_relative,
         "teacher_nodal_stress_p95_relative_rmse": nodal_peak_relative,
         "teacher_nodal_stress_frames": float(nodal_label_frames),
+        "teacher_reaction_equilibrium_relative_rmse": reaction_relative,
+        "teacher_reaction_equilibrium_frames": float(reaction_label_frames),
         "teacher_stress_admissible_coverage": float(
             admissible_frames / max(requested_frames, 1)
         ),

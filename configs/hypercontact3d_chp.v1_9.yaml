@@ -106,6 +106,9 @@ loss:
   penetration: 1.0
   residual: 0.01
   negative_j: 10.0
+  # Solver FORC contains fixed-support reactions.  It is supervision only and
+  # is never provided to the forward model as an input feature.
+  reaction_equilibrium: 0.25
   huber_delta: 1.0
   peak_fraction: 0.1
   peak_weight: 0.5

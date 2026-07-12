@@ -6,8 +6,12 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from scripts.audit_hypercontact3d import audit_hypercontact3d_dataset
+from scripts.audit_hypercontact3d import (
+    _neo_hookean_internal_force,
+    audit_hypercontact3d_dataset,
+)
 from valgraphnet.calculix_results import convert_case
+from valgraphnet.data.case import load_case
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hypercontact"
@@ -41,6 +45,7 @@ def _write_auditable_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             "mesh": {"nx": 1, "ny": 1, "nz": 1},
         },
         "derived": {
+            "d1_pa_inverse": 5.172413793103447e-7,
             "imposed_indenter_displacement_m": -0.2,
             "indenter_density_kg_m3": 1000.0,
             "indenter_shell_thickness_m": 0.01,
@@ -72,14 +77,16 @@ def _write_auditable_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     np.save(case_dir / "times.npy", times)
     np.save(case_dir / "V.npy", velocity.astype(np.float32))
     np.save(case_dir / "A.npy", acceleration.astype(np.float32))
-    force = np.zeros_like(displacement)
-    force[:, 3, 2] = times
-    np.save(case_dir / "solver_nodal_force.npy", force)
     np.save(
         case_dir / "integration_point_mask.npy",
         np.ones((101, 1, 1), dtype=bool),
     )
-
+    converted = load_case(case_dir)
+    force = np.zeros_like(displacement)
+    for frame in range(len(times)):
+        internal = _neo_hookean_internal_force(converted, frame)
+        force[frame, converted.fixed_mask] = -internal[converted.fixed_mask]
+    np.save(case_dir / "solver_nodal_force.npy", force)
     metadata_path = case_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["num_frames"] = 101
@@ -168,6 +175,11 @@ def test_audit_accepts_complete_dataset_and_records_provenance(tmp_path):
     assert len(report["provenance"]["requirements_sha256"]) == 64
     assert report["cases"][0]["fixed_state_bit_exact"]
     assert report["cases"][0]["prescribed_ramp_within_float32_tolerance"]
+    assert report["checks"]["neo_hookean_fixed_reaction_equilibrium_all_cases"]
+    assert (
+        report["summary"]["maximum_neo_hookean_fixed_reaction_relative_rmse"]
+        < 1.0e-5
+    )
 
 
 def test_audit_fails_closed_for_zero_force_and_nonpositive_j(tmp_path):

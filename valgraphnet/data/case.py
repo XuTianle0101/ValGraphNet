@@ -73,6 +73,9 @@ class ValveCase:
     fiber_direction: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3), dtype=np.float32)
     )
+    solver_nodal_force: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 0, 3), dtype=np.float32)
+    )
 
     @property
     def num_steps(self) -> int:
@@ -93,6 +96,14 @@ class ValveCase:
     @property
     def has_constitutive_data(self) -> bool:
         return self.num_cells > 0 and self.dm_inv.shape == (self.num_cells, 3, 3)
+
+    @property
+    def has_solver_nodal_force(self) -> bool:
+        return self.solver_nodal_force.shape == (
+            self.num_steps,
+            self.num_nodes,
+            3,
+        )
 
 
 def load_case(case_dir: str | Path) -> ValveCase:
@@ -189,6 +200,21 @@ def load_case(case_dir: str | Path) -> ValveCase:
         times.shape[0],
         num_cells,
     )
+    solver_force_path = root / "solver_nodal_force.npy"
+    if solver_force_path.is_file():
+        solver_nodal_force = np.load(
+            solver_force_path, allow_pickle=False, mmap_mode="r"
+        ).astype(np.float32, copy=False)
+        expected_solver_force = (times.shape[0], nodes.shape[0], 3)
+        if solver_nodal_force.shape != expected_solver_force:
+            raise ValueError(
+                f"{root}: solver_nodal_force.npy must have shape "
+                f"{expected_solver_force}; found {solver_nodal_force.shape}"
+            )
+        if not bool(np.isfinite(solver_nodal_force).all()):
+            raise ValueError(f"{root}: solver_nodal_force.npy contains non-finite values")
+    else:
+        solver_nodal_force = np.zeros((0, 0, 3), dtype=np.float32)
     fixed_mask = _load_optional(
         root, "fixed_mask.npy", np.zeros(nodes.shape[0], dtype=bool)
     ).astype(bool, copy=False)
@@ -290,6 +316,7 @@ def load_case(case_dir: str | Path) -> ValveCase:
         material_features=material_features,
         density=density,
         fiber_direction=fiber_direction,
+        solver_nodal_force=solver_nodal_force,
     )
 
 

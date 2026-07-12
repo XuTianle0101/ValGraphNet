@@ -101,6 +101,11 @@ def test_conversion_writes_loadable_constitutive_case(tmp_path):
     assert case.num_nodes == 7
     assert case.num_cells == 1
     assert case.has_constitutive_data
+    # This minimal legacy fixture contains no FRD FORC field.  Production v1.9
+    # conversion requires and loads it; absence remains explicit rather than
+    # fabricating a zero reaction history.
+    assert not case.has_solver_nodal_force
+    assert case.solver_nodal_force.shape == (0, 0, 3)
     np.testing.assert_allclose(case.times, [0.0, 0.5, 1.0])
     np.testing.assert_allclose(case.displacement[1, :4, 2], [0.0, 0.0, 0.0, -0.05])
     np.testing.assert_allclose(case.displacement[:, 4:, 2], [[0.0] * 3, [-0.1] * 3, [-0.2] * 3])
