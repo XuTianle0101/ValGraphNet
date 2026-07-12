@@ -171,6 +171,8 @@ def test_paired_bootstrap_requires_every_metric_to_improve():
         interval["ci95_low"] > 0
         for interval in comparison["paired_bootstrap"].values()
     )
+    assert set(comparison["standard_reference"].values()) == {0.0}
+    assert "not a trained-model result" in comparison["standard_reference_definition"]
 
 
 def test_native_reference_protocol_requires_same_even_validation_subset(tmp_path):

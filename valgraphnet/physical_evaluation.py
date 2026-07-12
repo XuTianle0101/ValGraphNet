@@ -618,6 +618,10 @@ def compare_experiments(
     }
     return {
         "standard_reference": {key: 0.0 for key in PRIMARY_METRICS},
+        "standard_reference_definition": (
+            "ground-truth fields compared with themselves; zero error is "
+            "definitional and is not a trained-model result"
+        ),
         "experiments": public,
         "paired_bootstrap": intervals,
         "acceptance": {
