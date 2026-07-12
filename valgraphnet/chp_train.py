@@ -951,6 +951,72 @@ def pooled_positive_constitutive_scale(
     return (cross / square).clamp(min=float(minimum), max=float(maximum))
 
 
+def winsorized_relative_constitutive_scale(
+    frame_moments: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    *,
+    leverage_quantile: float,
+    minimum: float,
+    maximum: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Fit a positive scale without letting one predicted frame own the fit.
+
+    Each frame is first normalized by its target energy, which removes mesh
+    size and stress-amplitude weighting from this train-only calibration.
+    Predicted leverage is then winsorized by downweighting frames above the
+    requested quantile.  The reported scientific gate remains the untouched
+    pooled physical rRMSE over every admissible validation label.
+    """
+
+    if not 0.0 < float(leverage_quantile) <= 1.0:
+        raise ValueError("leverage_quantile must be in (0, 1]")
+    if not frame_moments:
+        raise ValueError("winsorized scale fitting requires frame moments")
+    square = torch.stack([item[0] for item in frame_moments]).float()
+    cross = torch.stack([item[1] for item in frame_moments]).float()
+    reference = torch.stack([item[2] for item in frame_moments]).float()
+    eps = torch.finfo(square.dtype).eps
+    valid = (
+        torch.isfinite(square)
+        & torch.isfinite(cross)
+        & torch.isfinite(reference)
+        & (square > eps)
+        & (reference > eps)
+    )
+    if not bool(valid.any().item()):
+        raise ValueError("winsorized scale fitting has no finite non-zero frames")
+    square = square[valid]
+    cross = cross[valid]
+    reference = reference[valid]
+    relative_square = square / reference
+    relative_cross = cross / reference
+    leverage_cap = torch.quantile(relative_square, float(leverage_quantile))
+    leverage_cap = leverage_cap.clamp_min(eps)
+    weights = torch.minimum(
+        torch.ones_like(relative_square),
+        leverage_cap / relative_square.clamp_min(eps),
+    )
+    weighted_square = weights * relative_square
+    weighted_cross = weights * relative_cross
+    factor = pooled_positive_constitutive_scale(
+        weighted_square.sum(),
+        weighted_cross.sum(),
+        minimum=minimum,
+        maximum=maximum,
+    )
+    effective_frames = weights.sum().square() / weights.square().sum().clamp_min(eps)
+    return factor, {
+        "leverage_quantile": float(leverage_quantile),
+        "leverage_cap": float(leverage_cap.item()),
+        "maximum_raw_leverage_share": float(
+            (relative_square.max() / relative_square.sum().clamp_min(eps)).item()
+        ),
+        "maximum_winsorized_leverage_share": float(
+            (weighted_square.max() / weighted_square.sum().clamp_min(eps)).item()
+        ),
+        "effective_frames": float(effective_frames.item()),
+    }
+
+
 @torch.no_grad()
 def calibrate_constitutive_modulus(
     model: CHPGNS,
@@ -973,6 +1039,9 @@ def calibrate_constitutive_modulus(
     prediction_target = torch.zeros((), device=cache.device)
     target_square = torch.zeros((), device=cache.device)
     frame_moments: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    positive_frame_moments: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
     admissible_frames = 0
     requested_frames = 0
     tensor_frames = 0
@@ -1028,7 +1097,6 @@ def calibrate_constitutive_modulus(
             if bool(
                 (
                     (frame_prediction_square > 1.0e-12)
-                    & (frame_prediction_target > 0.0)
                     & (frame_target_square > 1.0e-12)
                 ).item()
             ):
@@ -1039,11 +1107,17 @@ def calibrate_constitutive_modulus(
                         frame_target_square,
                     )
                 )
+                if bool((frame_prediction_target > 0.0).item()):
+                    positive_frame_moments.append(frame_moments[-1])
             admissible_frames += 1
     if not frame_moments:
         raise RuntimeError("no admissible non-zero frames for constitutive calibration")
-    frame_factors = torch.stack(
-        [cross / square for square, cross, _ in frame_moments]
+    frame_factors = (
+        torch.stack(
+            [cross / square for square, cross, _ in positive_frame_moments]
+        )
+        if positive_frame_moments
+        else None
     )
     minimum_factor = float(
         get_cfg(cfg, "constitutive_pretraining.minimum_scale_factor", 1.0e-3)
@@ -1051,16 +1125,38 @@ def calibrate_constitutive_modulus(
     maximum_factor = float(
         get_cfg(cfg, "constitutive_pretraining.maximum_scale_factor", 1.0e4)
     )
-    # Checkpoint gates use pooled physical rRMSE, so their train-only scale
-    # initialization must optimize that same falsifiable objective.  Keep the
-    # per-frame distribution as a robustness diagnostic, but do not allow its
-    # median to make the pooled error worse (which occurred on deforming_plate).
-    factor = pooled_positive_constitutive_scale(
-        prediction_square,
-        prediction_target,
-        minimum=minimum_factor,
-        maximum=maximum_factor,
-    )
+    # The scientific gate remains an untouched pooled physical rRMSE.  The
+    # train-only initializer may use a robust estimator so a single malformed
+    # predicted frame cannot collapse the modulus for every other trajectory;
+    # both pooled before/after errors are still recorded below.
+    estimator = str(
+        get_cfg(cfg, "constitutive_pretraining.scale_estimator", "pooled")
+    ).lower()
+    estimator_diagnostics: dict[str, float] = {}
+    if estimator == "pooled":
+        factor = pooled_positive_constitutive_scale(
+            prediction_square,
+            prediction_target,
+            minimum=minimum_factor,
+            maximum=maximum_factor,
+        )
+        estimator_name = "constrained_pooled_least_squares"
+    elif estimator == "winsorized_relative":
+        factor, estimator_diagnostics = winsorized_relative_constitutive_scale(
+            frame_moments,
+            leverage_quantile=float(
+                get_cfg(
+                    cfg,
+                    "constitutive_pretraining.calibration_leverage_quantile",
+                    0.99,
+                )
+            ),
+            minimum=minimum_factor,
+            maximum=maximum_factor,
+        )
+        estimator_name = "winsorized_frame_relative_least_squares"
+    else:
+        raise ValueError(f"unsupported constitutive scale estimator: {estimator!r}")
     before_error = prediction_square - 2.0 * prediction_target + target_square
     after_error = (
         factor.square() * prediction_square
@@ -1088,7 +1184,7 @@ def calibrate_constitutive_modulus(
     )
     return {
         "scale_factor": float(factor.item()),
-        "scale_estimator": "constrained_pooled_least_squares",
+        "scale_estimator": estimator_name,
         "physical_modulus": float(model.log_stress_scale.exp().item()),
         "mass_scale": float(model.log_mass_scale.exp().item()),
         "relative_rmse_before": float(
@@ -1100,9 +1196,21 @@ def calibrate_constitutive_modulus(
         "median_frame_relative_rmse_after": float(
             frame_relative_after.median().item()
         ),
-        "frame_scale_q05": float(torch.quantile(frame_factors, 0.05).item()),
-        "frame_scale_median": float(frame_factors.median().item()),
-        "frame_scale_q95": float(torch.quantile(frame_factors, 0.95).item()),
+        "frame_scale_q05": (
+            float(torch.quantile(frame_factors, 0.05).item())
+            if frame_factors is not None
+            else None
+        ),
+        "frame_scale_median": (
+            float(frame_factors.median().item())
+            if frame_factors is not None
+            else None
+        ),
+        "frame_scale_q95": (
+            float(torch.quantile(frame_factors, 0.95).item())
+            if frame_factors is not None
+            else None
+        ),
         "admissible_frames": float(admissible_frames),
         "requested_frames": float(requested_frames),
         "admissible_coverage": float(admissible_frames / max(requested_frames, 1)),
@@ -1112,6 +1220,7 @@ def calibrate_constitutive_modulus(
         "cell_tensor_frames": float(tensor_frames),
         "nodal_scalar_frames": float(scalar_frames),
         "cell_tensor_coverage": float(tensor_frames / max(admissible_frames, 1)),
+        **estimator_diagnostics,
     }
 
 

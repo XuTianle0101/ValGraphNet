@@ -83,6 +83,10 @@ constitutive_pretraining:
   enabled: true
   calibration_cases: 32
   calibration_frames: 8
+  # Train-only scale fit is frame-relative and caps the top 1% predicted
+  # leverage; the validation gate itself remains the untouched pooled rRMSE.
+  scale_estimator: winsorized_relative
+  calibration_leverage_quantile: 0.99
   minimum_scale_factor: 1.0e-3
   maximum_scale_factor: 1.0e4
   preserve_force_mass_ratio: true

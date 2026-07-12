@@ -28,6 +28,7 @@ from valgraphnet.chp_train import (
     train_constitutive_epoch,
     validate_chp_checkpoint_semantics,
     validate_chp_problem_semantics,
+    winsorized_relative_constitutive_scale,
 )
 from valgraphnet.stress_transform import AsinhStressTransform
 from valgraphnet.physical_evaluation import (
@@ -114,6 +115,24 @@ def test_constitutive_scale_minimizes_the_pooled_gate_objective():
         + target_square
     )
     assert selected_error < median_error
+
+
+def test_winsorized_relative_scale_rejects_single_frame_leverage():
+    normal = [
+        (torch.tensor(1.0), torch.tensor(2.0), torch.tensor(4.0))
+        for _ in range(100)
+    ]
+    outlier = (torch.tensor(1.0e6), torch.tensor(0.0), torch.tensor(4.0))
+    factor, diagnostics = winsorized_relative_constitutive_scale(
+        [*normal, outlier],
+        leverage_quantile=0.99,
+        minimum=1.0e-3,
+        maximum=1.0e4,
+    )
+
+    assert factor == pytest.approx(200.0 / 101.0, rel=1.0e-5)
+    assert diagnostics["maximum_raw_leverage_share"] > 0.99
+    assert diagnostics["maximum_winsorized_leverage_share"] < 0.011
 
 
 def test_constitutive_loss_adds_non_saturating_gate_residual():
