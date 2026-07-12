@@ -215,9 +215,16 @@ class CellNodeBlock(nn.Module):
 class PairForceHeads(nn.Module):
     """Non-negative damping/contact magnitudes assembled as pair forces."""
 
-    def __init__(self, scalar_dim: int, tangential_ratio_cap: float = 1.0) -> None:
+    def __init__(
+        self,
+        scalar_dim: int,
+        tangential_ratio_cap: float = 1.0,
+        *,
+        enforce_action_reaction: bool = True,
+    ) -> None:
         super().__init__()
         self.tangential_ratio_cap = float(tangential_ratio_cap)
+        self.enforce_action_reaction = bool(enforce_action_reaction)
         if self.tangential_ratio_cap < 0.0:
             raise ValueError("tangential_ratio_cap must be non-negative")
         symmetric_dim = 2 * scalar_dim + 4
@@ -235,6 +242,8 @@ class PairForceHeads(nn.Module):
         velocity: torch.Tensor,
         pairs: torch.Tensor,
         reference_position: torch.Tensor | None = None,
+        *,
+        signed_scalar_difference: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         src, dst = pairs
         relative = position[dst] - position[src]
@@ -249,10 +258,13 @@ class PairForceHeads(nn.Module):
                 reference_position[dst] - reference_position[src], dim=1, keepdim=True
             ).clamp_min(1.0e-8)
             stretch = distance / reference_length - 1.0
+        scalar_difference = scalar[src] - scalar[dst]
+        if not signed_scalar_difference:
+            scalar_difference = scalar_difference.abs()
         features = torch.cat(
             [
                 scalar[src] + scalar[dst],
-                (scalar[src] - scalar[dst]).abs(),
+                scalar_difference,
                 distance,
                 stretch,
                 normal_velocity,
@@ -267,6 +279,20 @@ class PairForceHeads(nn.Module):
         result = force_on_src.new_zeros((count, 3))
         result.index_add_(0, pairs[0], force_on_src)
         result.index_add_(0, pairs[1], -force_on_src)
+        return result
+
+    @staticmethod
+    def scatter_endpoints(
+        force_on_src: torch.Tensor,
+        force_on_dst: torch.Tensor,
+        pairs: torch.Tensor,
+        count: int,
+    ) -> torch.Tensor:
+        """Scatter independently predicted endpoint forces without tying signs."""
+
+        result = force_on_src.new_zeros((count, 3))
+        result.index_add_(0, pairs[0], force_on_src)
+        result.index_add_(0, pairs[1], force_on_dst)
         return result
 
     @staticmethod
@@ -345,6 +371,7 @@ class PairForceHeads(nn.Module):
             velocity,
             contact_pairs,
             reference_position,
+            signed_scalar_difference=not self.enforce_action_reaction,
         )
         raw = self.contact(features)
         distance = features[:, -4:-3]
@@ -389,9 +416,76 @@ class PairForceHeads(nn.Module):
         if nodal_mass is not None:
             pair_mass = self.reduced_mass(nodal_mass, contact_pairs)
             force_src = force_src * pair_mass
-        force = self.scatter_pair(force_src, contact_pairs, position.shape[0])
+        if self.enforce_action_reaction:
+            force = self.scatter_pair(force_src, contact_pairs, position.shape[0])
+            endpoint_tangent = bounded_tangent
+        else:
+            # Evaluate the same contact MLP from the other endpoint with the
+            # signed scalar difference reversed.  Geometry-derived directions
+            # also reverse, but independently predicted magnitudes need not
+            # match, so this branch permits a non-zero pair resultant without
+            # adding parameters or changing checkpoint tensor shapes.
+            reverse_pairs = contact_pairs.flip(0)
+            (
+                reverse_features,
+                reverse_direction,
+                reverse_relative_velocity,
+                reverse_normal_velocity,
+            ) = self.invariants(
+                scalar,
+                position,
+                velocity,
+                reverse_pairs,
+                reference_position,
+                signed_scalar_difference=True,
+            )
+            reverse_raw = self.contact(reverse_features)
+            reverse_normal_magnitude = (
+                F.softplus(reverse_raw[:, :1]) * penetration
+            )
+            reverse_normal_force = -reverse_normal_magnitude * reverse_direction
+            reverse_tangential_velocity = (
+                reverse_relative_velocity
+                - reverse_normal_velocity * reverse_direction
+            )
+            reverse_tangential_coefficient = F.softplus(reverse_raw[:, 1:2])
+            reverse_tangential_speed = torch.linalg.vector_norm(
+                reverse_tangential_velocity, dim=1, keepdim=True
+            )
+            reverse_candidate_tangent = (
+                reverse_tangential_coefficient
+                * reverse_tangential_speed
+                * penetration
+            )
+            reverse_tangent_cap = (
+                self.tangential_ratio_cap * reverse_normal_magnitude
+            )
+            reverse_bounded_tangent = reverse_tangent_cap * torch.tanh(
+                reverse_candidate_tangent
+                / reverse_tangent_cap.clamp_min(1.0e-8)
+            )
+            reverse_tangential_direction = (
+                reverse_tangential_velocity
+                / reverse_tangential_speed.clamp_min(1.0e-8)
+            )
+            force_dst = (
+                reverse_normal_force
+                + reverse_bounded_tangent * reverse_tangential_direction
+            )
+            force_dst = force_dst * pair_weight
+            if pair_mass is not None:
+                force_dst = force_dst * pair_mass
+            force = self.scatter_endpoints(
+                force_src, force_dst, contact_pairs, position.shape[0]
+            )
+            # Keep the non-negative dissipation proxy on the same per-pair
+            # scale as the constrained path. Actual endpoint power is allowed
+            # to violate conservation in this deliberate ablation.
+            endpoint_tangent = 0.5 * (
+                bounded_tangent + reverse_bounded_tangent
+            )
         dissipation_density = (
-            bounded_tangent
+            endpoint_tangent
             * tangential_speed
             * pair_weight
         )
@@ -503,6 +597,9 @@ class CHPGNS(nn.Module):
             self.scalar_dim,
             tangential_ratio_cap=float(
                 model_cfg.get("contact_tangential_ratio_cap", 1.0)
+            ),
+            enforce_action_reaction=bool(
+                get_cfg(cfg, "contact.enforce_action_reaction", True)
             ),
         )
         self.residual_channel = VectorChannelLinear(self.vector_dim, 1)

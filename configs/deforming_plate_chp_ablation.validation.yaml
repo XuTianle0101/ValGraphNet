@@ -92,9 +92,13 @@ variants:
 
   unconstrained_contact:
     axis: contact_conservation
-    status: blocked
-    missing_capability: unconstrained_pair_force_scatter
-    blocked_reason: PairForceHeads always scatters equal-and-opposite pair forces; there is no matched unconstrained contact head.
+    status: runnable
+    description: Matched contact head evaluated in both directed orientations and scattered independently, without enforcing equal-and-opposite endpoint forces.
+    overrides:
+      contact:
+        enforce_action_reaction: false
+      training:
+        output_dir: outputs/deforming_plate_chp_ablation/unconstrained_contact_seed42
 
   cell_memory:
     axis: cell_memory

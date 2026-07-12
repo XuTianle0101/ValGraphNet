@@ -232,6 +232,139 @@ def test_pair_force_scatter_has_exact_zero_resultant():
     torch.testing.assert_close(assembled.sum(0), torch.zeros(3), atol=1.0e-6, rtol=0)
 
 
+def _set_signed_contact_fixture(heads: PairForceHeads) -> None:
+    for parameter in heads.parameters():
+        torch.nn.init.zeros_(parameter)
+    # Feature layout for scalar_dim=1 is [sum, difference, distance, stretch,
+    # normal_velocity, relative_speed].  Make only the signed difference alter
+    # the normal-force output.
+    heads.contact[0].weight.data[0, 1] = 1.0
+    heads.contact[2].weight.data[0, 0] = 1.0
+
+
+def _legacy_conservative_contact(
+    heads: PairForceHeads,
+    scalar: torch.Tensor,
+    position: torch.Tensor,
+    velocity: torch.Tensor,
+    pairs: torch.Tensor,
+    radius: float,
+    reference: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    features, direction, relative_velocity, normal_velocity = heads.invariants(
+        scalar, position, velocity, pairs, reference
+    )
+    raw = heads.contact(features)
+    distance = features[:, -4:-3]
+    src, dst = pairs
+    reference_distance = torch.linalg.vector_norm(
+        reference[dst] - reference[src], dim=1, keepdim=True
+    )
+    contact_distance = reference_distance.clamp_max(float(radius))
+    penetration = (
+        (contact_distance - distance) / contact_distance.clamp_min(1.0e-8)
+    ).clamp_min(0.0)
+    normal_magnitude = torch.nn.functional.softplus(raw[:, :1]) * penetration
+    normal_force = -normal_magnitude * direction
+    tangent_velocity = relative_velocity - normal_velocity * direction
+    tangent_coefficient = torch.nn.functional.softplus(raw[:, 1:2])
+    tangent_speed = torch.linalg.vector_norm(
+        tangent_velocity, dim=1, keepdim=True
+    )
+    candidate = tangent_coefficient * tangent_speed * penetration
+    cap = heads.tangential_ratio_cap * normal_magnitude
+    bounded = cap * torch.tanh(candidate / cap.clamp_min(1.0e-8))
+    tangent_direction = tangent_velocity / tangent_speed.clamp_min(1.0e-8)
+    pair_weight = heads.pair_normalization(pairs, position.shape[0]).to(
+        position.dtype
+    )
+    force_src = (normal_force + bounded * tangent_direction) * pair_weight
+    force = heads.scatter_pair(force_src, pairs, position.shape[0])
+    dissipation = (bounded * tangent_speed * pair_weight).sum()
+    return force, penetration.max(), dissipation
+
+
+def test_default_contact_path_matches_legacy_action_reaction_formula():
+    torch.manual_seed(23)
+    heads = PairForceHeads(3)
+    scalar = torch.randn(4, 3)
+    reference = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0], [0.0, 0.02, 0.0], [0.02, 0.02, 0.0]]
+    )
+    position = 0.5 * reference
+    velocity = torch.randn(4, 3)
+    pairs = torch.tensor([[0, 2], [1, 3]])
+
+    actual = heads.contact_force(
+        scalar,
+        position,
+        velocity,
+        pairs,
+        radius=0.03,
+        reference_position=reference,
+    )
+    expected = _legacy_conservative_contact(
+        heads, scalar, position, velocity, pairs, 0.03, reference
+    )
+
+    for actual_value, expected_value in zip(actual, expected):
+        torch.testing.assert_close(actual_value, expected_value, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(actual[0].sum(0), torch.zeros(3), atol=1.0e-6, rtol=0)
+
+
+def test_unconstrained_contact_is_parameter_matched_and_can_break_pair_balance():
+    conservative = PairForceHeads(1, enforce_action_reaction=True)
+    unconstrained = PairForceHeads(1, enforce_action_reaction=False)
+    _set_signed_contact_fixture(conservative)
+    unconstrained.load_state_dict(conservative.state_dict())
+    assert sum(parameter.numel() for parameter in conservative.parameters()) == sum(
+        parameter.numel() for parameter in unconstrained.parameters()
+    )
+    assert {
+        key: tuple(value.shape) for key, value in conservative.state_dict().items()
+    } == {key: tuple(value.shape) for key, value in unconstrained.state_dict().items()}
+
+    scalar = torch.tensor([[2.0], [0.0]])
+    reference = torch.tensor([[0.0, 0.0, 0.0], [0.02, 0.0, 0.0]])
+    position = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    velocity = torch.zeros_like(position)
+    pairs = torch.tensor([[0], [1]])
+    constrained_force, _, _ = conservative.contact_force(
+        scalar, position, velocity, pairs, 0.03, reference_position=reference
+    )
+    unconstrained_force, _, _ = unconstrained.contact_force(
+        scalar, position, velocity, pairs, 0.03, reference_position=reference
+    )
+
+    torch.testing.assert_close(
+        constrained_force.sum(0), torch.zeros(3), atol=1.0e-7, rtol=0
+    )
+    assert torch.linalg.vector_norm(unconstrained_force.sum(0)) > 1.0e-4
+
+    damping, _ = unconstrained.mesh_damping(
+        scalar,
+        position,
+        torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+        pairs,
+        reference,
+    )
+    torch.testing.assert_close(damping.sum(0), torch.zeros(3), atol=1.0e-7, rtol=0)
+
+
+def test_chp_threads_contact_conservation_switch_without_shape_changes():
+    constrained_cfg = _cfg()
+    unconstrained_cfg = _cfg()
+    unconstrained_cfg["contact"]["enforce_action_reaction"] = False
+    constrained = CHPGNS(constrained_cfg)
+    unconstrained = CHPGNS(unconstrained_cfg)
+
+    assert constrained.force_heads.enforce_action_reaction is True
+    assert unconstrained.force_heads.enforce_action_reaction is False
+    assert {
+        key: tuple(value.shape) for key, value in constrained.state_dict().items()
+    } == {key: tuple(value.shape) for key, value in unconstrained.state_dict().items()}
+
+
 def test_reference_contact_gap_has_zero_force_and_dissipation():
     heads = PairForceHeads(4)
     reference = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])

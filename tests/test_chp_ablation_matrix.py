@@ -30,6 +30,7 @@ def test_default_matrix_is_honest_about_supported_ablation_axes(tmp_path):
     assert set(value["variant_id"] for value in plan["runnable"].values()) == {
         "chp_full",
         "flat_processor",
+        "unconstrained_contact",
         "one_step",
         "no_work_energy",
     }
@@ -40,7 +41,6 @@ def test_default_matrix_is_honest_about_supported_ablation_axes(tmp_path):
     )
     assert set(plan["incomplete_required_comparisons"]) == {
         "direct_decoder_vs_potential",
-        "unconstrained_vs_action_reaction_contact",
     }
 
 
@@ -54,6 +54,7 @@ def test_materialized_variants_are_single_factor_and_validation_only(tmp_path):
     one_step = by_variant["one_step"]
     no_work = by_variant["no_work_energy"]
     flat = by_variant["flat_processor"]
+    unconstrained = by_variant["unconstrained_contact"]
 
     assert one_step["training"]["curriculum"] == [{"horizon": 1, "epochs": 16}]
     assert one_step["training"]["checkpoint_min_horizon"] == 1
@@ -68,6 +69,15 @@ def test_materialized_variants_are_single_factor_and_validation_only(tmp_path):
     matched_full.pop("ablation")
     matched_flat.pop("ablation")
     assert matched_flat == matched_full
+    assert full["contact"].get("enforce_action_reaction", True) is True
+    assert unconstrained["contact"]["enforce_action_reaction"] is False
+    matched_contact = deepcopy(unconstrained)
+    matched_contact["contact"].pop("enforce_action_reaction")
+    matched_contact["training"]["output_dir"] = full["training"]["output_dir"]
+    matched_contact.pop("ablation")
+    full_without_tag = deepcopy(full)
+    full_without_tag.pop("ablation")
+    assert matched_contact == full_without_tag
     for cfg in by_variant.values():
         assert cfg["training"]["device"] == "cuda"
         assert cfg["training"]["amp_dtype"] == "bfloat16"
@@ -101,6 +111,7 @@ def test_blocked_or_unknown_variant_cannot_be_scheduled(tmp_path):
         "checkpoints": {
             "chp_full": {"42": "missing.pt"},
             "flat_processor": {"42": "missing.pt"},
+            "unconstrained_contact": {"42": "missing.pt"},
             "one_step": {"42": "missing.pt"},
             "no_work_energy": {"42": "missing.pt"},
         }
@@ -122,6 +133,7 @@ def test_dry_run_emits_only_fixed_validation_commands(tmp_path):
         "checkpoints": {
             "chp_full": {"42": "full.pt"},
             "flat_processor": {"42": "flat.pt"},
+            "unconstrained_contact": {"42": "contact.pt"},
             "one_step": {"42": "one.pt"},
             "no_work_energy": {"42": "energy.pt"},
         }
@@ -132,7 +144,7 @@ def test_dry_run_emits_only_fixed_validation_commands(tmp_path):
         tmp_path / "evaluation",
         dry_run=True,
     )
-    assert len(result["records"]) == 4
+    assert len(result["records"]) == 5
     for record in result["records"]:
         command = record["command"]
         split_index = command.index("--split") + 1

@@ -138,6 +138,10 @@ def _validate_variant_override(variant_id: str, spec: Mapping[str, Any]) -> None
             "model.use_topology_hierarchy",
             "training.output_dir",
         },
+        "contact_conservation": {
+            "contact.enforce_action_reaction",
+            "training.output_dir",
+        },
     }.get(axis)
     if allowed is None:
         raise AblationProtocolError(
@@ -171,6 +175,13 @@ def _validate_variant_override(variant_id: str, spec: Mapping[str, Any]) -> None
     ) is not False:
         raise AblationProtocolError(
             "flat hierarchy ablation must set model.use_topology_hierarchy=false"
+        )
+    if axis == "contact_conservation" and get_cfg(
+        dict(overrides), "contact.enforce_action_reaction", None
+    ) is not False:
+        raise AblationProtocolError(
+            "unconstrained contact ablation must set "
+            "contact.enforce_action_reaction=false"
         )
 
 
