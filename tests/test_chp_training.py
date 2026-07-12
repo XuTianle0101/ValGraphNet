@@ -16,6 +16,7 @@ from valgraphnet.chp_train import (
     fit_chp_normalizers,
     integration_consistent_targets,
     minimax_checkpoint_score,
+    pooled_positive_constitutive_scale,
     load_native_reference,
     select_rollout_start,
     stress_frame_scores,
@@ -80,6 +81,31 @@ def test_noise_corrected_targets_match_two_symplectic_substeps():
     torch.testing.assert_close(
         target_velocity, state.velocity + dt * acceleration
     )
+
+
+def test_constitutive_scale_minimizes_the_pooled_gate_objective():
+    prediction_square = torch.tensor(100.0)
+    prediction_target = torch.tensor(20.0)
+    target_square = torch.tensor(80.0)
+    factor = pooled_positive_constitutive_scale(
+        prediction_square,
+        prediction_target,
+        minimum=1.0e-3,
+        maximum=1.0e4,
+    )
+    torch.testing.assert_close(factor, torch.tensor(0.2))
+    selected_error = (
+        factor.square() * prediction_square
+        - 2.0 * factor * prediction_target
+        + target_square
+    )
+    median_frame_factor = torch.tensor(3.0)
+    median_error = (
+        median_frame_factor.square() * prediction_square
+        - 2.0 * median_frame_factor * prediction_target
+        + target_square
+    )
+    assert selected_error < median_error
 
 
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():

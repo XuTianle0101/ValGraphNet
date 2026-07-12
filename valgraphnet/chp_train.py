@@ -902,6 +902,30 @@ def _constitutive_parameters(model: CHPGNS) -> list[torch.nn.Parameter]:
     return parameters
 
 
+def pooled_positive_constitutive_scale(
+    prediction_square: torch.Tensor,
+    prediction_target: torch.Tensor,
+    *,
+    minimum: float,
+    maximum: float,
+) -> torch.Tensor:
+    """Return the constrained scale minimizing the pooled squared error."""
+
+    if float(minimum) <= 0.0 or float(maximum) < float(minimum):
+        raise ValueError("constitutive scale bounds must satisfy 0 < minimum <= maximum")
+    square = torch.as_tensor(prediction_square)
+    cross = torch.as_tensor(
+        prediction_target, device=square.device, dtype=square.dtype
+    )
+    if square.numel() != 1 or cross.numel() != 1:
+        raise ValueError("pooled constitutive moments must be scalar")
+    if not bool(torch.isfinite(square).item()) or float(square) <= 0.0:
+        raise ValueError("pooled prediction square must be finite and positive")
+    if not bool(torch.isfinite(cross).item()):
+        raise ValueError("pooled prediction-target moment must be finite")
+    return (cross / square).clamp(min=float(minimum), max=float(maximum))
+
+
 @torch.no_grad()
 def calibrate_constitutive_modulus(
     model: CHPGNS,
@@ -989,15 +1013,24 @@ def calibrate_constitutive_modulus(
             admissible_frames += 1
     if not frame_moments:
         raise RuntimeError("no admissible non-zero frames for constitutive calibration")
-    # A pooled least-squares factor is dominated by a handful of nearly
-    # singular cells.  The median of per-frame optima is a robust train-only
-    # modulus estimator and is stable across mesh resolutions.
     frame_factors = torch.stack(
         [cross / square for square, cross, _ in frame_moments]
     )
-    factor = frame_factors.median().clamp(
-        min=float(get_cfg(cfg, "constitutive_pretraining.minimum_scale_factor", 1.0e-3)),
-        max=float(get_cfg(cfg, "constitutive_pretraining.maximum_scale_factor", 1.0e4)),
+    minimum_factor = float(
+        get_cfg(cfg, "constitutive_pretraining.minimum_scale_factor", 1.0e-3)
+    )
+    maximum_factor = float(
+        get_cfg(cfg, "constitutive_pretraining.maximum_scale_factor", 1.0e4)
+    )
+    # Checkpoint gates use pooled physical rRMSE, so their train-only scale
+    # initialization must optimize that same falsifiable objective.  Keep the
+    # per-frame distribution as a robustness diagnostic, but do not allow its
+    # median to make the pooled error worse (which occurred on deforming_plate).
+    factor = pooled_positive_constitutive_scale(
+        prediction_square,
+        prediction_target,
+        minimum=minimum_factor,
+        maximum=maximum_factor,
     )
     before_error = prediction_square - 2.0 * prediction_target + target_square
     after_error = (
@@ -1026,6 +1059,7 @@ def calibrate_constitutive_modulus(
     )
     return {
         "scale_factor": float(factor.item()),
+        "scale_estimator": "constrained_pooled_least_squares",
         "physical_modulus": float(model.log_stress_scale.exp().item()),
         "mass_scale": float(model.log_mass_scale.exp().item()),
         "relative_rmse_before": float(
