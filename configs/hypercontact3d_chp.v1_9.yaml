@@ -65,6 +65,13 @@ model:
   potential_j_init: [1.0, 0.1]
   potential_log_j_init: 1.0
   potential_minimum_coefficient: 1.0e-12
+  # Derived from the train-only HyperContact invariant spread.  Fixed scales
+  # are checkpointed with the model and never fitted on OOD splits.
+  potential_ridge_terms: 32
+  potential_ridge_init: 1.0e-3
+  potential_ridge_input_scales: [0.004, 0.004, 0.007]
+  potential_ridge_beta: 2.0
+  potential_ridge_center_limit: 4.0
   fiber_order: 0
   inversion_stiffness: 10.0
   minimum_j: 0.0
@@ -110,7 +117,7 @@ constitutive_pretraining:
   minimum_scale_factor: 1.0e-3
   maximum_scale_factor: 1.0e4
   preserve_force_mass_ratio: true
-  epochs: 2
+  epochs: 12
   cases_per_epoch: 128
   frames_per_case: 8
   lr: 1.0e-3
@@ -147,7 +154,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/hypercontact3d_chp_v1_9_seed42
+  output_dir: outputs/hypercontact3d_chp_ridge_v1_9_seed42
   resume_from: auto
 
 validation:

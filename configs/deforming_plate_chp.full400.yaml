@@ -26,6 +26,14 @@ model:
   potential_j_init: [1.0, 0.1]
   potential_log_j_init: 1.0
   potential_minimum_coefficient: 1.0e-12
+  # Train-only invariant standard deviations are approximately
+  # [0.0134, 0.0174, 0.0145].  The convex ridge extension adds coupled,
+  # objective constitutive capacity while retaining explicit dPsi/dF.
+  potential_ridge_terms: 32
+  potential_ridge_init: 1.0e-3
+  potential_ridge_input_scales: [0.015, 0.018, 0.015]
+  potential_ridge_beta: 2.0
+  potential_ridge_center_limit: 4.0
   fiber_order: 0
   inversion_stiffness: 10.0
   minimum_j: 0.0
@@ -76,8 +84,8 @@ constitutive_pretraining:
   minimum_scale_factor: 1.0e-3
   maximum_scale_factor: 1.0e4
   preserve_force_mass_ratio: true
-  epochs: 2
-  cases_per_epoch: 128
+  epochs: 12
+  cases_per_epoch: 256
   frames_per_case: 8
   lr: 1.0e-3
   grad_clip_norm: 10.0
@@ -136,7 +144,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/deforming_plate_chp_full400_seed42
+  output_dir: outputs/deforming_plate_chp_ridge_full400_seed42
   resume_from: auto
 
 validation:
