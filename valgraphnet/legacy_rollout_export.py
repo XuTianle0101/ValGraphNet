@@ -12,12 +12,24 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from valgraphnet.checkpoint_provenance import (
+    build_repo_data_contract,
+    compact_data_contract,
+    config_sha256,
+    sha256_file,
+    strict_checkpoint_provenance,
+    validate_repo_checkpoint,
+)
 from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
+from valgraphnet.data.case import read_split_file
 from valgraphnet.gpu_graph import update_state
 from valgraphnet.model import build_model
 from valgraphnet.normalization import Normalizers, split_target
-from valgraphnet.physical_evaluation import evaluate_prediction_directory
+from valgraphnet.physical_evaluation import (
+    evaluate_prediction_directory,
+    select_case_ids,
+)
 from valgraphnet.train import autocast_context
 
 
@@ -29,15 +41,38 @@ def export_legacy_rollouts(
     *,
     split: str | None = None,
     max_cases: int | None = None,
+    case_selection: str | None = None,
 ) -> dict[str, Any]:
-    if not torch.cuda.is_available():
-        raise RuntimeError("legacy comparison rollout requires CUDA")
-    device = torch.device("cuda")
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=False
     )
+    strict = strict_checkpoint_provenance(cfg)
+    if strict:
+        if split is None or max_cases is None or case_selection is None:
+            raise ValueError(
+                "strict_v2 legacy export requires explicit --split, "
+                "--max-cases, and --case-selection"
+            )
+        configured_selection = str(
+            get_cfg(cfg, "evaluation.case_selection", "")
+        )
+        if case_selection != configured_selection:
+            raise ValueError(
+                "strict_v2 case selection differs from evaluation.case_selection"
+            )
+    data_contract = build_repo_data_contract(cfg) if strict else None
+    validate_repo_checkpoint(
+        checkpoint,
+        cfg,
+        data_contract,
+        purpose="export",
+        source=checkpoint_path,
+    )
     effective = deepcopy(checkpoint.get("cfg", cfg))
-    effective["data"] = deepcopy(cfg.get("data", effective.get("data", {})))
+    if not strict:
+        # Historical checkpoints did not bind their data root.  Preserve their
+        # previous relocation behavior outside formal strict_v2 experiments.
+        effective["data"] = deepcopy(cfg.get("data", effective.get("data", {})))
     effective.setdefault("training", {})["device"] = "cuda"
     effective.setdefault("model", {})["num_processor_checkpoint_segments"] = 0
     root = get_cfg(effective, "data.root", get_cfg(effective, "data.case_dir", None))
@@ -45,15 +80,34 @@ def export_legacy_rollouts(
         effective, "data.split_file", get_cfg(effective, "data.case_split_file", None)
     )
     selected_split = split or str(get_cfg(effective, "data.test_split", "test"))
+    selection = case_selection or str(
+        get_cfg(cfg, "evaluation.case_selection", "head")
+    )
     if root is None or split_file is None:
         raise ValueError("legacy export requires data root and split file")
-    dataset = ValveGraphDataset(
-        root, effective, split=selected_split, split_file=split_file
+    selected_case_ids = _select_export_case_ids(
+        split_file,
+        selected_split,
+        max_cases,
+        selection,
     )
-    cases = dataset.cases[:max_cases] if max_cases is not None else dataset.cases
+    if not selected_case_ids:
+        raise ValueError("legacy export selected no cases")
+    dataset = ValveGraphDataset(
+        root,
+        effective,
+        case_ids=selected_case_ids,
+    )
+    cases = dataset.cases
+    if not torch.cuda.is_available():
+        raise RuntimeError("legacy comparison rollout requires CUDA")
+    device = torch.device("cuda")
     output_dim = int(checkpoint["output_dim"])
     model = build_model(effective, output_dim=output_dim).to(device)
-    model.load_compatible_state_dict(checkpoint["model"])
+    if strict:
+        model.load_state_dict(checkpoint["model"])
+    else:
+        model.load_compatible_state_dict(checkpoint["model"])
     model.eval()
     normalizers = None
     if checkpoint.get("normalizers") is not None:
@@ -92,7 +146,10 @@ def export_legacy_rollouts(
                 concatenated = normalizers.inverse_target(concatenated)
             physical = split_target(concatenated)
             state = update_state(physical, state, tensors, step + 1)
-            if not bool(torch.isfinite(state["U"]).all().item()):
+            if not bool(
+                torch.isfinite(state["U"]).all().item()
+                and torch.isfinite(physical["stress"]).all().item()
+            ):
                 diverged_at = step + 1
                 break
             displacement.append(state["U"].float().cpu().numpy())
@@ -119,9 +176,16 @@ def export_legacy_rollouts(
         )
     torch.cuda.synchronize(device)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": "ValGraphNet legacy",
         "checkpoint": str(Path(checkpoint_path).resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "config_sha256": config_sha256(cfg),
+        "data_contract": compact_data_contract(data_contract),
+        "split": selected_split,
+        "max_cases": max_cases,
+        "case_selection": selection,
+        "selected_case_ids": selected_case_ids,
         "device": torch.cuda.get_device_name(device),
         "peak_memory_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
         "seconds": time.perf_counter() - start_time,
@@ -129,11 +193,49 @@ def export_legacy_rollouts(
     }
     with (output / "manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, allow_nan=False)
-    metrics = evaluate_prediction_directory(
+    metrics = _evaluate_exported_predictions(
         root,
         split_file,
         selected_split,
         output,
         output_path=output / "metrics.json",
+        max_cases=max_cases,
+        case_selection=selection,
     )
     return {"manifest": manifest, "metrics": metrics}
+
+
+def _select_export_case_ids(
+    split_file: str | Path,
+    split: str,
+    max_cases: int | None,
+    case_selection: str,
+) -> list[str]:
+    return select_case_ids(
+        read_split_file(split_file, split),
+        max_cases,
+        case_selection,
+    )
+
+
+def _evaluate_exported_predictions(
+    root: str | Path,
+    split_file: str | Path,
+    split: str,
+    output: str | Path,
+    *,
+    output_path: str | Path,
+    max_cases: int | None,
+    case_selection: str,
+) -> dict[str, Any]:
+    """Evaluate exactly the same case subset that was exported."""
+
+    return evaluate_prediction_directory(
+        root,
+        split_file,
+        split,
+        output,
+        output_path=output_path,
+        max_cases=max_cases,
+        case_selection=case_selection,
+    )

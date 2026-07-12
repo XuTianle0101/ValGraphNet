@@ -3,6 +3,15 @@
 # architecture baseline while using the same 400-frame train/validation data.
 seed: 42
 
+provenance:
+  checkpoint_policy: strict_v2
+  expected_frames: 400
+  expected_split_counts:
+    train: 1000
+    val: 100
+    test: 100
+  expected_case_schema_version: 2
+
 data:
   root: data/deforming_plate_cases_400
   split_file: data/deforming_plate_cases_400/splits.json
@@ -86,3 +95,4 @@ rollout:
 
 evaluation:
   steps: 399
+  case_selection: even

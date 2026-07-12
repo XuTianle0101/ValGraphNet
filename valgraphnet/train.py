@@ -13,6 +13,14 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from valgraphnet.checkpoint_provenance import (
+    atomic_torch_save,
+    build_repo_data_contract,
+    checkpoint_metadata,
+    resume_config_sha256,
+    strict_checkpoint_provenance,
+    validate_repo_checkpoint,
+)
 from valgraphnet.config import get_cfg
 from valgraphnet.data import PerTrajectoryStepSampler, ValveGraphDataset, collate_valve_graphs
 from valgraphnet.losses import valve_loss
@@ -36,19 +44,80 @@ def run_training(cfg: dict[str, Any]) -> Path:
     set_seed(int(cfg.get("seed", 42)))
     device = resolve_device(str(get_cfg(cfg, "training.device", "auto")))
     output_dir = Path(get_cfg(cfg, "training.output_dir", "outputs/valve_hybrid"))
+    resume_path = _resolve_resume_path(cfg, output_dir)
+    _validate_output_directory_for_resume(cfg, output_dir, resume_path)
+    train_dataset, val_dataset = build_datasets(cfg)
+    data_contract = (
+        build_repo_data_contract(cfg)
+        if strict_checkpoint_provenance(cfg)
+        else None
+    )
+    resume_checkpoint_cpu = (
+        _torch_load(resume_path, map_location="cpu")
+        if resume_path is not None
+        else None
+    )
+    if resume_checkpoint_cpu is not None:
+        validate_repo_checkpoint(
+            resume_checkpoint_cpu,
+            cfg,
+            data_contract,
+            purpose="resume",
+            source=resume_path,
+        )
+    initial_path = get_cfg(cfg, "training.initial_checkpoint", None)
+    if resume_path is None and initial_path and not Path(initial_path).exists():
+        raise FileNotFoundError(
+            f"initial checkpoint does not exist: {Path(initial_path)}"
+        )
+    initial_checkpoint_cpu = (
+        _torch_load(Path(initial_path), map_location="cpu")
+        if resume_path is None and initial_path and Path(initial_path).exists()
+        else None
+    )
+    if initial_checkpoint_cpu is not None:
+        validate_repo_checkpoint(
+            initial_checkpoint_cpu,
+            cfg,
+            data_contract,
+            purpose="warm_start",
+            source=initial_path,
+        )
+    stress_initial_path = get_cfg(
+        cfg, "training.stress_initial_checkpoint", None
+    )
+    if resume_path is None and initial_path and stress_initial_path:
+        if not Path(stress_initial_path).exists():
+            raise FileNotFoundError(
+                f"stress initial checkpoint does not exist: {stress_initial_path}"
+            )
+        stress_initial_checkpoint_cpu = _torch_load(
+            Path(stress_initial_path), map_location="cpu"
+        )
+        validate_repo_checkpoint(
+            stress_initial_checkpoint_cpu,
+            cfg,
+            data_contract,
+            purpose="warm_start",
+            source=stress_initial_path,
+        )
+
+    # In strict mode no run metadata is overwritten until resume provenance is
+    # accepted.  A corrupt or 200-frame checkpoint therefore cannot taint the
+    # formal full400 output directory.
     output_dir.mkdir(parents=True, exist_ok=True)
     _save_json(output_dir / "config_snapshot.json", cfg)
+    if data_contract is not None:
+        _save_json(output_dir / "data_contract.json", data_contract)
 
-    train_dataset, val_dataset = build_datasets(cfg)
-    resume_path = _resolve_resume_path(cfg, output_dir)
     normalizers = None
     if bool(get_cfg(cfg, "normalization.enabled", True)):
-        stats_path = resume_path or get_cfg(cfg, "training.initial_checkpoint", None)
-        stats_state = (
-            _torch_load(Path(stats_path), map_location="cpu")
-            if stats_path and Path(stats_path).exists()
-            else None
-        )
+        # A strict warm-start migrates weights only.  It must not silently carry
+        # normalizers from another data contract.
+        stats_path = resume_path or initial_path
+        stats_state = resume_checkpoint_cpu
+        if stats_state is None and not strict_checkpoint_provenance(cfg):
+            stats_state = initial_checkpoint_cpu
         if stats_state is not None and stats_state.get("normalizers") is not None:
             normalizers = Normalizers.from_state_dict(stats_state["normalizers"])
             print(f"reused normalization statistics from: {stats_path}")
@@ -121,24 +190,55 @@ def run_training(cfg: dict[str, Any]) -> Path:
     history = _load_history(history_path)
     if resume_path is not None:
         checkpoint = _torch_load(resume_path, map_location=device)
-        model.load_compatible_state_dict(checkpoint["model"])
+        validate_repo_checkpoint(
+            checkpoint,
+            cfg,
+            data_contract,
+            purpose="resume",
+            source=resume_path,
+        )
+        if strict_checkpoint_provenance(cfg):
+            model.load_state_dict(checkpoint["model"])
+        else:
+            model.load_compatible_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_loss = float(checkpoint.get("score", best_loss))
         if best_path.exists():
-            best_loss = float(_torch_load(best_path, map_location="cpu").get("score", best_loss))
+            best_checkpoint = _torch_load(best_path, map_location="cpu")
+            validate_repo_checkpoint(
+                best_checkpoint,
+                cfg,
+                data_contract,
+                purpose="resume",
+                source=best_path,
+            )
+            best_loss = float(best_checkpoint.get("score", best_loss))
         print(f"resumed checkpoint: {resume_path} at epoch {start_epoch - 1}")
     else:
-        initial_path = get_cfg(cfg, "training.initial_checkpoint", None)
         if initial_path:
             checkpoint = _torch_load(Path(initial_path), map_location=device)
+            validate_repo_checkpoint(
+                checkpoint,
+                cfg,
+                data_contract,
+                purpose="warm_start",
+                source=initial_path,
+            )
             model.load_compatible_state_dict(checkpoint["model"])
             print(f"initialized compatible weights from: {initial_path}")
-            stress_path = get_cfg(cfg, "training.stress_initial_checkpoint", None)
+            stress_path = stress_initial_path
             if stress_path:
                 stress_checkpoint = _torch_load(Path(stress_path), map_location=device)
+                validate_repo_checkpoint(
+                    stress_checkpoint,
+                    cfg,
+                    data_contract,
+                    purpose="warm_start",
+                    source=stress_path,
+                )
                 model.load_stress_decoder_state_dict(stress_checkpoint["model"])
                 print(f"initialized stress decoder from: {stress_path}")
 
@@ -173,6 +273,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                     train_dataset.output_dim,
                     0,
                     best_loss,
+                    data_contract,
                 )
                 print(
                     "initial rollout checkpoint: "
@@ -243,6 +344,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 train_dataset.output_dim,
                 epoch,
                 best_loss,
+                data_contract,
             )
         checkpoint_score = score if score is not None else best_loss
         if not np.isfinite(checkpoint_score):
@@ -258,6 +360,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 train_dataset.output_dim,
                 epoch,
                 checkpoint_score,
+                data_contract,
             )
         if save_every > 0 and epoch % save_every == 0:
             save_checkpoint(
@@ -270,6 +373,7 @@ def run_training(cfg: dict[str, Any]) -> Path:
                 train_dataset.output_dim,
                 epoch,
                 checkpoint_score,
+                data_contract,
             )
 
     return best_path
@@ -311,8 +415,44 @@ def _resolve_resume_path(cfg: dict[str, Any], output_dir: Path) -> Path | None:
     resume_from = get_cfg(cfg, "training.resume_from", None)
     if not resume_from:
         return None
-    path = output_dir / "latest.pt" if str(resume_from).lower() == "auto" else Path(resume_from)
-    return path if path.exists() else None
+    if str(resume_from).lower() == "auto":
+        path = output_dir / "latest.pt"
+        return path if path.exists() else None
+    path = Path(resume_from)
+    if not path.exists():
+        raise FileNotFoundError(f"explicit resume checkpoint does not exist: {path}")
+    return path
+
+
+def _validate_output_directory_for_resume(
+    cfg: dict[str, Any],
+    output_dir: Path,
+    resume_path: Path | None,
+) -> None:
+    """Reject accidental fresh training in a strict, populated run directory."""
+
+    if not strict_checkpoint_provenance(cfg) or not output_dir.exists():
+        return
+    snapshot_path = output_dir / "config_snapshot.json"
+    if snapshot_path.exists():
+        with snapshot_path.open("r", encoding="utf-8") as handle:
+            snapshot = json.load(handle)
+        if resume_config_sha256(snapshot) != resume_config_sha256(cfg):
+            raise ValueError(
+                f"{snapshot_path}: existing run config does not match strict resume"
+            )
+    artifacts = [
+        path
+        for path in output_dir.iterdir()
+        if path.name in {"history.json", "best.pt", "latest.pt"}
+        or (path.name.startswith("epoch_") and path.suffix == ".pt")
+    ]
+    if artifacts and resume_path is None:
+        names = ", ".join(sorted(path.name for path in artifacts))
+        raise RuntimeError(
+            "strict_v2 refuses to start fresh in a populated output directory: "
+            f"{names}"
+        )
 
 
 def _torch_load(path: str | Path, map_location=None):
@@ -519,9 +659,9 @@ def evaluate_rollout_metric(
         if requested_steps is not None:
             steps = min(steps, int(requested_steps))
         max_evaluated_steps = max(max_evaluated_steps, steps)
-        free = ~(tensors["fixed"] | tensors["prescribed"])
-        if not bool(free.any().item()):
-            free = ~tensors["fixed"]
+        free, stress_mask = _rollout_metric_masks(tensors)
+        case_stress_truth: list[torch.Tensor] = []
+        case_stress_residual: list[torch.Tensor] = []
 
         for step in range(steps):
             graph = dataset.make_graph_gpu(case_index, step, device, state=state)
@@ -540,16 +680,30 @@ def evaluate_rollout_metric(
             u_error += (u_residual * u_residual).sum()
             u_reference += (tensors["U"][step + 1, free] ** 2).sum()
             u_count += u_residual.numel()
-            if physical["stress"].numel() > 0:
-                truth_stress = tensors["S"][step + 1, free, : physical["stress"].shape[1]]
-                stress_residual = physical["stress"][free] - truth_stress
+            stress_dim = min(
+                int(physical["stress"].shape[1]),
+                int(tensors["S"].shape[-1]),
+                1,
+            )
+            if stress_dim > 0:
+                truth_stress = tensors["S"][
+                    step + 1, stress_mask, :stress_dim
+                ]
+                stress_residual = (
+                    physical["stress"][stress_mask, :stress_dim] - truth_stress
+                )
                 stress_error += (stress_residual * stress_residual).sum()
                 stress_reference += (truth_stress * truth_stress).sum()
                 stress_count += stress_residual.numel()
-                threshold = torch.quantile(truth_stress.abs().reshape(-1), 0.95)
-                peak = truth_stress.abs() >= threshold
-                stress_p95_error += (stress_residual[peak] ** 2).sum()
-                stress_p95_reference += (truth_stress[peak] ** 2).sum()
+                case_stress_truth.append(truth_stress.reshape(-1))
+                case_stress_residual.append(stress_residual.reshape(-1))
+        if case_stress_truth:
+            case_p95_error, case_p95_reference = _trajectory_stress_p95_sums(
+                case_stress_truth,
+                case_stress_residual,
+            )
+            stress_p95_error += case_p95_error
+            stress_p95_reference += case_p95_reference
         final_residual = state["U"][free] - tensors["U"][steps, free]
         final_error += (final_residual * final_residual).sum()
         final_reference += (tensors["U"][steps, free] ** 2).sum()
@@ -624,6 +778,41 @@ def evaluate_rollout_metric(
     return result
 
 
+def _rollout_metric_masks(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the same moving/stress masks as the shared physical evaluator."""
+
+    fixed = tensors["fixed"].bool()
+    prescribed = tensors["prescribed"].bool()
+    moving = ~(fixed | prescribed)
+    if not bool(moving.any().item()):
+        moving = ~fixed
+    stress = ~prescribed
+    if not bool(stress.any().item()):
+        stress = torch.ones_like(prescribed, dtype=torch.bool)
+    return moving, stress
+
+
+def _trajectory_stress_p95_sums(
+    truth_parts: list[torch.Tensor],
+    residual_parts: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pool one trajectory, then select its truth-defined top-five-percent."""
+
+    if len(truth_parts) != len(residual_parts) or not truth_parts:
+        raise ValueError(
+            "truth/residual trajectory parts must be non-empty and aligned"
+        )
+    truth = torch.cat([part.reshape(-1) for part in truth_parts], dim=0)
+    residual = torch.cat([part.reshape(-1) for part in residual_parts], dim=0)
+    if truth.shape != residual.shape:
+        raise ValueError("truth and residual trajectory stress shapes differ")
+    threshold = torch.quantile(truth.abs(), 0.95)
+    peak = truth.abs() >= threshold
+    return (residual[peak] ** 2).sum(), (truth[peak] ** 2).sum()
+
+
 def _load_rollout_native_reference(cfg: dict[str, Any]) -> dict[str, float]:
     """Load the exact validation-only native artifact used for checkpointing."""
 
@@ -694,9 +883,25 @@ def save_checkpoint(
     output_dim: int,
     epoch: int,
     score: float,
+    data_contract: dict[str, Any] | None = None,
 ) -> None:
+    model_state = model.state_dict()
+    artifact_role = (
+        "best"
+        if path.name == "best.pt"
+        else "latest"
+        if path.name == "latest.pt"
+        else "epoch"
+    )
     state = {
-        "model": model.state_dict(),
+        **checkpoint_metadata(
+            cfg,
+            model_state,
+            data_contract,
+            output_dim,
+            artifact_role=artifact_role,
+        ),
+        "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "cfg": cfg,
@@ -705,7 +910,7 @@ def save_checkpoint(
         "epoch": int(epoch),
         "score": float(score),
     }
-    torch.save(state, path)
+    atomic_torch_save(state, path)
 
 
 def set_seed(seed: int) -> None:

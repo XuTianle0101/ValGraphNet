@@ -7,6 +7,7 @@ import pytest
 import torch
 import yaml
 
+from valgraphnet.checkpoint_provenance import checkpoint_metadata
 from valgraphnet.test_once import (
     PRIMARY_METRICS,
     TestOnceError,
@@ -177,6 +178,53 @@ def test_freeze_supports_every_checkpoint_family_without_test_access(tmp_path, f
     assert len(manifest["models"][0]["config"]["sha256"]) == 64
     assert len(manifest["models"][0]["checkpoint"]["sha256"]) == 64
     assert manifest["models"][0]["selection"]["split"] == "val"
+
+
+def test_freeze_accepts_strict_v2_repository_checkpoint(tmp_path):
+    model = _model_files(tmp_path, "repo")
+    config_path = tmp_path / model["config"]
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    cfg["provenance"] = {"checkpoint_policy": "strict_v2"}
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=True), encoding="utf-8")
+    state = {}
+    data_contract = {
+        "schema_version": 1,
+        "fingerprint_sha256": "a" * 64,
+        "split_file_sha256": "b" * 64,
+        "split_payload_sha256": "c" * 64,
+        "split_counts": {"train": 1, "val": 1, "test": 1},
+        "split_case_ids_sha256": {
+            "train": "d" * 64,
+            "val": "e" * 64,
+            "test": "f" * 64,
+        },
+        "test_content_accessed": False,
+    }
+    checkpoint = {
+        **checkpoint_metadata(
+            cfg,
+            state,
+            data_contract,
+            10,
+            artifact_role="best",
+        ),
+        "cfg": cfg,
+        "model": state,
+        "normalizers": {},
+        "output_dim": 10,
+        "epoch": 3,
+        "score": 0.5,
+    }
+    torch.save(checkpoint, tmp_path / model["checkpoint"])
+    spec = _write_spec(tmp_path, [model], experiment_id="strict-repo")
+
+    freeze_experiment(spec, tmp_path / "registry", workspace_root=tmp_path)
+    manifest = verify_frozen_experiment(tmp_path / "registry", "strict-repo")
+
+    assert manifest["models"][0]["family"] == "repo"
+    assert manifest["models"][0]["selection"]["criterion"] == (
+        "four_metric_native_ratio_minimax"
+    )
 
 
 def test_claim_is_atomic_and_same_experiment_cannot_run_twice(tmp_path):

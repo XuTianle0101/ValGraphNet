@@ -2,9 +2,17 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 
-from valgraphnet.train import _load_rollout_native_reference, _rollout_validation_due
+from valgraphnet.train import (
+    _load_rollout_native_reference,
+    _resolve_resume_path,
+    _rollout_metric_masks,
+    _rollout_validation_due,
+    _trajectory_stress_p95_sums,
+    _validate_output_directory_for_resume,
+)
 
 
 def test_rollout_checkpoint_schedule_always_includes_final_epoch():
@@ -77,3 +85,55 @@ def test_full400_repository_baseline_is_cuda_rollout_selected():
     assert cfg["validation"]["native_reference_file"].endswith(
         "native_val20/metrics.json"
     )
+    assert cfg["provenance"]["checkpoint_policy"] == "strict_v2"
+    assert cfg["provenance"]["expected_frames"] == 400
+    assert cfg["evaluation"]["case_selection"] == "even"
+
+
+def test_rollout_stress_mask_matches_shared_physical_evaluator():
+    tensors = {
+        "fixed": torch.tensor([False, True, False, True]),
+        "prescribed": torch.tensor([False, False, True, True]),
+    }
+
+    moving, stress = _rollout_metric_masks(tensors)
+
+    torch.testing.assert_close(
+        moving, torch.tensor([True, False, False, False])
+    )
+    # Fixed/clamped nodes remain in stress evaluation; only prescribed nodes
+    # are excluded, exactly as in physical_evaluation.py.
+    torch.testing.assert_close(
+        stress, torch.tensor([True, True, False, False])
+    )
+
+
+def test_rollout_p95_uses_one_threshold_for_the_complete_trajectory():
+    truth = [torch.tensor([1.0, 2.0]), torch.tensor([100.0, 200.0])]
+    residual = [torch.tensor([7.0, 8.0]), torch.tensor([9.0, 10.0])]
+
+    error, reference = _trajectory_stress_p95_sums(truth, residual)
+
+    # The trajectory-level 95th percentile is 185, so only truth=200 is in
+    # the peak region.  Per-frame selection would incorrectly include 2.
+    torch.testing.assert_close(error, torch.tensor(100.0))
+    torch.testing.assert_close(reference, torch.tensor(40_000.0))
+
+
+def test_strict_resume_rejects_missing_explicit_path_and_populated_fresh_output(
+    tmp_path,
+):
+    output = tmp_path / "run"
+    output.mkdir()
+    explicit = tmp_path / "missing.pt"
+    cfg = {
+        "provenance": {"checkpoint_policy": "strict_v2"},
+        "training": {"resume_from": str(explicit)},
+    }
+    with pytest.raises(FileNotFoundError, match="explicit resume"):
+        _resolve_resume_path(cfg, output)
+
+    (output / "history.json").write_text("[]", encoding="utf-8")
+    cfg["training"]["resume_from"] = "auto"
+    with pytest.raises(RuntimeError, match="populated output directory"):
+        _validate_output_directory_for_resume(cfg, output, None)

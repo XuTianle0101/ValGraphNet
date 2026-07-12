@@ -16,6 +16,11 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--split", default=None)
     parser.add_argument("--max-cases", type=int, default=None)
+    parser.add_argument(
+        "--case-selection",
+        choices=("head", "even"),
+        default=None,
+    )
     args = parser.parse_args()
     result = export_legacy_rollouts(
         load_config(args.config),
@@ -23,6 +28,7 @@ def main() -> None:
         args.out,
         split=args.split,
         max_cases=args.max_cases,
+        case_selection=args.case_selection,
     )
     print(json.dumps(result["metrics"]["summary"], indent=2))
 

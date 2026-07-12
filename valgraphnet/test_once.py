@@ -21,6 +21,14 @@ from typing import Any, Mapping
 import torch
 import yaml
 
+from valgraphnet.checkpoint_provenance import (
+    ARTIFACT_TYPE as REPOSITORY_ARTIFACT_TYPE,
+    CHECKPOINT_SCHEMA_VERSION as REPOSITORY_CHECKPOINT_SCHEMA_VERSION,
+    MODEL_FAMILY as REPOSITORY_MODEL_FAMILY,
+    config_sha256,
+    strict_checkpoint_provenance,
+)
+
 
 LOCK_SCHEMA_VERSION = 1
 CLAIM_SCHEMA_VERSION = 1
@@ -470,8 +478,42 @@ def _validate_family_selection(
         return {"criterion": "four_metric_native_ratio_minimax", "metrics": metrics}
 
     if family == "repo":
-        if checkpoint.get("model_family") is not None:
+        checkpoint_family = checkpoint.get("model_family")
+        if checkpoint_family not in {None, REPOSITORY_MODEL_FAMILY}:
             raise TestOnceError(f"{name}: repository checkpoint family is ambiguous")
+        if strict_checkpoint_provenance(config):
+            if checkpoint_family != REPOSITORY_MODEL_FAMILY:
+                raise TestOnceError(
+                    f"{name}: strict repository checkpoint model_family is missing"
+                )
+            if (
+                int(checkpoint.get("schema_version", 0))
+                != REPOSITORY_CHECKPOINT_SCHEMA_VERSION
+                or checkpoint.get("artifact_type") != REPOSITORY_ARTIFACT_TYPE
+                or checkpoint.get("artifact_role") != "best"
+            ):
+                raise TestOnceError(
+                    f"{name}: strict repository checkpoint schema is inconsistent"
+                )
+            provenance = checkpoint.get("provenance")
+            if not isinstance(provenance, Mapping) or provenance.get(
+                "config_sha256"
+            ) != config_sha256(checkpoint.get("cfg", {})):
+                raise TestOnceError(
+                    f"{name}: strict repository checkpoint provenance is inconsistent"
+                )
+            data_contract = provenance.get("data_contract")
+            if (
+                not isinstance(data_contract, Mapping)
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(data_contract.get("fingerprint_sha256", "")),
+                )
+                or data_contract.get("test_content_accessed") is not False
+            ):
+                raise TestOnceError(
+                    f"{name}: strict repository data provenance is inconsistent"
+                )
         if "normalizers" not in checkpoint or "output_dim" not in checkpoint:
             raise TestOnceError(f"{name}: checkpoint is not a repository-model artifact")
         training = config.get("training", {})
