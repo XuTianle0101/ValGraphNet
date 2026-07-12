@@ -196,6 +196,12 @@ def test_checkpoint_cannot_be_relabelled_after_config_changes(tmp_path):
         "residual_parameterization": CHPGNS.residual_parameterization,
         "residual_gate": CHPGNS.residual_gate,
         "scientific_gate_status": "passed",
+        "dynamics_pretraining_phase": "complete",
+        "dynamics_pretraining_phase_gate": {
+            "status": "passed",
+            "gate_role": "final_post_joint_residual_disabled",
+            "residual_enabled": False,
+        },
         "config": cfg,
     }
     path = tmp_path / "checkpoint.pt"

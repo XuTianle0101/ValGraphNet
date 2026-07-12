@@ -75,7 +75,13 @@ model:
   fiber_order: 0
   inversion_stiffness: 10.0
   minimum_j: 0.0
-  contact_substeps: 2
+  # Schema-9 evaluates force/contact twice, then advances the normalized load
+  # path with one global semi-implicit state update.  The predictor is only a
+  # force-evaluation state and must not introduce a second time increment.
+  contact_iterations: 2
+  integration_substeps: 1
+  contact_predictor_stop_gradient: true
+  contact_force_average: trapezoidal
   contact_tangential_ratio_cap: 1.0
   residual_acceleration_reference: 1.0e-3
   residual_acceleration_cap: 1.0e-2
@@ -94,7 +100,7 @@ contact:
   enabled: true
   radius: 0.003
   max_neighbors: 32
-  refresh_each_substep: true
+  refresh_each_iteration: true
 
 loss:
   position: 1.0
@@ -128,8 +134,9 @@ constitutive_pretraining:
   lr: 1.0e-3
   grad_clip_norm: 10.0
 
-# Static load-path derivatives are not physical accelerations. Do not pretrain
-# the dynamics residual against them as if this were a transient experiment.
+# Static load-path derivatives are not physical accelerations.  Keep transient
+# dynamics pretraining disabled; the schema-9 update is used only as a learned
+# continuation operator and is evaluated with position, stress and reactions.
 dynamics_pretraining:
   enabled: false
 
@@ -170,6 +177,7 @@ validation:
   teacher_stress_cases: 20
   teacher_stress_frames: 16
   teacher_stress_threshold: 0.50
+  teacher_stress_minimum_admissible_coverage: 0.99
   enforce_teacher_stress_gate: true
   enforce_rollout_pilot_gate: true
   pilot_moving_relative_rmse_threshold: 0.80

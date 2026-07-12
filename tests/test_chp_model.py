@@ -16,7 +16,7 @@ from valgraphnet.chp_model import (
 )
 from valgraphnet.config import load_config
 from valgraphnet.data.case import ValveCase
-from valgraphnet.mechanics import deformation_gradient, invariants
+from valgraphnet.mechanics import deformation_gradient, invariants, semi_implicit_step
 
 
 def _case() -> ValveCase:
@@ -73,6 +73,21 @@ def _cfg():
             "contact_substeps": 2,
         },
     }
+
+
+def _schema9_cfg():
+    cfg = _cfg()
+    cfg["model"].pop("contact_substeps")
+    cfg["model"].update(
+        {
+            "contact_iterations": 2,
+            "integration_substeps": 1,
+            "contact_predictor_stop_gradient": True,
+            "contact_force_average": "trapezoidal",
+        }
+    )
+    cfg["contact"]["refresh_each_iteration"] = True
+    return cfg
 
 
 def test_chp_threads_matched_flat_processor_switch():
@@ -156,6 +171,17 @@ def test_neural_feature_experiment_config_is_isolated_and_scale_aware():
     assert cfg["loss"]["stress_gate_mse_weight"] == 1.0
     assert cfg["loss"]["rollout_stress_gate_mse_weight"] == 0.0
     assert cfg["dynamics_pretraining"]["stress_gate_mse_weight"] == 0.0
+    assert model_cfg["contact_iterations"] == 2
+    assert model_cfg["integration_substeps"] == 1
+    assert model_cfg["contact_predictor_stop_gradient"] is True
+    assert model_cfg["contact_force_average"] == "trapezoidal"
+    assert cfg["dynamics_pretraining"]["phases"] == [
+        {"name": "physics_only", "epochs": 4},
+        {"name": "residual_warmup", "epochs": 1},
+        {"name": "joint", "epochs": 2},
+    ]
+    assert cfg["constitutive_pretraining"]["preserve_force_mass_ratio"] is False
+    assert float(model_cfg["initial_mass_scale"]) == 1.0e15
     assert (
         cfg["validation"]["teacher_stress_minimum_admissible_coverage"]
         == 0.99
@@ -247,6 +273,115 @@ def test_full_step_accumulates_two_semi_implicit_substeps():
         atol=1.0e-6,
         rtol=1.0e-6,
     )
+
+
+def test_schema9_uses_two_force_evaluations_but_one_global_state_update():
+    static = build_chp_static(_case(), "cpu")
+    model = CHPGNS(_schema9_cfg()).eval()
+    torch.nn.init.zeros_(model.residual_channel.weight)
+    velocity = torch.zeros_like(static.reference_position)
+    state = CHPState(static.reference_position.clone(), velocity)
+    nodal_force = static.lumped_mass[:, None] * torch.tensor([2.0, 0.0, 0.0])
+
+    output = model(static, state, dt=0.5, external_force=nodal_force)
+
+    expected_velocity = torch.tensor([1.0, 0.0, 0.0]).expand_as(velocity)
+    expected_displacement = torch.tensor([0.5, 0.0, 0.0]).expand_as(velocity)
+    torch.testing.assert_close(
+        output.next_position - state.position,
+        expected_displacement,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+    torch.testing.assert_close(output.next_velocity, expected_velocity)
+    torch.testing.assert_close(
+        output.next_position - state.position,
+        0.5 * output.next_velocity,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+    torch.testing.assert_close(
+        output.energy_diagnostics["discrete_force_balance_rms"],
+        torch.zeros(()),
+        atol=1.0e-7,
+        rtol=0.0,
+    )
+    assert model.dynamics_semantics_version == 9
+    assert output.energy_diagnostics["initial_contact_pair_count"] == 0
+    assert output.energy_diagnostics["final_contact_pair_count"] == 0
+
+
+def test_schema9_exposes_effective_and_final_constitutive_force_levels():
+    static = build_chp_static(_case(), "cpu")
+    model = CHPGNS(_schema9_cfg()).eval()
+    torch.nn.init.zeros_(model.residual_channel.weight)
+    position = static.reference_position.clone()
+    position[1, 0] += 0.02
+    state = CHPState(position, torch.zeros_like(position))
+    dt = torch.tensor(1.0e-3)
+
+    initial = model.constitutive_fields(static, state.position)
+    mass = static.lumped_mass * model.log_mass_scale.detach().exp()
+    predictor = semi_implicit_step(
+        state.position,
+        state.velocity,
+        initial.internal_force,
+        mass,
+        dt,
+        substeps=1,
+    )
+    predicted = model.constitutive_fields(static, predictor.position)
+    output = model(static, state, dt=dt, residual_enabled=False)
+
+    torch.testing.assert_close(
+        output.effective_internal_force,
+        0.5 * (initial.internal_force + predicted.internal_force),
+        atol=2.0e-6,
+        rtol=2.0e-5,
+    )
+    assert output.final_internal_force is not None
+    final = model.constitutive_fields(static, output.next_position)
+    torch.testing.assert_close(
+        output.final_internal_force,
+        final.internal_force,
+        atol=2.0e-6,
+        rtol=2.0e-5,
+    )
+    assert output.effective_contact_force is output.contact_force
+    assert output.effective_damping_force is output.damping_force
+
+
+def test_schema9_physics_phase_can_disable_residual_exactly():
+    static = build_chp_static(_case(), "cpu")
+    model = CHPGNS(_schema9_cfg()).eval()
+    torch.nn.init.ones_(model.residual_channel.weight)
+    state = CHPState(
+        static.reference_position + torch.tensor([0.01, 0.0, 0.0]),
+        torch.zeros_like(static.reference_position),
+    )
+
+    output = model(static, state, residual_enabled=False)
+
+    torch.testing.assert_close(
+        output.residual_force, torch.zeros_like(output.residual_force), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        output.energy_diagnostics["residual_norm"], torch.zeros(()), atol=0, rtol=0
+    )
+
+
+def test_legacy_contact_substep_config_remains_schema8_constructible():
+    legacy = CHPGNS(_cfg())
+    current = CHPGNS(_schema9_cfg())
+    assert legacy.dynamics_semantics_version == 8
+    assert current.dynamics_semantics_version == CHPGNS.dynamics_schema_version
+
+
+def test_schema9_requires_every_integration_contract_field_explicitly():
+    incomplete = _schema9_cfg()
+    incomplete["model"].pop("integration_substeps")
+    with pytest.raises(ValueError, match="explicit integration contract"):
+        CHPGNS(incomplete)
 
 
 def test_full_step_overwrites_fixed_and_prescribed_nodes_exactly():

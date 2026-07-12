@@ -23,8 +23,17 @@ def _base_config(tmp_path: Path) -> dict:
     return {
         "seed": 42,
         "data": {"val_split": "val", "test_split": "test"},
-        "model": {"scalar_dim": 8, "vector_dim": 2, "cell_dim": 4},
+        "model": {
+            "scalar_dim": 8,
+            "vector_dim": 2,
+            "cell_dim": 4,
+            "contact_iterations": 2,
+            "integration_substeps": 1,
+            "contact_predictor_stop_gradient": True,
+            "contact_force_average": "trapezoidal",
+        },
         "contact": {"enabled": True},
+        "dynamics_pretraining": {"enabled": True},
         "training": {
             "device": "cuda",
             "amp": True,
@@ -59,6 +68,12 @@ def _checkpoint(cfg: dict, *, shape: tuple[int, ...] = (2, 3)) -> dict:
         "problem_type": "dynamic",
         "time_semantics": "dynamic",
         "scientific_gate_status": "passed",
+        "dynamics_pretraining_phase": "complete",
+        "dynamics_pretraining_phase_gate": {
+            "status": "passed",
+            "gate_role": "final_post_joint_residual_disabled",
+            "residual_enabled": False,
+        },
         "epoch": 16,
         "rollout_metrics": metrics,
         "model": {"synthetic.weight": torch.zeros(shape)},

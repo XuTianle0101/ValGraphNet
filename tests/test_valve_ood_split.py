@@ -11,6 +11,7 @@ from scripts.abaqus_export_odb import (
     validate_material_feature_names,
 )
 from valgraphnet.config import load_config
+from valgraphnet.chp_model import CHPGNS
 from valgraphnet.data.case import load_case
 from valgraphnet.data.dataset import ValveGraphDataset
 from valgraphnet.data.valve_ood import (
@@ -280,6 +281,48 @@ def test_valve_chp_template_requires_cuda_bf16_and_complete_fields():
     assert cfg["training"]["amp_dtype"] == "bfloat16"
     assert cfg["training"]["mechanics_dtype"] == "float32"
     assert cfg["model"]["fiber_order"] > 0
+    assert "contact_substeps" not in cfg["model"]
+    assert cfg["model"]["contact_iterations"] == 2
+    assert cfg["model"]["integration_substeps"] == 1
+    assert cfg["model"]["contact_predictor_stop_gradient"] is True
+    assert cfg["model"]["contact_force_average"] == "trapezoidal"
+    assert cfg["contact"]["refresh_each_iteration"] is True
+    assert cfg["dynamics_pretraining"]["phases"] == [
+        {"name": "physics_only", "epochs": 4},
+        {"name": "residual_warmup", "epochs": 1},
+        {"name": "joint", "epochs": 2},
+    ]
+    assert {
+        key: cfg["dynamics_pretraining"][key]
+        for key in (
+            "physical_graph_lr",
+            "pair_head_lr",
+            "force_scale_lr",
+            "inertia_lr",
+            "constitutive_lr",
+            "residual_warmup_lr",
+            "residual_joint_lr",
+        )
+    } == {
+        "physical_graph_lr": 1.0e-4,
+        "pair_head_lr": 5.0e-4,
+        "force_scale_lr": 5.0e-4,
+        "inertia_lr": 1.0e-3,
+        "constitutive_lr": 1.0e-5,
+        "residual_warmup_lr": 1.0e-3,
+        "residual_joint_lr": 5.0e-4,
+    }
+    assert cfg["dynamics_pretraining"]["phase_gate"] == {
+        "active_acceleration_relative_rmse": 0.95,
+        "active_acceleration_cosine": 0.05,
+        "teacher_stress_relative_rmse": 0.50,
+    }
+    assert (
+        cfg["validation"]["teacher_stress_minimum_admissible_coverage"]
+        == 0.99
+    )
+    model = CHPGNS(cfg)
+    assert model.dynamics_semantics_version == CHPGNS.dynamics_schema_version
     requirements = cfg["data"]["requirements"]
     assert requirements["full_cell_stress_tensor"] is True
     assert requirements["full_integration_point_stress_tensor"] is True

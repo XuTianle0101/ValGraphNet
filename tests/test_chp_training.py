@@ -144,7 +144,7 @@ def test_geometry_noise_uses_base_growth_without_legacy_relaxation(monkeypatch):
     assert accepted_state.i2_bar.max() <= 6.0 + 1.0e-5
 
 
-def test_noise_corrected_targets_match_two_symplectic_substeps():
+def test_targets_match_one_global_semi_implicit_step():
     state = CHPState(
         position=torch.zeros(1, 3),
         velocity=torch.tensor([[0.1, 0.0, 0.0]]),
@@ -154,17 +154,33 @@ def test_noise_corrected_targets_match_two_symplectic_substeps():
     exact_next = (
         state.position
         + dt * state.velocity
-        + 0.75 * dt**2 * acceleration
+        + dt**2 * acceleration
     )
 
     target_velocity, target_acceleration = integration_consistent_targets(
-        state, exact_next, dt, substeps=2
+        state, exact_next, dt
     )
 
     torch.testing.assert_close(target_acceleration, acceleration)
     torch.testing.assert_close(
         target_velocity, state.velocity + dt * acceleration
     )
+
+
+def test_deforming_plate_backward_difference_velocity_is_exact_global_target():
+    displacement_t = torch.tensor([[0.10, -0.02, 0.03]])
+    displacement_next = torch.tensor([[0.14, -0.01, 0.01]])
+    velocity_t = torch.tensor([[0.03, -0.02, 0.01]])
+    velocity_next = displacement_next - displacement_t
+    reference = torch.tensor([[1.0, 2.0, 3.0]])
+    state = CHPState(reference + displacement_t, velocity_t)
+
+    target_velocity, target_acceleration = integration_consistent_targets(
+        state, reference + displacement_next, 1.0
+    )
+
+    torch.testing.assert_close(target_velocity, velocity_next)
+    torch.testing.assert_close(target_acceleration, velocity_next - velocity_t)
 
 
 def test_constitutive_scale_minimizes_the_pooled_gate_objective():
@@ -534,6 +550,7 @@ def test_failed_constitutive_gate_state_is_auditable_but_not_rollout_loadable(
 ):
     path = tmp_path / "constitutive_gate.pt"
     model = torch.nn.Linear(2, 1)
+    model.dynamics_semantics_version = CHPGNS.dynamics_schema_version
     normalizers = SimpleNamespace(
         state_dict=lambda: {"displacement_scale": torch.tensor(1.0)}
     )
@@ -652,6 +669,21 @@ def test_checkpoint_rejects_ambiguous_legacy_residual_semantics():
         "dynamics_schema_version": CHPGNS.dynamics_schema_version,
         "residual_parameterization": CHPGNS.residual_parameterization,
         "residual_gate": CHPGNS.residual_gate,
+        "dynamics_pretraining_phase": "complete",
+        "dynamics_pretraining_phase_gate": {
+            "status": "passed",
+            "gate_role": "final_post_joint_residual_disabled",
+            "residual_enabled": False,
+        },
+        "config": {
+            "model": {
+                "contact_iterations": 2,
+                "integration_substeps": 1,
+                "contact_predictor_stop_gradient": True,
+                "contact_force_average": "trapezoidal",
+            },
+            "dynamics_pretraining": {"enabled": True},
+        },
     }
     validate_chp_checkpoint_semantics(current)
     with pytest.raises(ValueError, match="did not pass"):
@@ -662,6 +694,441 @@ def test_checkpoint_rejects_ambiguous_legacy_residual_semantics():
         {**current, "scientific_gate_status": "passed"},
         require_scientific_gate=True,
     )
+
+    claimed_schema9_legacy_integrator = {
+        **current,
+        "config": {
+            "model": {"contact_substeps": 2},
+            "dynamics_pretraining": {"enabled": True},
+        },
+    }
+    with pytest.raises(ValueError, match="integration contract"):
+        validate_chp_checkpoint_semantics(claimed_schema9_legacy_integrator)
+
+    explicit_schema8 = {**current, "dynamics_schema_version": 8}
+    with pytest.raises(ValueError, match="dynamics semantics"):
+        validate_chp_checkpoint_semantics(explicit_schema8)
+
+    pending_physics_gate = {
+        **current,
+        "dynamics_pretraining_phase": "physics_only",
+        "dynamics_pretraining_phase_gate": {"status": "pending"},
+    }
+    with pytest.raises(ValueError, match="phase is incomplete"):
+        validate_chp_checkpoint_semantics(pending_physics_gate)
+
+    transition_only = {
+        **current,
+        "dynamics_pretraining_phase_gate": {
+            "status": "passed",
+            "gate_role": "transition_pre_residual",
+            "residual_enabled": False,
+        },
+    }
+    with pytest.raises(ValueError, match="final residual-disabled"):
+        validate_chp_checkpoint_semantics(transition_only)
+
+
+def test_dynamics_pretraining_parameter_groups_are_complete_and_disjoint():
+    model = CHPGNS(
+        {
+            "contact": {"radius": 0.03},
+            "model": {
+                "scalar_dim": 16,
+                "vector_dim": 4,
+                "cell_dim": 8,
+                "potential_order": 2,
+                "contact_iterations": 2,
+                "integration_substeps": 1,
+                "contact_predictor_stop_gradient": True,
+                "contact_force_average": "trapezoidal",
+            },
+        }
+    )
+    groups = chp_train_module._dynamics_pretraining_parameters(model)
+    assigned = [parameter for values in groups.values() for parameter in values]
+
+    assert set(groups) == {
+        "inertia",
+        "force_scales",
+        "pair_heads",
+        "physical_graph",
+        "constitutive",
+        "residual",
+    }
+    assert len({id(parameter) for parameter in assigned}) == len(assigned)
+    assert {id(parameter) for parameter in assigned} == {
+        id(parameter) for parameter in model.parameters()
+    }
+    assert id(model.log_mass_scale) in {id(p) for p in groups["inertia"]}
+    assert id(model.cell_encoder[0].weight) in {
+        id(p) for p in groups["physical_graph"]
+    }
+    assert id(model.cell_blocks[0].node_to_cell[0].weight) in {
+        id(p) for p in groups["physical_graph"]
+    }
+    assert id(model.force_heads.contact[0].weight) in {
+        id(p) for p in groups["pair_heads"]
+    }
+
+
+def test_rollout_payload_refuses_a_schema8_model_instance():
+    legacy_model = CHPGNS(
+        {
+            "contact": {"radius": 0.03},
+            "model": {
+                "scalar_dim": 8,
+                "vector_dim": 2,
+                "cell_dim": 4,
+                "contact_substeps": 2,
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="schema-8 model"):
+        chp_train_module._checkpoint_payload(
+            legacy_model,
+            None,
+            None,
+            None,
+            None,
+            {"dynamics_pretraining": {"enabled": True}},
+            1,
+            1.0,
+            1.0,
+            {},
+            0,
+            scientific_gate_status="passed",
+        )
+
+
+def test_dynamics_phase_schedule_and_gate_are_fail_closed():
+    cfg = {
+        "dynamics_pretraining": {
+            "phases": [
+                {"name": "physics_only", "epochs": 4},
+                {"name": "residual_warmup", "epochs": 1},
+                {"name": "joint", "epochs": 2},
+            ],
+            "phase_gate": {
+                "active_acceleration_relative_rmse": 0.95,
+                "active_acceleration_cosine": 0.05,
+                "teacher_stress_relative_rmse": 0.50,
+            },
+        },
+        "validation": {"teacher_stress_minimum_admissible_coverage": 0.99},
+    }
+    schedule = chp_train_module._dynamics_pretraining_schedule(cfg)
+    phases = [
+        str(item["name"])
+        for item in schedule
+        for _ in range(int(item["epochs"]))
+    ]
+    assert phases == [
+        "physics_only",
+        "physics_only",
+        "physics_only",
+        "physics_only",
+        "residual_warmup",
+        "joint",
+        "joint",
+    ]
+
+    failed = chp_train_module._evaluate_dynamics_physics_gate(
+        {
+            "active_acceleration_relative_rmse": 0.95,
+            "active_acceleration_cosine": 0.05,
+        },
+        {
+            "teacher_stress_relative_rmse": 0.50,
+            "teacher_stress_admissible_coverage": 0.99,
+        },
+        cfg,
+    )
+    assert failed["status"] == "failed"
+    assert set(failed["failures"]) == {
+        "active_acceleration_relative_rmse",
+        "active_acceleration_cosine",
+        "teacher_stress_relative_rmse",
+    }
+
+    passed = chp_train_module._evaluate_dynamics_physics_gate(
+        {
+            "active_acceleration_relative_rmse": 0.94,
+            "active_acceleration_cosine": 0.051,
+        },
+        {
+            "teacher_stress_relative_rmse": 0.49,
+            "teacher_stress_admissible_coverage": 0.99,
+        },
+        cfg,
+    )
+    assert passed["status"] == "passed"
+
+    transition = chp_train_module._dynamics_gate_with_role(
+        {
+            "active_acceleration_relative_rmse": 0.94,
+            "active_acceleration_cosine": 0.051,
+        },
+        {
+            "teacher_stress_relative_rmse": 0.49,
+            "teacher_stress_admissible_coverage": 0.99,
+        },
+        cfg,
+        role="transition_pre_residual",
+    )
+    final = chp_train_module._dynamics_gate_with_role(
+        {
+            "active_acceleration_relative_rmse": 0.94,
+            "active_acceleration_cosine": 0.051,
+        },
+        {
+            "teacher_stress_relative_rmse": 0.49,
+            "teacher_stress_admissible_coverage": 0.99,
+        },
+        cfg,
+        role="final_post_joint_residual_disabled",
+    )
+    assert transition["gate_role"] == "transition_pre_residual"
+    assert final["gate_role"] == "final_post_joint_residual_disabled"
+    assert transition["residual_enabled"] is False
+    assert final["residual_enabled"] is False
+
+
+def test_conservative_force_resultants_are_distinct_fp64_diagnostics():
+    output = SimpleNamespace(
+        effective_internal_force=torch.tensor(
+            [[1.0, 2.0, 0.0], [-0.5, -2.0, 0.0]], dtype=torch.float32
+        ),
+        effective_contact_force=torch.tensor(
+            [[-1.0, 0.0, 0.0], [0.5, 0.0, 0.0]], dtype=torch.float32
+        ),
+    )
+    resultants = chp_train_module._conservative_force_resultants(output)
+
+    assert all(value.dtype == torch.float64 for value in resultants.values())
+    torch.testing.assert_close(
+        resultants["internal_force_resultant"],
+        torch.tensor(0.5, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        resultants["contact_force_resultant"],
+        torch.tensor(0.5, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        resultants["total_conservative_force_resultant"],
+        torch.tensor(0.0, dtype=torch.float64),
+    )
+
+
+def _tiny_schema9_model() -> CHPGNS:
+    return CHPGNS(
+        {
+            "contact": {"radius": 0.03},
+            "model": {
+                "scalar_dim": 8,
+                "vector_dim": 2,
+                "cell_dim": 4,
+                "potential_order": 2,
+                "contact_iterations": 2,
+                "integration_substeps": 1,
+                "contact_predictor_stop_gradient": True,
+                "contact_force_average": "trapezoidal",
+            },
+        }
+    )
+
+
+def _final_gate_test_cfg() -> dict:
+    return {
+        "dynamics_pretraining": {
+            "enabled": True,
+            "phases": [
+                {"name": "physics_only", "epochs": 1},
+                {"name": "residual_warmup", "epochs": 1},
+                {"name": "joint", "epochs": 1},
+            ],
+            "phase_gate": {
+                "active_acceleration_relative_rmse": 0.95,
+                "active_acceleration_cosine": 0.05,
+                "teacher_stress_relative_rmse": 0.50,
+            },
+        },
+        "validation": {"teacher_stress_minimum_admissible_coverage": 0.99},
+    }
+
+
+def _passing_dynamics_metrics() -> dict[str, float]:
+    return {
+        "active_acceleration_relative_rmse": 0.90,
+        "active_acceleration_cosine": 0.10,
+        "one_step_stress_relative_rmse": 0.40,
+    }
+
+
+def _passing_stress_metrics() -> dict[str, float | str]:
+    return {
+        "teacher_stress_relative_rmse": 0.40,
+        "teacher_stress_admissible_coverage": 1.0,
+        "teacher_stress_source": NODAL_STRESS_FALLBACK_SOURCE,
+    }
+
+
+def test_dynamics_pretraining_rechecks_final_gate_with_residual_disabled_and_migrates_resume(
+    tmp_path, monkeypatch
+):
+    residual_calls: list[bool] = []
+    stress_calls: list[bool] = []
+
+    def evaluate_dynamics(*args, residual_enabled=True, **kwargs):
+        del args, kwargs
+        residual_calls.append(bool(residual_enabled))
+        return _passing_dynamics_metrics()
+
+    def evaluate_stress(*args, **kwargs):
+        del args, kwargs
+        stress_calls.append(True)
+        return _passing_stress_metrics()
+
+    monkeypatch.setattr(
+        chp_train_module, "evaluate_teacher_forced_dynamics", evaluate_dynamics
+    )
+    monkeypatch.setattr(
+        chp_train_module, "evaluate_teacher_forced_stress", evaluate_stress
+    )
+    monkeypatch.setattr(
+        chp_train_module,
+        "train_exact_dynamics_epoch",
+        lambda *args, **kwargs: {"loss": 0.0, "steps": 1.0},
+    )
+    cfg = _final_gate_test_cfg()
+    normalizers = SimpleNamespace(
+        state_dict=lambda: {"sentinel": torch.tensor(1.0)}
+    )
+    cache = SimpleNamespace(device=torch.device("cpu"))
+    model = _tiny_schema9_model()
+    history = chp_train_module.run_dynamics_pretraining(
+        model,
+        [SimpleNamespace()],
+        [SimpleNamespace()],
+        cache,
+        cache,
+        [np.ones(2, dtype=np.float32)],
+        normalizers,
+        cfg,
+        tmp_path,
+        amp_dtype=torch.float32,
+    )
+
+    assert residual_calls == [False, False, True, True, False]
+    assert len(stress_calls) == 2
+    assert history["transition_physics_gate"]["status"] == "passed"
+    assert history["transition_physics_gate"]["gate_role"] == (
+        "transition_pre_residual"
+    )
+    assert history["final_physics_gate"]["status"] == "passed"
+    assert history["final_physics_gate"]["gate_role"] == (
+        "final_post_joint_residual_disabled"
+    )
+    assert model.dynamics_pretraining_phase_gate == history["final_physics_gate"]
+    saved = torch.load(
+        tmp_path / "dynamics_pretraining_latest.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert saved["phase_state"]["status"] == "complete"
+    assert saved["phase_state"]["transition_physics_gate"]["status"] == "passed"
+    assert saved["phase_state"]["final_physics_gate"]["status"] == "passed"
+
+    # Migrate the first, uncommitted schema-9 artifact shape: a completed
+    # schedule with only the transition ``physics_gate``.  Resume must not
+    # trust that gate as final; it re-runs just the residual-disabled checks.
+    saved["dynamics_pretraining_protocol"] = "physics_gate_residual_v1"
+    saved["phase_state"].pop("final_physics_gate")
+    saved["phase_state"]["physics_gate"] = saved["phase_state"][
+        "transition_physics_gate"
+    ]
+    saved["history"].pop("final_physics_gate")
+    saved["history"].pop("final_physics_validation")
+    torch.save(saved, tmp_path / "dynamics_pretraining_latest.pt")
+    residual_calls.clear()
+    stress_calls.clear()
+    resumed_model = _tiny_schema9_model()
+    resumed = chp_train_module.run_dynamics_pretraining(
+        resumed_model,
+        [SimpleNamespace()],
+        [SimpleNamespace()],
+        cache,
+        cache,
+        [np.ones(2, dtype=np.float32)],
+        normalizers,
+        cfg,
+        tmp_path,
+        amp_dtype=torch.float32,
+    )
+    assert residual_calls == [False]
+    assert len(stress_calls) == 1
+    assert resumed["final_physics_gate"]["status"] == "passed"
+    assert resumed_model.dynamics_pretraining_phase_gate["gate_role"] == (
+        "final_post_joint_residual_disabled"
+    )
+
+
+def test_final_residual_disabled_gate_failure_never_writes_complete_checkpoint(
+    tmp_path, monkeypatch
+):
+    residual_disabled_calls = 0
+
+    def evaluate_dynamics(*args, residual_enabled=True, **kwargs):
+        nonlocal residual_disabled_calls
+        del args, kwargs
+        metrics = _passing_dynamics_metrics()
+        if not residual_enabled:
+            residual_disabled_calls += 1
+            if residual_disabled_calls == 3:
+                metrics["active_acceleration_relative_rmse"] = 1.0
+        return metrics
+
+    monkeypatch.setattr(
+        chp_train_module, "evaluate_teacher_forced_dynamics", evaluate_dynamics
+    )
+    monkeypatch.setattr(
+        chp_train_module,
+        "evaluate_teacher_forced_stress",
+        lambda *args, **kwargs: _passing_stress_metrics(),
+    )
+    monkeypatch.setattr(
+        chp_train_module,
+        "train_exact_dynamics_epoch",
+        lambda *args, **kwargs: {"loss": 0.0, "steps": 1.0},
+    )
+    normalizers = SimpleNamespace(
+        state_dict=lambda: {"sentinel": torch.tensor(1.0)}
+    )
+    cache = SimpleNamespace(device=torch.device("cpu"))
+    with pytest.raises(RuntimeError, match="final residual-disabled"):
+        chp_train_module.run_dynamics_pretraining(
+            _tiny_schema9_model(),
+            [SimpleNamespace()],
+            [SimpleNamespace()],
+            cache,
+            cache,
+            [np.ones(2, dtype=np.float32)],
+            normalizers,
+            _final_gate_test_cfg(),
+            tmp_path,
+            amp_dtype=torch.float32,
+        )
+    assert not (tmp_path / "dynamics_pretraining_complete.pt").exists()
+    assert (tmp_path / "dynamics_final_physics_gate_failure.json").is_file()
+    failed = torch.load(
+        tmp_path / "dynamics_pretraining_latest.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert failed["phase_state"]["status"] == "failed"
+    assert failed["phase_state"]["final_physics_gate"]["status"] == "failed"
+    with pytest.raises(RuntimeError, match="refusing training/resume"):
+        _assert_no_gate_failure_artifact(tmp_path, context="training/resume")
 
 
 def test_failed_scientific_gate_blocks_resume_and_best_eligibility(tmp_path):

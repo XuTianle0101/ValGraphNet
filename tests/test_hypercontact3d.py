@@ -15,6 +15,8 @@ from scripts.generate_hypercontact3d import (
     render_calculix_deck,
     validate_config,
 )
+from valgraphnet.chp_model import CHPGNS
+from valgraphnet.chp_train import validate_chp_problem_semantics
 
 
 def _tiny_config():
@@ -265,6 +267,20 @@ def test_chp_v1_9_config_is_gpu_bf16_quasistatic_and_reference_free():
     assert config["training"]["amp_dtype"] == "bfloat16"
     assert config["training"]["mechanics_dtype"] == "float32"
     assert config["model"]["fiber_order"] == 0
+    assert "contact_substeps" not in config["model"]
+    assert config["model"]["contact_iterations"] == 2
+    assert config["model"]["integration_substeps"] == 1
+    assert config["model"]["contact_predictor_stop_gradient"] is True
+    assert config["model"]["contact_force_average"] == "trapezoidal"
+    assert config["contact"]["refresh_each_iteration"] is True
+    assert config["dynamics_pretraining"] == {"enabled": False}
+    assert (
+        config["validation"]["teacher_stress_minimum_admissible_coverage"]
+        == 0.99
+    )
+    model = CHPGNS(config)
+    assert model.dynamics_semantics_version == CHPGNS.dynamics_schema_version
+    assert validate_chp_problem_semantics(config) == "quasi_static_continuation"
     assert config["data"]["train_split"] == "train"
     assert config["data"]["val_split"] == "validation"
     assert config["validation"]["steps"] == 100

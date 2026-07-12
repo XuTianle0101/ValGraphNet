@@ -53,6 +53,16 @@ class CHPState:
 
 @dataclass
 class PhysicalStep:
+    """One accepted state update and the forces associated with it.
+
+    ``internal_force``, ``contact_force`` and ``damping_force`` retain the
+    public v1 names, but are the *effective* (trapezoid-averaged) forces used
+    by the schema-9 integrator.  ``cell_stress_tensor`` and
+    ``final_internal_force`` are evaluated at ``next_position``.  Keeping both
+    force time levels prevents a final stress tensor from being incorrectly
+    compared with the force that advanced the state.
+    """
+
     next_position: torch.Tensor
     next_velocity: torch.Tensor
     acceleration: torch.Tensor
@@ -63,6 +73,19 @@ class PhysicalStep:
     damping_force: torch.Tensor
     residual_force: torch.Tensor
     energy_diagnostics: dict[str, torch.Tensor]
+    final_internal_force: torch.Tensor | None = None
+
+    @property
+    def effective_internal_force(self) -> torch.Tensor:
+        return self.internal_force
+
+    @property
+    def effective_contact_force(self) -> torch.Tensor:
+        return self.contact_force
+
+    @property
+    def effective_damping_force(self) -> torch.Tensor:
+        return self.damping_force
 
     def legacy_predictions(self, state: CHPState) -> dict[str, torch.Tensor]:
         return {
@@ -499,7 +522,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 8
+    dynamics_schema_version = 9
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -513,13 +536,67 @@ class CHPGNS(nn.Module):
         self.contact_radius = float(get_cfg(cfg, "contact.radius", 0.03))
         self.contact_enabled = bool(get_cfg(cfg, "contact.enabled", True))
         self.contact_max_neighbors = int(get_cfg(cfg, "contact.max_neighbors", 32))
-        self.refresh_contact_pairs_each_substep = bool(
-            get_cfg(cfg, "contact.refresh_each_substep", True)
+        self.legacy_contact_dynamics = "contact_iterations" not in model_cfg
+        if self.legacy_contact_dynamics:
+            # Schema-8 configurations remain constructible for checkpoint
+            # migration and regression tests.  They retain the historical
+            # cumulative dt/S state updates, but schema-8 dynamics checkpoints
+            # are never accepted by the schema-9 resume/evaluation path.
+            self.contact_substeps = int(model_cfg.get("contact_substeps", 2))
+            self.contact_iterations = self.contact_substeps
+            self.integration_substeps = self.contact_substeps
+            self.contact_predictor_stop_gradient = False
+            self.contact_force_average = "legacy_substeps"
+            self.dynamics_semantics_version = 8
+        else:
+            required_contract = {
+                "contact_iterations",
+                "integration_substeps",
+                "contact_predictor_stop_gradient",
+                "contact_force_average",
+            }
+            missing_contract = sorted(required_contract.difference(model_cfg))
+            if missing_contract:
+                raise ValueError(
+                    "schema-9 dynamics requires an explicit integration contract; "
+                    f"missing={missing_contract}"
+                )
+            self.contact_iterations = int(model_cfg.get("contact_iterations", 2))
+            self.integration_substeps = int(model_cfg.get("integration_substeps", 1))
+            self.contact_predictor_stop_gradient = bool(
+                model_cfg.get("contact_predictor_stop_gradient", True)
+            )
+            self.contact_force_average = str(
+                model_cfg.get("contact_force_average", "trapezoidal")
+            )
+            self.contact_substeps = self.integration_substeps
+            self.dynamics_semantics_version = self.dynamics_schema_version
+            if self.contact_iterations != 2:
+                raise ValueError("schema-9 dynamics requires contact_iterations=2")
+            if self.integration_substeps != 1:
+                raise ValueError("schema-9 dynamics requires integration_substeps=1")
+            if not self.contact_predictor_stop_gradient:
+                raise ValueError(
+                    "schema-9 dynamics requires a stop-gradient contact predictor"
+                )
+            if self.contact_force_average != "trapezoidal":
+                raise ValueError(
+                    "schema-9 dynamics requires trapezoidal contact force averaging"
+                )
+        self.refresh_contact_pairs_each_iteration = bool(
+            get_cfg(
+                cfg,
+                "contact.refresh_each_iteration",
+                get_cfg(cfg, "contact.refresh_each_substep", True),
+            )
         )
-        self.contact_substeps = int(model_cfg.get("contact_substeps", 2))
         self.residual_acceleration_reference = float(
             model_cfg.get("residual_acceleration_reference", 1.9e-4)
         )
+        self.dynamics_pretraining_phase = "not_started"
+        self.dynamics_pretraining_phase_gate: dict[str, object] = {
+            "status": "pending"
+        }
         self.residual_acceleration_cap = float(
             model_cfg.get("residual_acceleration_cap", 3.0e-3)
         )
@@ -792,6 +869,7 @@ class CHPGNS(nn.Module):
         prescribed_position: torch.Tensor | None = None,
         prescribed_velocity: torch.Tensor | None = None,
         detach_pair_force_features: bool = False,
+        residual_enabled: bool = True,
     ) -> PhysicalStep:
         position = state.position.float()
         velocity = state.velocity.float()
@@ -920,6 +998,8 @@ class CHPGNS(nn.Module):
         dynamic_mask = ~(static.fixed_mask | static.prescribed_mask)
         activity_gate = activity_gate * dynamic_mask[:, None]
         residual_acceleration = residual_acceleration * activity_gate
+        if not residual_enabled:
+            residual_acceleration = torch.zeros_like(residual_acceleration)
         # The source dataset has no physical dt/density pair (meta.json stores
         # dt=0), so the bounded learned correction is identifiable as an
         # acceleration.  Multiplication by lumped mass preserves the public
@@ -931,7 +1011,6 @@ class CHPGNS(nn.Module):
             if bool(static.prescribed_mask.any().item())
             else None
         )
-        substep_dt = step_dt / max(self.contact_substeps, 1)
         current_position = position
         current_velocity = velocity
         external_work = position.new_zeros(())
@@ -943,94 +1022,219 @@ class CHPGNS(nn.Module):
         integration_domain_penalty = position.new_zeros(())
         max_penetration = position.new_zeros(())
         minimum_update_scale = position.new_ones(())
+        predictor_update_scale = position.new_ones(())
         integration_valid = torch.ones((), dtype=torch.bool, device=position.device)
         free_mask = ~static.fixed_mask
         if active_prescribed_mask is not None:
             free_mask = free_mask & ~active_prescribed_mask
         damping = torch.zeros_like(position)
         contact = torch.zeros_like(position)
+        effective_internal = initial_fields.internal_force
         total_force = torch.zeros_like(position)
-        current_fields = initial_fields
         force_scalar = scalar.detach() if detach_pair_force_features else scalar
         active_contact_pairs = contact_pairs
-        for substep in range(max(self.contact_substeps, 1)):
-            if substep:
-                current_fields = self.constitutive_fields(static, current_position)
-                if (
-                    self.contact_enabled
-                    and self.refresh_contact_pairs_each_substep
-                    and current_position.is_cuda
-                ):
-                    active_contact_pairs = radius_contact_pairs(
-                        current_position,
-                        static.mesh_edge_index,
-                        static.fixed_mask,
-                        self.contact_radius,
-                        max_neighbors=self.contact_max_neighbors,
-                        prescribed_mask=static.prescribed_mask,
-                        surface_mask=static.contact_surface_mask,
-                    )
-            damping, damping_rate = self.force_heads.mesh_damping(
+        initial_contact_pair_count = position.new_tensor(contact_pairs.shape[1])
+        final_contact_pair_count = initial_contact_pair_count
+
+        def evaluate_force_components(
+            evaluation_position: torch.Tensor,
+            evaluation_velocity: torch.Tensor,
+            fields: ConstitutiveFields,
+            pairs: torch.Tensor,
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
+            damping_force, damping_rate = self.force_heads.mesh_damping(
                 force_scalar,
-                current_position,
-                current_velocity,
+                evaluation_position,
+                evaluation_velocity,
                 mesh_pairs,
                 reference,
                 nodal_mass,
             )
-            contact, penetration, contact_rate = self.force_heads.contact_force(
+            contact_force, penetration, contact_rate = self.force_heads.contact_force(
                 force_scalar,
-                current_position,
-                current_velocity,
-                active_contact_pairs,
+                evaluation_position,
+                evaluation_velocity,
+                pairs,
                 self.contact_radius,
                 nodal_mass,
                 reference,
             )
-            damping = damping * damping_scale
+            damping_force = damping_force * damping_scale
             damping_rate = damping_rate * damping_scale
-            contact = contact * contact_scale
+            contact_force = contact_force * contact_scale
             contact_rate = contact_rate * contact_scale
-            max_penetration = torch.maximum(max_penetration, penetration)
-            total_force = (
-                current_fields.internal_force
-                + damping
-                + contact
+            force = (
+                fields.internal_force
+                + damping_force
+                + contact_force
                 + residual
                 + external_force
             )
-            substep_target = None
-            if prescribed_position is not None:
-                fraction = float(substep + 1) / max(self.contact_substeps, 1)
-                substep_target = position + fraction * (
-                    prescribed_position.float() - position
+            return (
+                fields.internal_force,
+                damping_force,
+                contact_force,
+                force,
+                torch.stack((penetration, damping_rate, contact_rate)),
+            )
+
+        if self.legacy_contact_dynamics:
+            substep_dt = step_dt / max(self.contact_substeps, 1)
+            current_fields = initial_fields
+            for substep in range(max(self.contact_substeps, 1)):
+                if substep:
+                    current_fields = self.constitutive_fields(
+                        static, current_position
+                    )
+                    if (
+                        self.contact_enabled
+                        and self.refresh_contact_pairs_each_iteration
+                        and current_position.is_cuda
+                    ):
+                        active_contact_pairs = radius_contact_pairs(
+                            current_position,
+                            static.mesh_edge_index,
+                            static.fixed_mask,
+                            self.contact_radius,
+                            max_neighbors=self.contact_max_neighbors,
+                            prescribed_mask=static.prescribed_mask,
+                            surface_mask=static.contact_surface_mask,
+                        )
+                (
+                    effective_internal,
+                    damping,
+                    contact,
+                    total_force,
+                    rate_values,
+                ) = evaluate_force_components(
+                    current_position,
+                    current_velocity,
+                    current_fields,
+                    active_contact_pairs,
                 )
-            integrated = semi_implicit_step(
-                current_position,
-                current_velocity,
-                total_force,
+                penetration, damping_rate, contact_rate = rate_values.unbind()
+                max_penetration = torch.maximum(max_penetration, penetration)
+                substep_target = None
+                if prescribed_position is not None:
+                    fraction = float(substep + 1) / max(self.contact_substeps, 1)
+                    substep_target = position + fraction * (
+                        prescribed_position.float() - position
+                    )
+                integrated = semi_implicit_step(
+                    current_position,
+                    current_velocity,
+                    total_force,
+                    nodal_mass,
+                    substep_dt,
+                    substeps=1,
+                    fixed_mask=static.fixed_mask,
+                    prescribed_mask=active_prescribed_mask,
+                    prescribed_position=substep_target,
+                    prescribed_velocity=prescribed_velocity,
+                )
+                proposal_penalty = tetrahedral_domain_penalty(
+                    integrated.position,
+                    static.cells,
+                    static.dm_inv,
+                    minimum_j=self.integration_minimum_j,
+                    maximum_i1_bar=self.integration_maximum_i1_bar,
+                    maximum_i2_bar=self.integration_maximum_i2_bar,
+                )
+                integration_domain_penalty = torch.maximum(
+                    integration_domain_penalty, proposal_penalty
+                )
+                (
+                    accepted_position,
+                    update_scale,
+                    update_valid,
+                ) = backtrack_tetrahedral_update(
+                    current_position,
+                    integrated.position,
+                    static.cells,
+                    static.dm_inv,
+                    fixed_mask=static.fixed_mask,
+                    prescribed_mask=active_prescribed_mask,
+                    minimum_j=self.integration_minimum_j,
+                    maximum_i1_bar=self.integration_maximum_i1_bar,
+                    maximum_i2_bar=self.integration_maximum_i2_bar,
+                    max_backtracks=self.integration_backtracks,
+                )
+                minimum_update_scale = torch.minimum(
+                    minimum_update_scale, update_scale
+                )
+                integration_valid = integration_valid & update_valid
+                derived_velocity = (
+                    accepted_position - current_position
+                ) / substep_dt
+                accepted_velocity = torch.where(
+                    free_mask[:, None], derived_velocity, integrated.velocity
+                )
+                proposal_kinetic = 0.5 * (
+                    nodal_mass[:, None] * integrated.velocity.square()
+                ).sum()
+                accepted_kinetic = 0.5 * (
+                    nodal_mass[:, None] * accepted_velocity.square()
+                ).sum()
+                projection_dissipation = projection_dissipation + (
+                    proposal_kinetic - accepted_kinetic
+                ).clamp_min(0.0)
+                damping_dissipation = (
+                    damping_dissipation + damping_rate * substep_dt
+                )
+                contact_dissipation = (
+                    contact_dissipation + contact_rate * substep_dt
+                )
+                current_position = accepted_position
+                current_velocity = accepted_velocity
+            final_contact_pair_count = position.new_tensor(
+                active_contact_pairs.shape[1]
+            )
+        else:
+            # Two force/contact evaluations are a predictor-corrector solve,
+            # not two cumulative state substeps.  Only the final full-dt
+            # semi-implicit result below is committed.
+            (
+                internal_0,
+                damping_0,
+                contact_0,
+                total_0,
+                rate_0,
+            ) = evaluate_force_components(
+                position, velocity, initial_fields, contact_pairs
+            )
+            predictor_raw = semi_implicit_step(
+                position,
+                velocity,
+                total_0,
                 nodal_mass,
-                substep_dt,
+                step_dt,
                 substeps=1,
                 fixed_mask=static.fixed_mask,
                 prescribed_mask=active_prescribed_mask,
-                prescribed_position=substep_target,
+                prescribed_position=prescribed_position,
                 prescribed_velocity=prescribed_velocity,
             )
-            proposal_penalty = tetrahedral_domain_penalty(
-                integrated.position,
+            predictor_penalty = tetrahedral_domain_penalty(
+                predictor_raw.position,
                 static.cells,
                 static.dm_inv,
                 minimum_j=self.integration_minimum_j,
                 maximum_i1_bar=self.integration_maximum_i1_bar,
                 maximum_i2_bar=self.integration_maximum_i2_bar,
             )
-            integration_domain_penalty = torch.maximum(
-                integration_domain_penalty, proposal_penalty
-            )
-            accepted_position, update_scale, update_valid = backtrack_tetrahedral_update(
-                current_position,
-                integrated.position,
+            (
+                predictor_position,
+                predictor_update_scale,
+                predictor_valid,
+            ) = backtrack_tetrahedral_update(
+                position,
+                predictor_raw.position,
                 static.cells,
                 static.dm_inv,
                 fixed_mask=static.fixed_mask,
@@ -1040,31 +1244,130 @@ class CHPGNS(nn.Module):
                 maximum_i2_bar=self.integration_maximum_i2_bar,
                 max_backtracks=self.integration_backtracks,
             )
-            minimum_update_scale = torch.minimum(minimum_update_scale, update_scale)
-            integration_valid = integration_valid & update_valid
-            derived_velocity = (accepted_position - current_position) / substep_dt
-            accepted_velocity = torch.where(
-                free_mask[:, None], derived_velocity, integrated.velocity
+            predictor_velocity = torch.where(
+                free_mask[:, None],
+                (predictor_position - position) / step_dt,
+                predictor_raw.velocity,
+            )
+            if self.contact_predictor_stop_gradient:
+                predictor_position = predictor_position.detach()
+                predictor_velocity = predictor_velocity.detach()
+            predictor_fields = self.constitutive_fields(
+                static, predictor_position
+            )
+            predictor_pairs = contact_pairs
+            if (
+                self.contact_enabled
+                and self.refresh_contact_pairs_each_iteration
+                and predictor_position.is_cuda
+            ):
+                predictor_pairs = radius_contact_pairs(
+                    predictor_position,
+                    static.mesh_edge_index,
+                    static.fixed_mask,
+                    self.contact_radius,
+                    max_neighbors=self.contact_max_neighbors,
+                    prescribed_mask=static.prescribed_mask,
+                    surface_mask=static.contact_surface_mask,
+                )
+            predictor_pairs = unique_undirected_pairs(
+                predictor_pairs, static.num_nodes
+            )
+            (
+                internal_1,
+                damping_1,
+                contact_1,
+                _,
+                rate_1,
+            ) = evaluate_force_components(
+                predictor_position,
+                predictor_velocity,
+                predictor_fields,
+                predictor_pairs,
+            )
+            effective_internal = 0.5 * (internal_0 + internal_1)
+            damping = 0.5 * (damping_0 + damping_1)
+            contact = 0.5 * (contact_0 + contact_1)
+            total_force = (
+                effective_internal
+                + damping
+                + contact
+                + residual
+                + external_force
+            )
+            final_raw = semi_implicit_step(
+                position,
+                velocity,
+                total_force,
+                nodal_mass,
+                step_dt,
+                substeps=1,
+                fixed_mask=static.fixed_mask,
+                prescribed_mask=active_prescribed_mask,
+                prescribed_position=prescribed_position,
+                prescribed_velocity=prescribed_velocity,
+            )
+            final_penalty = tetrahedral_domain_penalty(
+                final_raw.position,
+                static.cells,
+                static.dm_inv,
+                minimum_j=self.integration_minimum_j,
+                maximum_i1_bar=self.integration_maximum_i1_bar,
+                maximum_i2_bar=self.integration_maximum_i2_bar,
+            )
+            (
+                current_position,
+                minimum_update_scale,
+                final_valid,
+            ) = backtrack_tetrahedral_update(
+                position,
+                final_raw.position,
+                static.cells,
+                static.dm_inv,
+                fixed_mask=static.fixed_mask,
+                prescribed_mask=active_prescribed_mask,
+                minimum_j=self.integration_minimum_j,
+                maximum_i1_bar=self.integration_maximum_i1_bar,
+                maximum_i2_bar=self.integration_maximum_i2_bar,
+                max_backtracks=self.integration_backtracks,
+            )
+            current_velocity = torch.where(
+                free_mask[:, None],
+                (current_position - position) / step_dt,
+                final_raw.velocity,
             )
             proposal_kinetic = 0.5 * (
-                nodal_mass[:, None] * integrated.velocity.square()
+                nodal_mass[:, None] * final_raw.velocity.square()
             ).sum()
             accepted_kinetic = 0.5 * (
-                nodal_mass[:, None] * accepted_velocity.square()
+                nodal_mass[:, None] * current_velocity.square()
             ).sum()
-            projection_dissipation = projection_dissipation + (
+            projection_dissipation = (
                 proposal_kinetic - accepted_kinetic
             ).clamp_min(0.0)
-            damping_dissipation = damping_dissipation + damping_rate * substep_dt
-            contact_dissipation = contact_dissipation + contact_rate * substep_dt
-            current_position = accepted_position
-            current_velocity = accepted_velocity
+            integration_domain_penalty = torch.maximum(
+                predictor_penalty, final_penalty
+            )
+            integration_valid = predictor_valid & final_valid
+            max_penetration = torch.maximum(rate_0[0], rate_1[0])
+            damping_dissipation = 0.5 * (rate_0[1] + rate_1[1]) * step_dt
+            contact_dissipation = 0.5 * (rate_0[2] + rate_1[2]) * step_dt
+            active_contact_pairs = predictor_pairs
+            final_contact_pair_count = position.new_tensor(
+                predictor_pairs.shape[1]
+            )
 
-        # Each contact substep already applies symplectic Euler with dt/S.
-        # Keep the accumulated trajectory instead of reconstructing x[t+1]
-        # from only the final velocity, which would discard the first
-        # substep's position and no longer represent the force refresh path.
         acceleration = (current_velocity - velocity) / step_dt
+        discrete_force_balance = nodal_mass[:, None] * acceleration - total_force
+        if bool(free_mask.any().item()):
+            free_force_balance = discrete_force_balance[free_mask]
+            discrete_force_balance_rms = free_force_balance.square().mean().sqrt()
+            discrete_force_balance_resultant = torch.linalg.vector_norm(
+                free_force_balance.sum(0)
+            )
+        else:
+            discrete_force_balance_rms = position.new_zeros(())
+            discrete_force_balance_resultant = position.new_zeros(())
         full_step_displacement = current_position - position
         external_work = (external_force * full_step_displacement).sum()
         residual_work = (residual * full_step_displacement).sum()
@@ -1110,7 +1413,7 @@ class CHPGNS(nn.Module):
             acceleration=acceleration,
             nodal_stress=nodal_stress,
             cell_stress_tensor=final_fields.cauchy_stress,
-            internal_force=initial_fields.internal_force,
+            internal_force=effective_internal,
             contact_force=contact,
             damping_force=damping,
             residual_force=residual,
@@ -1144,6 +1447,8 @@ class CHPGNS(nn.Module):
                     boundary_target_velocity, dim=1
                 ).max(),
                 "integration_update_scale": minimum_update_scale,
+                "predictor_update_scale": predictor_update_scale,
+                "final_update_scale": minimum_update_scale,
                 "integration_valid": integration_valid.to(position.dtype),
                 "integration_domain_penalty": integration_domain_penalty,
                 "stress_scale": self.log_stress_scale.clamp(-20.0, 30.0).exp(),
@@ -1153,7 +1458,14 @@ class CHPGNS(nn.Module):
                 "contact_pair_count": position.new_tensor(
                     active_contact_pairs.shape[1]
                 ),
+                "initial_contact_pair_count": initial_contact_pair_count,
+                "final_contact_pair_count": final_contact_pair_count,
+                "discrete_force_balance_rms": discrete_force_balance_rms,
+                "discrete_force_balance_resultant": (
+                    discrete_force_balance_resultant
+                ),
             },
+            final_internal_force=final_fields.internal_force,
         )
 
 

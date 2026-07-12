@@ -779,7 +779,6 @@ def chp_step_loss(
         input_state,
         exact_position,
         step_dt,
-        substeps=int(get_cfg(cfg, "model.contact_substeps", 2)),
     )
     moving = ~(static.fixed_mask | static.prescribed_mask)
     if not bool(moving.any().item()):
@@ -889,15 +888,13 @@ def integration_consistent_targets(
     input_state: CHPState,
     exact_next_position: torch.Tensor,
     dt: float | torch.Tensor,
-    *,
-    substeps: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Infer constant acceleration under the configured symplectic substeps.
+    """Return targets for one global semi-implicit state update.
 
-    For ``S`` equal substeps and constant acceleration, symplectic Euler gives
-    ``dx = dt*v0 + dt^2*a*(S+1)/(2S)``.  This preserves noise correction while
-    keeping position, terminal velocity, and acceleration consistent with the
-    actual integrator used by :class:`CHPGNS`.
+    The exported deforming_plate velocity is the backward position difference,
+    so with ``dt=1`` this gives ``v*=V[t+1]`` and
+    ``a*=V[t+1]-V[t]`` on an exact input state.  Contact iterations refine the
+    force but never change this single-update kinematic contract.
     """
 
     step_dt = torch.as_tensor(
@@ -905,15 +902,14 @@ def integration_consistent_targets(
         device=input_state.position.device,
         dtype=input_state.position.dtype,
     )
-    if int(substeps) < 1:
-        raise ValueError("substeps must be at least one")
-    integration_factor = (int(substeps) + 1.0) / (2.0 * int(substeps))
+    if step_dt.numel() != 1 or not bool(torch.isfinite(step_dt).item()):
+        raise ValueError("dt must be a finite scalar")
+    if not bool((step_dt > 0.0).item()):
+        raise ValueError("dt must be positive")
+    target_velocity = (exact_next_position - input_state.position) / step_dt
     target_acceleration = (
-        exact_next_position
-        - input_state.position
-        - step_dt * input_state.velocity
-    ) / (integration_factor * step_dt.square())
-    target_velocity = input_state.velocity + step_dt * target_acceleration
+        target_velocity - input_state.velocity
+    ) / step_dt
     return target_velocity, target_acceleration
 
 
@@ -1851,6 +1847,7 @@ def exact_dynamics_loss(
     cfg: dict[str, Any],
     *,
     contact_pairs: torch.Tensor | None = None,
+    residual_enabled: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Supervise the force-driven update on an exact, noise-free state."""
 
@@ -1861,7 +1858,6 @@ def exact_dynamics_loss(
         input_state,
         exact_position,
         dt,
-        substeps=int(get_cfg(cfg, "model.contact_substeps", 2)),
     )
     moving = ~(static.fixed_mask | static.prescribed_mask)
     if not bool(moving.any().item()):
@@ -1918,47 +1914,37 @@ def exact_dynamics_loss(
         (output.energy_diagnostics["integration_update_scale"] >= 1.0 - 1.0e-7)
         & (output.energy_diagnostics["integration_valid"] >= 0.5)
     ).to(acceleration_loss.dtype)
-    effective_mass = (
-        static.lumped_mass.reshape(-1, 1)
-        * output.energy_diagnostics["mass_scale"]
-    )
-    residual_acceleration = output.residual_force / effective_mass
-    residual_moving = residual_acceleration[moving]
-    correction_target = (
-        target_acceleration_moving
-        - (output.acceleration[moving] - residual_moving).detach()
-    ).detach()
-    correction_norm = torch.linalg.vector_norm(correction_target, dim=1)
-    direction_mask = correction_norm > (
+    del contact_pairs  # The cosine objective applies to the total acceleration.
+    target_norm = torch.linalg.vector_norm(target_acceleration_moving, dim=1)
+    direction_mask = target_norm > (
         float(get_cfg(cfg, "dynamics_pretraining.active_threshold", 0.05))
         * global_scale
     )
-    if contact_pairs is not None and contact_pairs.numel():
-        contact_nodes = torch.zeros_like(moving)
-        contact_nodes[contact_pairs.reshape(-1).long()] = True
-        direction_mask = direction_mask & ~contact_nodes[moving]
     if bool(direction_mask.any().item()):
-        selected_correction = correction_target[direction_mask].float()
-        correction_unit = selected_correction / torch.linalg.vector_norm(
-            selected_correction, dim=1, keepdim=True
-        ).clamp_min(global_scale.detach().float() * 0.05)
-        directional_projection = (
-            residual_moving[direction_mask].float()
-            / frame_scale.detach().float()
-            * correction_unit
-        ).sum(dim=1)
-        direction_loss = (1.0 - directional_projection).mean()
+        direction_loss = (
+            1.0
+            - F.cosine_similarity(
+                output.acceleration[moving][direction_mask].float(),
+                target_acceleration_moving[direction_mask].float(),
+                dim=1,
+                eps=1.0e-8,
+            )
+        ).mean()
     else:
         direction_loss = acceleration_loss.new_zeros(())
     quiet_mask = target_norm <= (
         float(get_cfg(cfg, "dynamics_pretraining.active_threshold", 0.05))
         * global_scale
     )
-    quiet_loss = (
-        (residual_moving[quiet_mask] / global_scale).square().mean()
-        if bool(quiet_mask.any().item())
-        else acceleration_loss.new_zeros(())
+    effective_mass = (
+        static.lumped_mass.reshape(-1, 1)
+        * output.energy_diagnostics["mass_scale"]
     )
+    residual_acceleration = output.residual_force / effective_mass
+    residual_moving = residual_acceleration[moving]
+    quiet_loss = acceleration_loss.new_zeros(())
+    if residual_enabled and bool(quiet_mask.any().item()):
+        quiet_loss = (residual_moving[quiet_mask] / global_scale).square().mean()
     state_loss = projection_free * (
         float(get_cfg(cfg, "dynamics_pretraining.position_weight", 0.25))
         * position_loss
@@ -1973,10 +1959,12 @@ def exact_dynamics_loss(
         + float(get_cfg(cfg, "dynamics_pretraining.stress_weight", 0.1))
         * stress_loss
     )
-    residual_loss = (
-        output.energy_diagnostics["residual_norm"]
-        / output.energy_diagnostics["residual_reference"].clamp_min(1.0e-12)
-    ).square()
+    residual_loss = acceleration_loss.new_zeros(())
+    if residual_enabled:
+        residual_loss = (
+            output.energy_diagnostics["residual_norm"]
+            / output.energy_diagnostics["residual_reference"].clamp_min(1.0e-12)
+        ).square()
     total = (
         state_loss
         + float(get_cfg(cfg, "dynamics_pretraining.residual_weight", 1.0e-3))
@@ -2012,6 +2000,7 @@ def evaluate_teacher_forced_dynamics(
     normalizers: CHPNormalizers,
     *,
     amp_dtype: torch.dtype,
+    residual_enabled: bool = True,
 ) -> dict[str, float]:
     """Measure exact-state one-step dynamics without touching the test split."""
 
@@ -2083,6 +2072,7 @@ def evaluate_teacher_forced_dynamics(
                         + trajectory.displacement[frame + 1]
                     ),
                     prescribed_velocity=trajectory.velocity[frame + 1],
+                    residual_enabled=residual_enabled,
                 )
             moving = ~(
                 trajectory.static.fixed_mask
@@ -2098,7 +2088,6 @@ def evaluate_teacher_forced_dynamics(
                 state,
                 exact_next,
                 dt,
-                substeps=int(get_cfg(cfg, "model.contact_substeps", 2)),
             )
             prediction = output.acceleration[moving].double()
             target = target_acceleration[moving].double()
@@ -2204,21 +2193,48 @@ def evaluate_teacher_forced_dynamics(
 
 def _dynamics_pretraining_parameters(
     model: CHPGNS,
-) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
-    residual = list(model.residual_channel.parameters())
-    residual_ids = {id(parameter) for parameter in residual}
-    processor: list[torch.nn.Parameter] = []
+) -> dict[str, list[torch.nn.Parameter]]:
+    """Return a complete, mutually exclusive physical pretraining partition."""
+
+    physical_graph: list[torch.nn.Parameter] = []
     for module in (
         model.node_encoder,
         model.vector_encoder,
+        model.cell_encoder,
+        model.cell_blocks,
         model.processor,
     ):
-        processor.extend(
-            parameter
-            for parameter in module.parameters()
-            if id(parameter) not in residual_ids
+        physical_graph.extend(module.parameters())
+    groups = {
+        "inertia": [model.log_mass_scale],
+        "force_scales": [model.log_contact_scale, model.log_damping_scale],
+        "pair_heads": list(model.force_heads.parameters()),
+        "physical_graph": physical_graph,
+        "constitutive": _constitutive_parameters(model),
+        "residual": list(model.residual_channel.parameters()),
+    }
+    assigned: dict[int, str] = {}
+    for name, parameters in groups.items():
+        for parameter in parameters:
+            previous = assigned.setdefault(id(parameter), name)
+            if previous != name:
+                raise ValueError(
+                    f"dynamics parameter appears in both {previous!r} and {name!r}"
+                )
+    model_ids = {id(parameter) for parameter in model.parameters()}
+    missing_ids = model_ids.difference(assigned)
+    extra_ids = set(assigned).difference(model_ids)
+    if missing_ids or extra_ids:
+        missing_names = [
+            name
+            for name, parameter in model.named_parameters()
+            if id(parameter) in missing_ids
+        ]
+        raise ValueError(
+            "dynamics parameter partition must cover the model exactly; "
+            f"missing={missing_names}, extra_count={len(extra_ids)}"
         )
-    return processor, residual
+    return groups
 
 
 def train_exact_dynamics_epoch(
@@ -2232,6 +2248,8 @@ def train_exact_dynamics_epoch(
     *,
     epoch: int,
     amp_dtype: torch.dtype,
+    phase: str = "joint",
+    residual_enabled: bool = True,
 ) -> dict[str, float]:
     """Fit exact one-step acceleration before exposing the model to noise."""
 
@@ -2282,7 +2300,8 @@ def train_exact_dynamics_epoch(
                     + trajectory.displacement[1]
                 ),
                 prescribed_velocity=trajectory.velocity[1],
-                detach_pair_force_features=True,
+                detach_pair_force_features=False,
+                residual_enabled=residual_enabled,
             )
             loss, metrics = exact_dynamics_loss(
                 output,
@@ -2292,10 +2311,50 @@ def train_exact_dynamics_epoch(
                 normalizers,
                 cfg,
                 contact_pairs=pairs,
+                residual_enabled=residual_enabled,
             )
+            exact_stress_weight = float(
+                get_cfg(cfg, "dynamics_pretraining.exact_stress_weight", 0.1)
+            )
+            if phase in {"physics_only", "joint"} and exact_stress_weight > 0.0:
+                exact_position = (
+                    trajectory.static.reference_position
+                    + trajectory.displacement[1]
+                )
+                exact_fields = model.constitutive_fields(
+                    trajectory.static, exact_position
+                )
+                exact_nodal_stress = _nodal_stress_from_cell_tensor(
+                    exact_fields.cauchy_stress, trajectory.static
+                )
+                stress_mask = ~trajectory.static.prescribed_mask
+                if not bool(stress_mask.any().item()):
+                    stress_mask = torch.ones_like(
+                        trajectory.static.prescribed_mask
+                    )
+                exact_stress_loss, exact_stress_metrics = (
+                    _supervised_constitutive_loss(
+                        exact_nodal_stress,
+                        exact_fields.cauchy_stress,
+                        trajectory,
+                        1,
+                        normalizers,
+                        cfg,
+                        nodal_mask=stress_mask,
+                        gate_mse_weight=1.0,
+                    )
+                )
+                loss = loss + exact_stress_weight * exact_stress_loss
+                metrics["exact_geometry_stress"] = exact_stress_loss.detach()
+                metrics["exact_geometry_stress_gate_mse"] = (
+                    exact_stress_metrics["stress_gate_mse"]
+                )
         if not bool(torch.isfinite(loss).item()):
             nonfinite_losses += 1
-            continue
+            raise FloatingPointError(
+                "non-finite dynamics-pretraining loss for "
+                f"{case.case_id} at frame {start} during phase {phase!r}"
+            )
         loss.backward()
         try:
             stable_clip_grad_norm_(
@@ -2314,7 +2373,230 @@ def train_exact_dynamics_epoch(
     averaged["steps"] = float(used)
     averaged["nonfinite_losses"] = float(nonfinite_losses)
     averaged["nonfinite_gradients"] = float(nonfinite_gradients)
+    if used == 0:
+        raise RuntimeError(
+            f"dynamics-pretraining phase {phase!r} produced no admissible steps"
+        )
     return averaged
+
+
+def _dynamics_pretraining_schedule(
+    cfg: dict[str, Any],
+) -> list[dict[str, int | str]]:
+    configured = get_cfg(cfg, "dynamics_pretraining.phases", None)
+    if configured is None:
+        configured = [
+            {
+                "name": "physics_only",
+                "epochs": int(
+                    get_cfg(cfg, "dynamics_pretraining.physics_only_epochs", 4)
+                ),
+            },
+            {
+                "name": "residual_warmup",
+                "epochs": int(
+                    get_cfg(cfg, "dynamics_pretraining.residual_warmup_epochs", 1)
+                ),
+            },
+            {
+                "name": "joint",
+                "epochs": int(
+                    get_cfg(cfg, "dynamics_pretraining.joint_epochs", 2)
+                ),
+            },
+        ]
+    schedule = [
+        {"name": str(item["name"]), "epochs": int(item["epochs"])}
+        for item in configured
+    ]
+    names = [str(item["name"]) for item in schedule]
+    if names != ["physics_only", "residual_warmup", "joint"]:
+        raise ValueError(
+            "dynamics pretraining phases must be ordered as "
+            "physics_only, residual_warmup, joint"
+        )
+    if any(int(item["epochs"]) < 0 for item in schedule):
+        raise ValueError("dynamics pretraining phase epochs cannot be negative")
+    if int(schedule[0]["epochs"]) < 1:
+        raise ValueError("physics_only requires at least one epoch before its gate")
+    return schedule
+
+
+def _set_dynamics_pretraining_phase(
+    model: CHPGNS,
+    optimizer: torch.optim.Optimizer,
+    phase: str,
+    cfg: dict[str, Any],
+) -> dict[str, float]:
+    active = {
+        "physics_only": {
+            "inertia",
+            "force_scales",
+            "pair_heads",
+            "physical_graph",
+            "constitutive",
+        },
+        "residual_warmup": {"residual"},
+        "joint": {
+            "inertia",
+            "force_scales",
+            "pair_heads",
+            "physical_graph",
+            "constitutive",
+            "residual",
+        },
+    }
+    if phase not in active:
+        raise ValueError(f"unknown dynamics pretraining phase: {phase!r}")
+    base_lr = float(get_cfg(cfg, "dynamics_pretraining.lr", 1.0e-4))
+    configured_lrs = {
+        "inertia": float(
+            get_cfg(cfg, "dynamics_pretraining.inertia_lr", 1.0e-3)
+        ),
+        "force_scales": float(
+            get_cfg(cfg, "dynamics_pretraining.force_scale_lr", 5.0e-4)
+        ),
+        "pair_heads": float(
+            get_cfg(cfg, "dynamics_pretraining.pair_head_lr", 5.0e-4)
+        ),
+        "physical_graph": float(
+            get_cfg(cfg, "dynamics_pretraining.physical_graph_lr", base_lr)
+        ),
+        "constitutive": float(
+            get_cfg(cfg, "dynamics_pretraining.constitutive_lr", 1.0e-5)
+        ),
+        "residual": float(
+            get_cfg(
+                cfg,
+                "dynamics_pretraining.residual_warmup_lr"
+                if phase == "residual_warmup"
+                else "dynamics_pretraining.residual_joint_lr",
+                1.0e-3 if phase == "residual_warmup" else 5.0e-4,
+            )
+        ),
+    }
+    applied: dict[str, float] = {}
+    for group in optimizer.param_groups:
+        name = str(group["name"])
+        enabled = name in active[phase]
+        lr = configured_lrs[name] if enabled else 0.0
+        group["lr"] = lr
+        applied[name] = lr
+        for parameter in group["params"]:
+            parameter.requires_grad_(enabled)
+    model.dynamics_pretraining_phase = phase
+    return applied
+
+
+def _evaluate_dynamics_physics_gate(
+    dynamics_metrics: dict[str, Any],
+    stress_metrics: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    thresholds = {
+        "active_acceleration_relative_rmse": float(
+            get_cfg(
+                cfg,
+                "dynamics_pretraining.phase_gate.active_acceleration_relative_rmse",
+                0.95,
+            )
+        ),
+        "active_acceleration_cosine": float(
+            get_cfg(
+                cfg,
+                "dynamics_pretraining.phase_gate.active_acceleration_cosine",
+                0.05,
+            )
+        ),
+        "teacher_stress_relative_rmse": float(
+            get_cfg(
+                cfg,
+                "dynamics_pretraining.phase_gate.teacher_stress_relative_rmse",
+                0.50,
+            )
+        ),
+        "teacher_stress_admissible_coverage": float(
+            get_cfg(
+                cfg,
+                "validation.teacher_stress_minimum_admissible_coverage",
+                0.0,
+            )
+        ),
+    }
+    metrics = {
+        "active_acceleration_relative_rmse": float(
+            dynamics_metrics.get("active_acceleration_relative_rmse", float("inf"))
+        ),
+        "active_acceleration_cosine": float(
+            dynamics_metrics.get("active_acceleration_cosine", float("-inf"))
+        ),
+        "teacher_stress_relative_rmse": float(
+            stress_metrics.get("teacher_stress_relative_rmse", float("inf"))
+        ),
+        "teacher_stress_admissible_coverage": float(
+            stress_metrics.get("teacher_stress_admissible_coverage", 0.0)
+        ),
+        "teacher_stress_source": str(
+            stress_metrics.get("teacher_stress_source", "unavailable")
+        ),
+    }
+    failures: list[str] = []
+    if not (
+        math.isfinite(metrics["active_acceleration_relative_rmse"])
+        and metrics["active_acceleration_relative_rmse"]
+        < thresholds["active_acceleration_relative_rmse"]
+    ):
+        failures.append("active_acceleration_relative_rmse")
+    if not (
+        math.isfinite(metrics["active_acceleration_cosine"])
+        and metrics["active_acceleration_cosine"]
+        > thresholds["active_acceleration_cosine"]
+    ):
+        failures.append("active_acceleration_cosine")
+    if not (
+        math.isfinite(metrics["teacher_stress_relative_rmse"])
+        and metrics["teacher_stress_relative_rmse"]
+        < thresholds["teacher_stress_relative_rmse"]
+    ):
+        failures.append("teacher_stress_relative_rmse")
+    if not (
+        math.isfinite(metrics["teacher_stress_admissible_coverage"])
+        and metrics["teacher_stress_admissible_coverage"]
+        >= thresholds["teacher_stress_admissible_coverage"]
+    ):
+        failures.append("teacher_stress_admissible_coverage")
+    return {
+        "status": "passed" if not failures else "failed",
+        "passed": not failures,
+        "metrics": metrics,
+        "thresholds": thresholds,
+        "failures": failures,
+    }
+
+
+_TRANSITION_DYNAMICS_GATE_ROLE = "transition_pre_residual"
+_FINAL_DYNAMICS_GATE_ROLE = "final_post_joint_residual_disabled"
+
+
+def _dynamics_gate_with_role(
+    dynamics_metrics: dict[str, Any],
+    stress_metrics: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    """Evaluate the shared physics thresholds and identify when they ran."""
+
+    if role not in {
+        _TRANSITION_DYNAMICS_GATE_ROLE,
+        _FINAL_DYNAMICS_GATE_ROLE,
+    }:
+        raise ValueError(f"unsupported dynamics gate role: {role!r}")
+    return {
+        **_evaluate_dynamics_physics_gate(dynamics_metrics, stress_metrics, cfg),
+        "gate_role": role,
+        "residual_enabled": False,
+    }
 
 
 def run_dynamics_pretraining(
@@ -2330,78 +2612,193 @@ def run_dynamics_pretraining(
     *,
     amp_dtype: torch.dtype,
 ) -> dict[str, Any]:
-    """Pretrain bounded residual dynamics on exact states and select on val."""
+    """Fit identifiable physical forces before unlocking the residual channel."""
 
     if not bool(get_cfg(cfg, "dynamics_pretraining.enabled", True)):
         return {"enabled": False}
     if val_cases is None or val_cache is None:
         raise ValueError("dynamics pretraining requires a validation split")
-    processor_parameters, residual_parameters = _dynamics_pretraining_parameters(model)
-    selected_ids = {
-        id(parameter)
-        for parameter in (*processor_parameters, *residual_parameters)
-    }
+    if int(model.dynamics_semantics_version) != CHPGNS.dynamics_schema_version:
+        raise ValueError(
+            "formal dynamics pretraining requires the schema-9 integration contract"
+        )
+    schedule = _dynamics_pretraining_schedule(cfg)
+    flattened_schedule = [
+        (str(item["name"]), phase_epoch)
+        for item in schedule
+        for phase_epoch in range(1, int(item["epochs"]) + 1)
+    ]
+    parameter_groups = _dynamics_pretraining_parameters(model)
     original_requires_grad = {
         id(parameter): parameter.requires_grad for parameter in model.parameters()
     }
-    for parameter in model.parameters():
-        parameter.requires_grad_(id(parameter) in selected_ids)
-    base_lr = float(get_cfg(cfg, "dynamics_pretraining.lr", 1.0e-4))
-    head_warmup_lr = float(
-        get_cfg(cfg, "dynamics_pretraining.head_warmup_lr", 5.0e-3)
-    )
-    joint_head_lr = float(
-        get_cfg(
-            cfg,
-            "dynamics_pretraining.joint_head_lr",
-            base_lr
-            * float(
-                get_cfg(cfg, "dynamics_pretraining.residual_lr_scale", 5.0)
-            ),
-        )
+    weight_decay = float(
+        get_cfg(cfg, "dynamics_pretraining.weight_decay", 1.0e-6)
     )
     optimizer = torch.optim.AdamW(
         [
-            {"params": processor_parameters, "lr": 0.0},
             {
-                "params": residual_parameters,
-                "lr": head_warmup_lr,
-            },
+                "name": name,
+                "params": parameters,
+                "lr": 0.0,
+                "weight_decay": (
+                    weight_decay
+                    if name in {"physical_graph", "pair_heads", "residual"}
+                    else 0.0
+                ),
+            }
+            for name, parameters in parameter_groups.items()
         ],
-        weight_decay=float(
-            get_cfg(cfg, "dynamics_pretraining.weight_decay", 1.0e-6)
-        ),
+        lr=1.0,
+        weight_decay=0.0,
     )
-    history: dict[str, Any] = {"enabled": True, "epochs": []}
-    try:
-        initial = evaluate_teacher_forced_dynamics(
-            model,
-            val_cases,
-            val_cache,
-            cfg,
-            normalizers,
-            amp_dtype=amp_dtype,
-        )
-        history["initial_validation"] = initial
-        best_score = max(
-            initial["active_acceleration_relative_rmse"],
-            initial["one_step_stress_relative_rmse"],
-        )
-        best_state = {
-            key: value.detach().cpu().clone()
-            for key, value in model.state_dict().items()
+    state_path = output_dir / "dynamics_pretraining_latest.pt"
+    complete_path = output_dir / "dynamics_pretraining_complete.pt"
+    history: dict[str, Any] = {
+        "enabled": True,
+        "protocol": "physics_transition_final_gate_residual_v2",
+        "schedule": schedule,
+        "epochs": [],
+    }
+    completed_epochs = 0
+    transition_gate: dict[str, Any] = {
+        "status": "pending",
+        "passed": False,
+        "gate_role": _TRANSITION_DYNAMICS_GATE_ROLE,
+        "residual_enabled": False,
+    }
+    final_gate: dict[str, Any] = {
+        "status": "pending",
+        "passed": False,
+        "gate_role": _FINAL_DYNAMICS_GATE_ROLE,
+        "residual_enabled": False,
+    }
+
+    def save_state(*, status: str, phase: str, phase_epoch: int) -> None:
+        phase_state = {
+            "phase": phase,
+            "status": status,
+            "global_epoch_completed": completed_epochs,
+            "phase_epoch_completed": phase_epoch,
+            "schedule": schedule,
+            # ``physics_gate`` remains as a migration alias for the
+            # uncommitted schema-9 pretraining artifact.  It means the final
+            # gate only once the artifact is complete; both named gates are
+            # always persisted by protocol v2.
+            "physics_gate": (
+                final_gate if status == "complete" else transition_gate
+            ),
+            "transition_physics_gate": transition_gate,
+            "final_physics_gate": final_gate,
+            "residual_zero_initialized": True,
+            "residual_enabled": phase in {
+                "residual_warmup",
+                "joint",
+                "complete",
+            },
         }
-        epochs = max(int(get_cfg(cfg, "dynamics_pretraining.epochs", 2)), 0)
-        head_warmup_epochs = max(
-            int(get_cfg(cfg, "dynamics_pretraining.head_warmup_epochs", 1)), 0
+        model.dynamics_pretraining_phase = phase
+        model.dynamics_pretraining_phase_gate = (
+            final_gate if status == "complete" else transition_gate
         )
-        for epoch in range(1, epochs + 1):
-            if epoch <= head_warmup_epochs:
-                optimizer.param_groups[0]["lr"] = 0.0
-                optimizer.param_groups[1]["lr"] = head_warmup_lr
-            else:
-                optimizer.param_groups[0]["lr"] = base_lr
-                optimizer.param_groups[1]["lr"] = joint_head_lr
+        model.dynamics_pretraining_transition_gate = transition_gate
+        model.dynamics_pretraining_final_gate = final_gate
+        payload = {
+            "artifact_type": "chp_dynamics_pretraining_checkpoint",
+            "artifact_schema_version": 1,
+            "checkpoint_schema_version": CHPGNS.checkpoint_schema_version,
+            "dynamics_schema_version": int(model.dynamics_semantics_version),
+            "dynamics_pretraining_protocol": (
+                "physics_transition_final_gate_residual_v2"
+            ),
+            "phase_state": phase_state,
+            "parameter_group_names": list(parameter_groups),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "normalizers": normalizers.state_dict(),
+            "history": history,
+            "rng_state": _capture_rng_state(),
+            "config": cfg,
+        }
+        _atomic_torch_save(payload, state_path)
+
+    try:
+        if state_path.is_file():
+            saved = _torch_load(state_path, train_cache.device)
+            if saved.get("artifact_type") != "chp_dynamics_pretraining_checkpoint":
+                raise ValueError(f"invalid dynamics pretraining artifact: {state_path}")
+            if int(saved.get("dynamics_schema_version", 0)) != int(
+                model.dynamics_semantics_version
+            ):
+                raise ValueError("dynamics pretraining checkpoint semantics changed")
+            saved_phase_state = saved.get("phase_state", {})
+            if saved_phase_state.get("schedule") != schedule:
+                raise ValueError("dynamics pretraining schedule changed across resume")
+            if saved.get("parameter_group_names") != list(parameter_groups):
+                raise ValueError("dynamics pretraining parameter groups changed")
+            if not _checkpoint_values_equal(saved.get("config"), cfg):
+                raise ValueError("dynamics pretraining config changed across resume")
+            if not _checkpoint_values_equal(
+                saved.get("normalizers"), normalizers.state_dict()
+            ):
+                raise ValueError(
+                    "dynamics pretraining normalizers changed across resume"
+                )
+            if saved_phase_state.get("status") == "failed":
+                raise RuntimeError(
+                    "dynamics physics gate previously failed; refusing resume"
+                )
+            model.load_state_dict(saved["model"])
+            optimizer.load_state_dict(saved["optimizer"])
+            history = saved["history"]
+            completed_epochs = int(
+                saved_phase_state.get("global_epoch_completed", 0)
+            )
+            transition_gate = dict(
+                saved_phase_state.get(
+                    "transition_physics_gate",
+                    saved_phase_state.get("physics_gate", transition_gate),
+                )
+            )
+            final_gate = dict(
+                saved_phase_state.get("final_physics_gate", final_gate)
+            )
+            if saved.get("rng_state") is not None:
+                _restore_rng_state(saved["rng_state"])
+            if (
+                saved_phase_state.get("status") == "complete"
+                and final_gate.get("status") == "passed"
+                and final_gate.get("gate_role") == _FINAL_DYNAMICS_GATE_ROLE
+            ):
+                model.dynamics_pretraining_phase = "complete"
+                model.dynamics_pretraining_phase_gate = final_gate
+                model.dynamics_pretraining_transition_gate = transition_gate
+                model.dynamics_pretraining_final_gate = final_gate
+                return history
+        else:
+            with torch.no_grad():
+                torch.nn.init.zeros_(model.residual_channel.weight)
+            initial = evaluate_teacher_forced_dynamics(
+                model,
+                val_cases,
+                val_cache,
+                cfg,
+                normalizers,
+                amp_dtype=amp_dtype,
+                residual_enabled=False,
+            )
+            history["initial_validation"] = initial
+
+        physics_epochs = int(schedule[0]["epochs"])
+        for global_index, (phase, phase_epoch) in enumerate(
+            flattened_schedule, start=1
+        ):
+            if global_index <= completed_epochs:
+                continue
+            residual_enabled = phase != "physics_only"
+            group_lrs = _set_dynamics_pretraining_phase(
+                model, optimizer, phase, cfg
+            )
             train_metrics = train_exact_dynamics_epoch(
                 model,
                 train_cases,
@@ -2410,8 +2807,10 @@ def run_dynamics_pretraining(
                 normalizers,
                 optimizer,
                 cfg,
-                epoch=epoch,
+                epoch=global_index,
                 amp_dtype=amp_dtype,
+                phase=phase,
+                residual_enabled=residual_enabled,
             )
             validation = evaluate_teacher_forced_dynamics(
                 model,
@@ -2420,29 +2819,166 @@ def run_dynamics_pretraining(
                 cfg,
                 normalizers,
                 amp_dtype=amp_dtype,
+                residual_enabled=residual_enabled,
             )
             score = max(
                 validation["active_acceleration_relative_rmse"],
                 validation["one_step_stress_relative_rmse"],
             )
-            if score < best_score:
-                best_score = score
-                best_state = {
-                    key: value.detach().cpu().clone()
-                    for key, value in model.state_dict().items()
-                }
-            history["epochs"].append(
-                {
-                    "epoch": epoch,
-                    "train": train_metrics,
-                    "validation": validation,
-                    "score": score,
-                    "processor_lr": optimizer.param_groups[0]["lr"],
-                    "residual_head_lr": optimizer.param_groups[1]["lr"],
-                }
+            record = {
+                "epoch": global_index,
+                "phase": phase,
+                "phase_epoch": phase_epoch,
+                "residual_enabled": residual_enabled,
+                "train": train_metrics,
+                "validation": validation,
+                "score": score,
+                "group_lrs": group_lrs,
+            }
+            history["epochs"] = [
+                item
+                for item in history["epochs"]
+                if int(item["epoch"]) != global_index
+            ]
+            history["epochs"].append(record)
+            completed_epochs = global_index
+
+            if phase == "physics_only" and phase_epoch == physics_epochs:
+                stress_validation = evaluate_teacher_forced_stress(
+                    model,
+                    val_cases,
+                    val_cache,
+                    cfg,
+                    amp_dtype=amp_dtype,
+                )
+                transition_gate = _dynamics_gate_with_role(
+                    validation,
+                    stress_validation,
+                    cfg,
+                    role=_TRANSITION_DYNAMICS_GATE_ROLE,
+                )
+                history["transition_physics_gate"] = transition_gate
+                # Keep this alias in JSON for readers of the initial schema-9
+                # implementation; it is never accepted as the final gate.
+                history["physics_gate"] = transition_gate
+                model.dynamics_pretraining_phase_gate = transition_gate
+                model.dynamics_pretraining_transition_gate = transition_gate
+                if not bool(transition_gate["passed"]):
+                    save_state(
+                        status="failed",
+                        phase="physics_gate",
+                        phase_epoch=phase_epoch,
+                    )
+                    failure = {
+                        "stage": "dynamics_pretraining.physics_gate",
+                        "dynamics_schema_version": int(
+                            model.dynamics_semantics_version
+                        ),
+                        "protocol": "physics_transition_final_gate_residual_v2",
+                        "completed_physics_epochs": physics_epochs,
+                        **transition_gate,
+                        "test_content_accessed": False,
+                        "action": (
+                            "stop before residual learning and rollout; revise "
+                            "physical forces, inertia, or constitutive fit"
+                        ),
+                    }
+                    _save_json(
+                        output_dir / "dynamics_physics_gate_failure.json",
+                        failure,
+                    )
+                    _save_json(output_dir / "dynamics_pretraining.json", history)
+                    raise RuntimeError(
+                        "dynamics physics-only gate failed: "
+                        + ", ".join(transition_gate["failures"])
+                    )
+            save_state(
+                status="in_progress",
+                phase=phase,
+                phase_epoch=phase_epoch,
             )
-        model.load_state_dict(best_state)
-        history["selected_score"] = best_score
+            _save_json(output_dir / "dynamics_pretraining.json", history)
+
+        # The residual channel is deliberately disabled after joint training.
+        # This second, identically-thresholded gate proves that the physical
+        # force path still carries the dynamics instead of being bypassed by
+        # the bounded residual decoder.
+        final_dynamics_validation = evaluate_teacher_forced_dynamics(
+            model,
+            val_cases,
+            val_cache,
+            cfg,
+            normalizers,
+            amp_dtype=amp_dtype,
+            residual_enabled=False,
+        )
+        final_stress_validation = evaluate_teacher_forced_stress(
+            model,
+            val_cases,
+            val_cache,
+            cfg,
+            amp_dtype=amp_dtype,
+        )
+        final_gate = _dynamics_gate_with_role(
+            final_dynamics_validation,
+            final_stress_validation,
+            cfg,
+            role=_FINAL_DYNAMICS_GATE_ROLE,
+        )
+        history["protocol"] = "physics_transition_final_gate_residual_v2"
+        history["final_physics_validation"] = {
+            "dynamics": final_dynamics_validation,
+            "stress": final_stress_validation,
+        }
+        history["final_physics_gate"] = final_gate
+        if not bool(final_gate["passed"]):
+            save_state(
+                status="failed",
+                phase="final_physics_gate",
+                phase_epoch=int(schedule[-1]["epochs"]),
+            )
+            failure = {
+                "stage": "dynamics_pretraining.final_physics_gate",
+                "dynamics_schema_version": int(model.dynamics_semantics_version),
+                "protocol": "physics_transition_final_gate_residual_v2",
+                **final_gate,
+                "test_content_accessed": False,
+                "action": (
+                    "stop before rollout; revise joint training because the "
+                    "residual-disabled physical force path regressed"
+                ),
+            }
+            _save_json(
+                output_dir / "dynamics_final_physics_gate_failure.json",
+                failure,
+            )
+            _save_json(output_dir / "dynamics_pretraining.json", history)
+            raise RuntimeError(
+                "final residual-disabled dynamics physics gate failed: "
+                + ", ".join(final_gate["failures"])
+            )
+        history["selected_score"] = max(
+            float(
+                final_dynamics_validation.get(
+                    "active_acceleration_relative_rmse", float("inf")
+                )
+            ),
+            float(
+                final_dynamics_validation.get(
+                    "one_step_stress_relative_rmse", float("inf")
+                )
+            ),
+        )
+        history["selected_phase"] = "complete"
+        model.dynamics_pretraining_phase = "complete"
+        model.dynamics_pretraining_phase_gate = final_gate
+        model.dynamics_pretraining_transition_gate = transition_gate
+        model.dynamics_pretraining_final_gate = final_gate
+        final_phase_epoch = int(schedule[-1]["epochs"])
+        save_state(
+            status="complete", phase="complete", phase_epoch=final_phase_epoch
+        )
+        _atomic_torch_save(_torch_load(state_path, "cpu"), complete_path)
     finally:
         for parameter in model.parameters():
             parameter.requires_grad_(original_requires_grad[id(parameter)])
@@ -2586,17 +3122,26 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
     history = _load_json(output_dir / "history.json", default=[])
     resume = _resolve_resume(cfg, output_dir)
     if resume is None:
-        pretraining = run_constitutive_pretraining(
-            model,
-            train_dataset.cases,
-            val_dataset.cases if val_dataset is not None else None,
-            train_cache,
-            val_cache,
-            normalizers,
-            cfg,
-            output_dir,
-            amp_dtype=amp_dtype,
-        )
+        dynamics_state_exists = (
+            output_dir / "dynamics_pretraining_latest.pt"
+        ).is_file()
+        if dynamics_state_exists:
+            # The dynamics artifact embeds the post-constitutive model and is
+            # validated by run_dynamics_pretraining.  Do not repeat or mutate
+            # constitutive pretraining before restoring it.
+            pretraining = {"enabled": False, "resumed_from_dynamics": True}
+        else:
+            pretraining = run_constitutive_pretraining(
+                model,
+                train_dataset.cases,
+                val_dataset.cases if val_dataset is not None else None,
+                train_cache,
+                val_cache,
+                normalizers,
+                cfg,
+                output_dir,
+                amp_dtype=amp_dtype,
+            )
         if pretraining.get("enabled"):
             selected = float(
                 pretraining.get(
@@ -2701,6 +3246,24 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
         checkpoint = _torch_load(resume, device)
         validate_chp_checkpoint_semantics(checkpoint, source=resume)
         model.load_state_dict(checkpoint["model"])
+        model.dynamics_pretraining_phase = str(
+            checkpoint["dynamics_pretraining_phase"]
+        )
+        model.dynamics_pretraining_phase_gate = dict(
+            checkpoint["dynamics_pretraining_phase_gate"]
+        )
+        model.dynamics_pretraining_final_gate = dict(
+            checkpoint.get(
+                "dynamics_pretraining_final_gate",
+                checkpoint["dynamics_pretraining_phase_gate"],
+            )
+        )
+        model.dynamics_pretraining_transition_gate = dict(
+            checkpoint.get(
+                "dynamics_pretraining_transition_gate",
+                {"status": "unavailable"},
+            )
+        )
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         if checkpoint.get("scaler"):
@@ -2820,7 +3383,7 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             scientific_gate_status=gate_status,
             rng_provenance=rng_provenance,
         )
-        torch.save(payload, output_dir / "latest.pt")
+        _atomic_torch_save(payload, output_dir / "latest.pt")
         if (
             gate_status in {"passed", "not_required"}
             and score is not None
@@ -2828,7 +3391,7 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
         ):
             best_score = score
             payload["best_score"] = best_score
-            torch.save(payload, output_dir / "best.pt")
+            _atomic_torch_save(payload, output_dir / "best.pt")
     if not (output_dir / "best.pt").exists():
         raise RuntimeError("CHP-GNS produced no scientifically eligible best checkpoint")
     return output_dir / "best.pt"
@@ -3058,6 +3621,37 @@ def train_chp_epoch(
     return averaged
 
 
+def _conservative_force_resultants(
+    output: PhysicalStep,
+) -> dict[str, torch.Tensor]:
+    """Return FP64 net resultants of the conservative force channels.
+
+    These are conservation diagnostics, not the discrete equation-solver
+    residual ``M a - F``.  Internal and paired contact forces should each
+    have a near-zero global resultant before boundary projection; their sum
+    reports the complete conservative channel independently of damping,
+    external loading, and the learned residual force.
+    """
+
+    internal = output.effective_internal_force.double()
+    contact = output.effective_contact_force.double()
+    if internal.ndim != 2 or internal.shape[-1] != 3:
+        raise ValueError("internal force must have shape [N, 3]")
+    if contact.shape != internal.shape:
+        raise ValueError("contact and internal force must have matching shapes")
+    return {
+        "internal_force_resultant": torch.linalg.vector_norm(
+            internal.sum(dim=0)
+        ),
+        "contact_force_resultant": torch.linalg.vector_norm(
+            contact.sum(dim=0)
+        ),
+        "total_conservative_force_resultant": torch.linalg.vector_norm(
+            (internal + contact).sum(dim=0)
+        ),
+    }
+
+
 @torch.no_grad()
 def evaluate_chp_rollouts(
     model: CHPGNS,
@@ -3095,7 +3689,10 @@ def evaluate_chp_rollouts(
             "cell_vm_p95_error",
             "cell_vm_p95_reference",
             "penetration",
-            "momentum",
+            "solver_force_balance_rms",
+            "internal_force_resultant",
+            "contact_force_resultant",
+            "total_conservative_force_resultant",
             "energy",
             "backtrack",
             "integration_failure",
@@ -3184,19 +3781,33 @@ def evaluate_chp_rollouts(
             accum["proposal_domain"] += (
                 output.energy_diagnostics["integration_domain_penalty"] > 0.0
             ).double()
-            predicted_deformation = invariants(
-                deformation_gradient(
-                    state.position,
-                    trajectory.static.cells,
-                    trajectory.static.dm_inv,
-                )
+            predicted_gradient = deformation_gradient(
+                state.position,
+                trajectory.static.cells,
+                trajectory.static.dm_inv,
             )
+            predicted_deformation = invariants(predicted_gradient)
             predicted_domain_valid = (
-                torch.isfinite(predicted_deformation.j).all()
+                torch.isfinite(predicted_gradient).all()
+                & torch.isfinite(predicted_deformation.c).all()
+                & torch.isfinite(predicted_deformation.i1).all()
+                & torch.isfinite(predicted_deformation.i2).all()
+                & torch.isfinite(predicted_deformation.j).all()
+                & torch.isfinite(predicted_deformation.i1_bar).all()
                 & torch.isfinite(predicted_deformation.i2_bar).all()
                 & (
                     predicted_deformation.j.min()
                     >= float(get_cfg(cfg, "validation.minimum_predicted_j", 1.0e-4))
+                )
+                & (
+                    predicted_deformation.i1_bar.max()
+                    <= float(
+                        get_cfg(
+                            cfg,
+                            "validation.maximum_predicted_i1_bar",
+                            1.0e4,
+                        )
+                    )
                 )
                 & (
                     predicted_deformation.i2_bar.max()
@@ -3271,10 +3882,12 @@ def evaluate_chp_rollouts(
             accum["penetration"] += output.energy_diagnostics[
                 "max_penetration"
             ].double()
-            resultant = output.internal_force + output.contact_force
-            accum["momentum"] += torch.linalg.vector_norm(
-                resultant.double().sum(0)
-            )
+            accum["solver_force_balance_rms"] += output.energy_diagnostics[
+                "discrete_force_balance_rms"
+            ].double()
+            force_resultants = _conservative_force_resultants(output)
+            for key, value in force_resultants.items():
+                accum[key] += value
             accum["energy"] += output.energy_diagnostics[
                 "work_energy_balance"
             ].double().abs()
@@ -3411,7 +4024,36 @@ def evaluate_chp_rollouts(
         ),
         "diverged_cases": float(diverged),
         "mean_penetration": float((accum["penetration"] / max(evaluated_steps, 1)).item()),
-        "mean_momentum_residual": float((accum["momentum"] / max(evaluated_steps, 1)).item()),
+        "mean_solver_force_balance_rms": float(
+            (
+                accum["solver_force_balance_rms"]
+                / max(evaluated_steps, 1)
+            ).item()
+        ),
+        "mean_discrete_force_balance_rms": float(
+            (
+                accum["solver_force_balance_rms"]
+                / max(evaluated_steps, 1)
+            ).item()
+        ),
+        "mean_internal_force_resultant": float(
+            (
+                accum["internal_force_resultant"]
+                / max(evaluated_steps, 1)
+            ).item()
+        ),
+        "mean_contact_force_resultant": float(
+            (
+                accum["contact_force_resultant"]
+                / max(evaluated_steps, 1)
+            ).item()
+        ),
+        "mean_total_conservative_force_resultant": float(
+            (
+                accum["total_conservative_force_resultant"]
+                / max(evaluated_steps, 1)
+            ).item()
+        ),
         "mean_work_energy_error": float((accum["energy"] / max(evaluated_steps, 1)).item()),
         "integration_backtrack_fraction": float(
             (accum["backtrack"] / max(attempted_steps, 1)).item()
@@ -3710,6 +4352,45 @@ def validate_chp_checkpoint_semantics(
             f"{source}; found={mismatched}, expected={expected}. "
             "Start a fresh run instead of reinterpreting a legacy residual head."
         )
+    model_cfg = checkpoint.get("config", {}).get("model", {})
+    integration_contract = {
+        "contact_iterations": 2,
+        "integration_substeps": 1,
+        "contact_predictor_stop_gradient": True,
+        "contact_force_average": "trapezoidal",
+    }
+    contract_mismatch = {
+        key: model_cfg.get(key)
+        for key, value in integration_contract.items()
+        if model_cfg.get(key) != value
+    }
+    if contract_mismatch:
+        raise ValueError(
+            "checkpoint integration contract is missing or incompatible: "
+            f"{source}; found={contract_mismatch}, expected={integration_contract}"
+        )
+    dynamics_enabled = bool(
+        checkpoint.get("config", {})
+        .get("dynamics_pretraining", {})
+        .get("enabled", True)
+    )
+    if dynamics_enabled and checkpoint.get("dynamics_pretraining_phase") != "complete":
+        raise ValueError(
+            "checkpoint dynamics pretraining phase is incomplete: "
+            f"{source}; phase={checkpoint.get('dynamics_pretraining_phase')!r}"
+        )
+    gate = checkpoint.get("dynamics_pretraining_phase_gate", {})
+    if dynamics_enabled and (
+        gate.get("status") != "passed"
+        or gate.get("gate_role") != _FINAL_DYNAMICS_GATE_ROLE
+        or bool(gate.get("residual_enabled", True))
+    ):
+        raise ValueError(
+            "checkpoint final residual-disabled dynamics gate did not pass: "
+            f"{source}; gate_status={gate.get('status')!r}, "
+            f"gate_role={gate.get('gate_role')!r}, "
+            f"residual_enabled={gate.get('residual_enabled')!r}"
+        )
     if require_scientific_gate:
         source_path = Path(source)
         if source_path != Path("checkpoint"):
@@ -3797,11 +4478,52 @@ def _checkpoint_payload(
     scientific_gate_status: str,
     rng_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if int(model.dynamics_semantics_version) != CHPGNS.dynamics_schema_version:
+        raise ValueError(
+            "schema-8 model instances cannot be serialized as schema-9 checkpoints"
+        )
+    dynamics_enabled = bool(get_cfg(cfg, "dynamics_pretraining.enabled", True))
+    phase = str(
+        getattr(
+            model,
+            "dynamics_pretraining_phase",
+            "missing" if dynamics_enabled else "not_required",
+        )
+    )
+    phase_gate = dict(
+        getattr(
+            model,
+            "dynamics_pretraining_phase_gate",
+            {"status": "missing" if dynamics_enabled else "not_required"},
+        )
+    )
+    if dynamics_enabled and (
+        phase != "complete"
+        or phase_gate.get("status") != "passed"
+        or phase_gate.get("gate_role") != _FINAL_DYNAMICS_GATE_ROLE
+        or bool(phase_gate.get("residual_enabled", True))
+    ):
+        raise ValueError(
+            "rollout checkpoint requires completed dynamics pretraining and a "
+            "passed final residual-disabled physics gate"
+        )
+    transition_gate = dict(
+        getattr(
+            model,
+            "dynamics_pretraining_transition_gate",
+            {"status": "missing" if dynamics_enabled else "not_required"},
+        )
+    )
     return {
+        "artifact_type": "chp_rollout_checkpoint",
         "schema_version": CHPGNS.checkpoint_schema_version,
-        "dynamics_schema_version": CHPGNS.dynamics_schema_version,
+        "dynamics_schema_version": int(model.dynamics_semantics_version),
         "residual_parameterization": CHPGNS.residual_parameterization,
         "residual_gate": CHPGNS.residual_gate,
+        "dynamics_pretraining_phase": phase,
+        "dynamics_pretraining_phase_gate": phase_gate,
+        "dynamics_pretraining_transition_gate": transition_gate,
+        "dynamics_pretraining_final_gate": phase_gate,
         "architecture": "CHP-GNS",
         "problem_type": str(get_cfg(cfg, "training.problem_type", "dynamic")),
         "time_semantics": str(get_cfg(cfg, "data.time_semantics", "dynamic")),
@@ -3860,7 +4582,7 @@ def _save_constitutive_gate_artifact(
         "schema_version": 1,
         "artifact_type": "constitutive_teacher_gate",
         "architecture": "CHP-GNS",
-        "dynamics_schema_version": CHPGNS.dynamics_schema_version,
+        "dynamics_schema_version": int(model.dynamics_semantics_version),
         "teacher_stress_relative_rmse": selected,
         "teacher_stress_source": str(
             pretraining.get("selected_teacher_stress_source", "unavailable")
@@ -3973,6 +4695,8 @@ def _assert_no_gate_failure_artifact(
     root = Path(directory)
     markers = (
         root / "teacher_stress_gate_failure.json",
+        root / "dynamics_physics_gate_failure.json",
+        root / "dynamics_final_physics_gate_failure.json",
         root / "rollout_pilot_gate_failure.json",
     )
     failed = [marker for marker in markers if marker.is_file()]
@@ -4166,6 +4890,30 @@ def _torch_load(path: str | Path, map_location: Any) -> Any:
         return torch.load(path, map_location=map_location)
 
 
+def _checkpoint_values_equal(left: Any, right: Any) -> bool:
+    """Compare nested checkpoint metadata without device-dependent tensor rules."""
+
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+            return False
+        return bool(torch.equal(left.detach().cpu(), right.detach().cpu()))
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        return set(left) == set(right) and all(
+            _checkpoint_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        if not isinstance(left, (list, tuple)) or not isinstance(
+            right, (list, tuple)
+        ):
+            return False
+        return len(left) == len(right) and all(
+            _checkpoint_values_equal(a, b) for a, b in zip(left, right)
+        )
+    return bool(left == right)
+
+
 def _load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -4181,3 +4929,11 @@ def _save_json(path: Path, value: Any) -> None:
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, allow_nan=False)
     temporary.replace(path)
+
+
+def _atomic_torch_save(value: Any, path: str | Path) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save(value, temporary)
+    temporary.replace(destination)

@@ -44,7 +44,10 @@ model:
   fiber_order: 0
   inversion_stiffness: 10.0
   minimum_j: 0.0
-  contact_substeps: 2
+  contact_iterations: 2
+  integration_substeps: 1
+  contact_predictor_stop_gradient: true
+  contact_force_average: trapezoidal
   contact_tangential_ratio_cap: 1.0
   # Train-only acceleration statistics: free-node P99 ~=1.9e-4.  The bounded
   # correction may cover the P99.9 tail but cannot bypass the constitutive law.
@@ -60,7 +63,7 @@ model:
   # positive scales initialize the constitutive stress and effective inertia in
   # a numerically useful range and remain part of the trained physical model.
   initial_stress_scale: 1.0e4
-  initial_mass_scale: 1.0e16
+  initial_mass_scale: 1.0e15
   initial_contact_scale: 1.0e-5
   initial_damping_scale: 0.1
 
@@ -68,7 +71,7 @@ contact:
   enabled: true
   radius: 0.03
   max_neighbors: 32
-  refresh_each_substep: true
+  refresh_each_iteration: true
 
 loss:
   position: 1.0
@@ -96,7 +99,7 @@ constitutive_pretraining:
   calibration_leverage_quantile: 0.99
   minimum_scale_factor: 1.0e-3
   maximum_scale_factor: 1.0e4
-  preserve_force_mass_ratio: true
+  preserve_force_mass_ratio: false
   # Refit the one identifiable global modulus on train-only frames after each
   # shape update instead of letting Adam trade physical scale against asinh.
   closed_form_scale_each_epoch: true
@@ -108,14 +111,20 @@ constitutive_pretraining:
 
 dynamics_pretraining:
   enabled: true
-  epochs: 3
-  head_warmup_epochs: 1
+  phases:
+    - {name: physics_only, epochs: 4}
+    - {name: residual_warmup, epochs: 1}
+    - {name: joint, epochs: 2}
   trajectories_per_epoch: 500
   validation_cases: 10
   validation_frames: 8
-  lr: 1.0e-4
-  head_warmup_lr: 1.0e-3
-  joint_head_lr: 5.0e-4
+  physical_graph_lr: 1.0e-4
+  pair_head_lr: 5.0e-4
+  force_scale_lr: 5.0e-4
+  inertia_lr: 1.0e-3
+  constitutive_lr: 1.0e-5
+  residual_warmup_lr: 1.0e-3
+  residual_joint_lr: 5.0e-4
   weight_decay: 1.0e-6
   grad_clip_norm: 1.0
   position_weight: 0.25
@@ -126,7 +135,13 @@ dynamics_pretraining:
   active_node_fraction: 0.2
   active_threshold: 0.05
   stress_weight: 0.1
-  residual_weight: 1.0e-3
+  stress_gate_mse_weight: 0.0
+  exact_stress_weight: 0.1
+  residual_weight: 0.01
+  phase_gate:
+    active_acceleration_relative_rmse: 0.95
+    active_acceleration_cosine: 0.05
+    teacher_stress_relative_rmse: 0.50
 
 training:
   device: cuda
