@@ -315,6 +315,16 @@ def fit_chp_normalizers(
             )
         )
         free_nodes = np.flatnonzero(moving)
+        stress_node_count = min(node_count, free_nodes.size)
+        stress_nodes = (
+            free_nodes[
+                np.linspace(0, free_nodes.size - 1, stress_node_count)
+                .round()
+                .astype(int)
+            ]
+            if stress_node_count
+            else nodes
+        )
         acceleration_node_count = min(node_count, free_nodes.size)
         acceleration_nodes = (
             free_nodes[
@@ -353,7 +363,9 @@ def fit_chp_normalizers(
             if case.stress_dim:
                 stress_samples.append(
                     torch.from_numpy(
-                        np.array(case.stress[frame + 1, nodes, :1], copy=True)
+                        np.array(
+                            case.stress[frame + 1, stress_nodes, :1], copy=True
+                        )
                     ).float()
                 )
             if has_cell_stress:

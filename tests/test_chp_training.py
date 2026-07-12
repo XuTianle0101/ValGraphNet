@@ -572,6 +572,37 @@ def test_normalizers_are_finite_invertible_and_do_not_clip_stress():
     assert stress_frame_scores(case).shape == (5,)
 
 
+def test_stress_normalizer_uses_the_same_free_node_supervision_mask():
+    steps = 3
+    nodes = 4
+    stress = np.ones((steps, nodes, 1), dtype=np.float32)
+    stress[:, :2, 0] = np.asarray([2.0, 4.0], dtype=np.float32)
+    stress[:, 2:, 0] = 1.0e9
+    velocity = np.zeros((steps, nodes, 3), dtype=np.float32)
+    velocity[1:, :2, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
+    case = SimpleNamespace(
+        num_steps=steps,
+        num_nodes=nodes,
+        stress_dim=1,
+        times=np.arange(steps, dtype=np.float32),
+        displacement=np.zeros_like(velocity),
+        velocity=velocity,
+        stress=stress,
+        fixed_mask=np.asarray([False, False, True, False]),
+        prescribed_mask=np.asarray([False, False, False, True]),
+    )
+
+    normalizers = fit_chp_normalizers(
+        [case], max_cases=1, frames_per_case=2, nodes_per_frame=4
+    )
+
+    # The two supervised nodes contain only {2, 4}; constrained/prescribed
+    # billion-scale labels must not set the robust stress reference.
+    torch.testing.assert_close(
+        normalizers.stress.reference_scale, torch.tensor([2.0])
+    )
+
+
 def test_acceleration_normalizer_uses_free_nodes_and_nonunit_dt():
     velocity = np.zeros((3, 3, 3), dtype=np.float32)
     velocity[1, 0] = np.asarray([2.0, 4.0, 6.0])
