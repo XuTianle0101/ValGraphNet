@@ -168,6 +168,10 @@ class ValveGraphDataset(Dataset):
         target = np.concatenate([target_delta_u, target_delta_v, target_accel, target_stress], axis=1)
 
         data = Data(edge_index=torch.as_tensor(edge_index, dtype=torch.long), num_nodes=case.num_nodes)
+        data.pos = torch.as_tensor(current_pos, dtype=torch.float32)
+        data.reference_pos = torch.from_numpy(
+            np.array(case.nodes, dtype=np.float32, copy=True)
+        )
         data.node_features = torch.as_tensor(node_features, dtype=torch.float32)
         data.mesh_edge_features = torch.as_tensor(mesh_edge_features, dtype=torch.float32)
         data.world_edge_features = torch.as_tensor(world_edge_features, dtype=torch.float32)

@@ -1,0 +1,90 @@
+# Two-level PhysicsNeMo BiStrideMeshGraphNet comparison on the complete
+# deforming_plate benchmark.  Training and rollout inference are CUDA/BF16-only.
+seed: 42
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+  pressure_sign: 1.0
+  # Same native-style state perturbation and target correction as fair MGN.
+  noise_std: 0.003
+
+model:
+  family: two_level_bistride_mgn
+  processor_size: 15
+  hidden_dim_processor: 128
+  hidden_dim_node_encoder: 128
+  hidden_dim_edge_encoder: 128
+  hidden_dim_node_decoder: 128
+  node_encoder_layers: 2
+  edge_encoder_layers: 2
+  node_layers: 2
+  edge_layers: 2
+  decoder_layers: 2
+  aggregation: sum
+  activation: relu
+  do_concat_trick: false
+  # Exactly two static topology coarsenings; contact edges remain fine-only.
+  num_mesh_levels: 2
+  num_layers_bistride: 2
+  bistride_unet_levels: 1
+  num_processor_checkpoint_segments: 3
+  # PhysicsNeMo activation recomputation only supports SiLU.  Keep ReLU to
+  # match fair MGN; segmented processor checkpointing remains enabled.
+  recompute_activation: false
+
+contact:
+  enabled: true
+  radius: 0.03
+  max_neighbors: 32
+  max_edges: 200000
+  different_leaflets_only: false
+
+loss:
+  position: 1.0
+  stress: 1.0
+  huber_delta: 1.0
+  peak_fraction: 0.1
+  peak_weight: 0.5
+
+training:
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+  epochs: 30
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  fused_optimizer: true
+  steps_per_trajectory_per_epoch: 1
+  normalizer_graphs: 128
+  normalizer_cases: 128
+  normalizer_frames: 8
+  normalizer_nodes: 256
+  stress_normalizer_values: 1000000
+  gpu_case_cache_size: 3
+  gpu_hierarchy_cache_size: 3
+  output_dir: outputs/deforming_plate_multiscale_mgn_full400_seed42
+  resume_from: auto
+  save_every: 1
+
+validation:
+  every: 3
+  cases: 20
+  steps: 399
+  divergence_position: 10.0
+  # Development selection is fixed to the same val20/even/400 protocol used by
+  # native, fair MGN, ValGraphNet, and CHP-GNS.  Test is never read here.
+  require_native_reference: true
+  require_native_reference_provenance: true
+  native_reference_split: val
+  native_reference_case_selection: even
+  native_reference_file: outputs/deforming_plate_chp_evidence/native_val20/metrics.json
+
+evaluation:
+  steps: 399
+  divergence_position: 10.0

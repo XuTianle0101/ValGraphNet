@@ -119,6 +119,12 @@ class GpuGraphBuilder:
             dim=1,
         )
         data = Data(edge_index=edge_index, num_nodes=case.num_nodes)
+        # Keep physical coordinates outside the standardized node feature
+        # tensor.  Multi-scale processors use current coordinates for their
+        # geometric edge fibres and the reference coordinates for a static
+        # hierarchy; ordinary MGN models simply ignore both attributes.
+        data.pos = current_pos
+        data.reference_pos = t["nodes"]
         data.node_features = node_features
         data.mesh_edge_features = mesh_features
         data.world_edge_features = world_features
