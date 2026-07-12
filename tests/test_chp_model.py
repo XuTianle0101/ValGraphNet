@@ -74,6 +74,20 @@ def _cfg():
     }
 
 
+def test_chp_threads_matched_flat_processor_switch():
+    hierarchical_cfg = _cfg()
+    flat_cfg = _cfg()
+    flat_cfg["model"]["use_topology_hierarchy"] = False
+    hierarchical = CHPGNS(hierarchical_cfg)
+    flat = CHPGNS(flat_cfg)
+
+    assert hierarchical.processor.use_topology_hierarchy is True
+    assert flat.processor.use_topology_hierarchy is False
+    assert sum(parameter.numel() for parameter in flat.parameters()) == sum(
+        parameter.numel() for parameter in hierarchical.parameters()
+    )
+
+
 def test_reference_state_remains_static_and_has_zero_stress():
     static = build_chp_static(_case(), "cpu")
     model = CHPGNS(_cfg()).eval()

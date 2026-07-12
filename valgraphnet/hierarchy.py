@@ -140,7 +140,12 @@ class ScalarVectorBlock(nn.Module):
 
 
 class HierarchicalScalarVectorProcessor(nn.Module):
-    """Two fine and four coarse blocks followed by two fine refinement blocks."""
+    """Matched eight-block scalar/vector processor with optional hierarchy.
+
+    The flat ablation retains every message and fusion parameter.  It changes
+    only the graph schedule: all eight blocks operate on the fine mesh and no
+    restriction, prolongation, assignment, or coarse edge is read.
+    """
 
     def __init__(
         self,
@@ -148,9 +153,11 @@ class HierarchicalScalarVectorProcessor(nn.Module):
         vector_dim: int = 16,
         *,
         activation_checkpointing: bool = False,
+        use_topology_hierarchy: bool = True,
     ) -> None:
         super().__init__()
         self.activation_checkpointing = bool(activation_checkpointing)
+        self.use_topology_hierarchy = bool(use_topology_hierarchy)
         self.fine_in = nn.ModuleList(
             [ScalarVectorBlock(scalar_dim, vector_dim) for _ in range(2)]
         )
@@ -207,11 +214,39 @@ class HierarchicalScalarVectorProcessor(nn.Module):
         position: torch.Tensor,
         hierarchy: TopologyHierarchy,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        edges = [edge.to(scalar.device) for edge in hierarchy.edge_indices]
-        assignments = [value.to(scalar.device) for value in hierarchy.assignments]
+        fine_edges = hierarchy.edge_indices[0].to(scalar.device)
         scalar, vector = self._blocks(
-            self.fine_in, scalar, vector, edges[0], position
+            self.fine_in, scalar, vector, fine_edges, position
         )
+
+        if not self.use_topology_hierarchy:
+            # Preserve the hierarchical branch's skip/fusion topology and all
+            # trainable parameters, but schedule both nominally coarse block
+            # pairs on the original nodes and fine mesh edges.
+            scalar_fine = scalar
+            vector_fine = vector
+            scalar_one, vector_one = self._blocks(
+                self.coarse_one, scalar, vector, fine_edges, position
+            )
+            scalar_two, vector_two = self._blocks(
+                self.coarse_two, scalar_one, vector_one, fine_edges, position
+            )
+            scalar_one = self.coarse_one_fuse(
+                torch.cat([scalar_one, scalar_two], dim=1)
+            )
+            vector_one = vector_one + vector_two
+            scalar = self.fine_fuse(
+                torch.cat([scalar_fine, scalar_one], dim=1)
+            )
+            vector = vector_fine + vector_one
+            return self._blocks(
+                self.fine_out, scalar, vector, fine_edges, position
+            )
+
+        edges = [fine_edges] + [
+            edge.to(scalar.device) for edge in hierarchy.edge_indices[1:]
+        ]
+        assignments = [value.to(scalar.device) for value in hierarchy.assignments]
 
         scalar_one = pool_mean(scalar, assignments[0], hierarchy.node_counts[1])
         vector_one = pool_mean(vector, assignments[0], hierarchy.node_counts[1])
@@ -236,7 +271,7 @@ class HierarchicalScalarVectorProcessor(nn.Module):
         )
         vector = vector + unpool(vector_one, assignments[0])
         scalar, vector = self._blocks(
-            self.fine_out, scalar, vector, edges[0], position
+            self.fine_out, scalar, vector, fine_edges, position
         )
         return scalar, vector
 

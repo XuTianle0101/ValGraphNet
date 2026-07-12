@@ -134,6 +134,10 @@ def _validate_variant_override(variant_id: str, spec: Mapping[str, Any]) -> None
             "training.output_dir",
         },
         "work_energy": {"loss.work_energy", "training.output_dir"},
+        "hierarchy": {
+            "model.use_topology_hierarchy",
+            "training.output_dir",
+        },
     }.get(axis)
     if allowed is None:
         raise AblationProtocolError(
@@ -162,6 +166,12 @@ def _validate_variant_override(variant_id: str, spec: Mapping[str, Any]) -> None
         get_cfg(dict(overrides), "loss.work_energy", float("nan"))
     ) != 0.0:
         raise AblationProtocolError("no-work ablation must set loss.work_energy=0")
+    if axis == "hierarchy" and get_cfg(
+        dict(overrides), "model.use_topology_hierarchy", None
+    ) is not False:
+        raise AblationProtocolError(
+            "flat hierarchy ablation must set model.use_topology_hierarchy=false"
+        )
 
 
 def validate_ablation_matrix(

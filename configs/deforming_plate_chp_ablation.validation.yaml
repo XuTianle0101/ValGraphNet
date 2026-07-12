@@ -82,9 +82,13 @@ variants:
 
   flat_processor:
     axis: hierarchy
-    status: blocked
-    missing_capability: flat_scalar_vector_processor_switch
-    blocked_reason: CHPGNS currently constructs HierarchicalScalarVectorProcessor unconditionally and exposes no matched flat processor.
+    status: runnable
+    description: Matched eight-block scalar-vector processor using only fine mesh edges, with the same latent widths, fusion layers, and parameter budget.
+    overrides:
+      model:
+        use_topology_hierarchy: false
+      training:
+        output_dir: outputs/deforming_plate_chp_ablation/flat_processor_seed42
 
   unconstrained_contact:
     axis: contact_conservation

@@ -29,6 +29,7 @@ def test_default_matrix_is_honest_about_supported_ablation_axes(tmp_path):
     plan = materialize_ablation_plan(DEFAULT_MATRIX, tmp_path / "resolved")
     assert set(value["variant_id"] for value in plan["runnable"].values()) == {
         "chp_full",
+        "flat_processor",
         "one_step",
         "no_work_energy",
     }
@@ -39,7 +40,6 @@ def test_default_matrix_is_honest_about_supported_ablation_axes(tmp_path):
     )
     assert set(plan["incomplete_required_comparisons"]) == {
         "direct_decoder_vs_potential",
-        "flat_vs_hierarchy",
         "unconstrained_vs_action_reaction_contact",
     }
 
@@ -53,11 +53,21 @@ def test_materialized_variants_are_single_factor_and_validation_only(tmp_path):
     full = by_variant["chp_full"]
     one_step = by_variant["one_step"]
     no_work = by_variant["no_work_energy"]
+    flat = by_variant["flat_processor"]
 
     assert one_step["training"]["curriculum"] == [{"horizon": 1, "epochs": 16}]
     assert one_step["training"]["checkpoint_min_horizon"] == 1
     assert no_work["loss"]["work_energy"] == 0.0
     assert full["loss"]["work_energy"] == 0.1
+    assert full["model"].get("use_topology_hierarchy", True) is True
+    assert flat["model"]["use_topology_hierarchy"] is False
+    matched_full = deepcopy(full)
+    matched_flat = deepcopy(flat)
+    matched_full["model"]["use_topology_hierarchy"] = False
+    matched_full["training"]["output_dir"] = matched_flat["training"]["output_dir"]
+    matched_full.pop("ablation")
+    matched_flat.pop("ablation")
+    assert matched_flat == matched_full
     for cfg in by_variant.values():
         assert cfg["training"]["device"] == "cuda"
         assert cfg["training"]["amp_dtype"] == "bfloat16"
@@ -90,6 +100,7 @@ def test_blocked_or_unknown_variant_cannot_be_scheduled(tmp_path):
         "schema_version": 1,
         "checkpoints": {
             "chp_full": {"42": "missing.pt"},
+            "flat_processor": {"42": "missing.pt"},
             "one_step": {"42": "missing.pt"},
             "no_work_energy": {"42": "missing.pt"},
         }
@@ -110,6 +121,7 @@ def test_dry_run_emits_only_fixed_validation_commands(tmp_path):
         "schema_version": 1,
         "checkpoints": {
             "chp_full": {"42": "full.pt"},
+            "flat_processor": {"42": "flat.pt"},
             "one_step": {"42": "one.pt"},
             "no_work_energy": {"42": "energy.pt"},
         }
@@ -120,7 +132,7 @@ def test_dry_run_emits_only_fixed_validation_commands(tmp_path):
         tmp_path / "evaluation",
         dry_run=True,
     )
-    assert len(result["records"]) == 3
+    assert len(result["records"]) == 4
     for record in result["records"]:
         command = record["command"]
         split_index = command.index("--split") + 1

@@ -482,6 +482,9 @@ class CHPGNS(nn.Module):
             activation_checkpointing=bool(
                 model_cfg.get("activation_checkpointing", True)
             ),
+            use_topology_hierarchy=bool(
+                model_cfg.get("use_topology_hierarchy", True)
+            ),
         )
         cell_input_dim = self.scalar_dim + 6 + self.material_dim
         self.cell_encoder = nn.Sequential(
