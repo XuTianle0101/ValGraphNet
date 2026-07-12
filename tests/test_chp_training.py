@@ -17,6 +17,7 @@ from valgraphnet.chp_train import (
     acceleration_frame_scores,
     curriculum_horizon,
     fit_chp_normalizers,
+    geometry_safe_state_noise,
     integration_consistent_targets,
     minimax_checkpoint_score,
     pooled_positive_constitutive_scale,
@@ -24,6 +25,7 @@ from valgraphnet.chp_train import (
     load_native_reference,
     run_constitutive_pretraining,
     select_rollout_start,
+    stable_clip_grad_norm_,
     stress_frame_scores,
     train_constitutive_epoch,
     validate_chp_checkpoint_semantics,
@@ -67,6 +69,76 @@ def test_noise_corrected_targets_match_public_full_step_convention():
         target_velocity,
         torch.tensor([[0.017, 0.002, -0.001]]),
     )
+
+
+def test_stable_gradient_clip_preserves_finite_extreme_direction():
+    first = torch.nn.Parameter(torch.zeros(2))
+    second = torch.nn.Parameter(torch.zeros(1))
+    first.grad = torch.tensor([1.6e33, -1.0e33])
+    second.grad = torch.tensor([5.0e32])
+
+    original_direction = torch.cat([first.grad, second.grad]).double()
+    total_norm = stable_clip_grad_norm_([first, second], 1.0)
+    clipped = torch.cat([first.grad, second.grad]).double()
+
+    assert torch.isfinite(total_norm)
+    assert total_norm > 1.0e33
+    assert torch.isfinite(clipped).all()
+    assert torch.count_nonzero(clipped) == clipped.numel()
+    torch.testing.assert_close(
+        clipped / torch.linalg.vector_norm(clipped),
+        original_direction / torch.linalg.vector_norm(original_direction),
+        atol=1.0e-7,
+        rtol=1.0e-6,
+    )
+    assert torch.linalg.vector_norm(clipped) == pytest.approx(1.0, rel=1.0e-6)
+
+
+def test_stable_gradient_clip_distinguishes_nonfinite_values():
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    parameter.grad = torch.tensor([float("inf")])
+
+    with pytest.raises(FloatingPointError, match=r"parameter indices \[0\]"):
+        stable_clip_grad_norm_([parameter], 1.0)
+    assert torch.isinf(parameter.grad).all()
+
+
+def test_geometry_noise_uses_base_growth_without_legacy_relaxation(monkeypatch):
+    position = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    cells = torch.tensor([[0, 1, 2, 3]])
+    deformation = torch.diag(torch.tensor([4.0, 0.5, 0.5]))
+    target = position @ deformation.T
+    raw_noise = target - position
+    static = SimpleNamespace(
+        fixed_mask=torch.zeros(4, dtype=torch.bool),
+        prescribed_mask=torch.zeros(4, dtype=torch.bool),
+        mesh_edge_index=torch.empty((2, 0), dtype=torch.long),
+        cells=cells,
+        dm_inv=torch.eye(3)[None],
+    )
+    monkeypatch.setattr(torch, "randn_like", lambda _value: raw_noise.clone())
+
+    accepted_noise, scale = geometry_safe_state_noise(
+        static,
+        position,
+        float(raw_noise.square().mean().sqrt()),
+        smoothing_steps=0,
+        minimum_j=0.2,
+        max_backtracks=8,
+        maximum_invariant_growth=2.0,
+        maximum_i1_bar=10000.0,
+        maximum_i2_bar=100000.0,
+    )
+
+    assert 0.0 < scale < 1.0
+    accepted = position + accepted_noise
+    accepted_state = chp_train_module.invariants(
+        chp_train_module.deformation_gradient(accepted, cells, static.dm_inv)
+    )
+    assert accepted_state.i1_bar.max() <= 6.0 + 1.0e-5
+    assert accepted_state.i2_bar.max() <= 6.0 + 1.0e-5
 
 
 def test_noise_corrected_targets_match_two_symplectic_substeps():

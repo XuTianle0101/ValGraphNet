@@ -31,6 +31,38 @@ def _unit_tetra(dtype=torch.float64, device="cpu"):
     return nodes, cells
 
 
+def test_i2_cofactor_form_avoids_anisotropic_fp32_cancellation():
+    determinant = 5.0e-4
+    stretch_1 = math.exp(6.0)
+    stretch_2 = math.exp(-3.0)
+    stretch_3 = determinant / (stretch_1 * stretch_2)
+    deformation = torch.diag(
+        torch.tensor([stretch_1, stretch_2, stretch_3], dtype=torch.float32)
+    )[None].requires_grad_(True)
+
+    state = invariants(deformation)
+    cofactor = torch.stack(
+        (
+            torch.linalg.cross(deformation[..., :, 1], deformation[..., :, 2]),
+            torch.linalg.cross(deformation[..., :, 2], deformation[..., :, 0]),
+            torch.linalg.cross(deformation[..., :, 0], deformation[..., :, 1]),
+        ),
+        dim=-1,
+    )
+    expected_i2 = cofactor.square().sum(dim=(-2, -1))
+    cancellation_form = 0.5 * (
+        state.i1.square()
+        - (state.c * state.c.transpose(-1, -2)).sum(dim=(-2, -1))
+    )
+
+    torch.testing.assert_close(state.i2, expected_i2)
+    assert cancellation_form.item() < 0.01 * expected_i2.item()
+    assert state.i2_bar.item() > 1.0e7
+    state.i2_bar.sum().backward()
+    assert deformation.grad is not None
+    assert torch.isfinite(deformation.grad).all()
+
+
 def _rotation_z(angle, dtype=torch.float64, device="cpu"):
     cosine = math.cos(angle)
     sine = math.sin(angle)

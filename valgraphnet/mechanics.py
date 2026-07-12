@@ -263,8 +263,13 @@ def _invariants_impl(
     work_f = deformation.to(dtype=_work_dtype(deformation))
     c = work_f.transpose(-1, -2) @ work_f
     i1 = torch.diagonal(c, dim1=-2, dim2=-1).sum(dim=-1)
-    trace_c2 = (c * c.transpose(-1, -2)).sum(dim=(-2, -1))
-    i2 = 0.5 * (i1.square() - trace_c2)
+    # For C = F.T @ F, I2(C) is exactly the squared Frobenius norm of
+    # cof(F).  This form avoids the catastrophic cancellation in
+    # ``0.5 * (I1**2 - tr(C**2))`` for highly anisotropic yet finite cells.
+    # The cross-product construction remains analytic and fully
+    # differentiable, while also preserving the non-negative invariant in
+    # FP32 much farther into the admissibility envelope.
+    i2 = _cofactor(work_f).square().sum(dim=(-2, -1))
     j = torch.linalg.det(work_f)
     minimum = float(eps) if eps is not None else 10.0 * torch.finfo(work_f.dtype).eps
     j_safe = j.clamp_min(minimum)

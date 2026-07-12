@@ -106,6 +106,72 @@ class CHPNormalizers:
         )
 
 
+def stable_clip_grad_norm_(
+    parameters: Iterable[torch.nn.Parameter], max_norm: float
+) -> torch.Tensor:
+    """Clip finite gradients without overflowing the norm reduction.
+
+    ``torch.nn.utils.clip_grad_norm_`` may report an infinite FP32 norm even
+    when every gradient entry is finite.  Compute a dimensionless norm after
+    scaling by the largest entry, accumulate the small list of per-tensor norms
+    in FP64, and only then restore the physical magnitude.  Actual NaN/Inf
+    entries are rejected before any in-place scaling, so numerical corruption
+    is not confused with a merely large finite update.
+    """
+
+    limit = float(max_norm)
+    if not math.isfinite(limit) or limit < 0.0:
+        raise ValueError("max_norm must be finite and non-negative")
+    parameter_list = list(parameters)
+    gradients: list[torch.Tensor] = []
+    gradient_indices: list[int] = []
+    for index, parameter in enumerate(parameter_list):
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        if gradient.is_sparse:
+            raise TypeError("stable_clip_grad_norm_ does not support sparse gradients")
+        if gradient.numel():
+            gradients.append(gradient)
+            gradient_indices.append(index)
+    if not gradients:
+        device = parameter_list[0].device if parameter_list else torch.device("cpu")
+        return torch.zeros((), device=device, dtype=torch.float64)
+
+    finite_flags = torch.stack(
+        [torch.isfinite(gradient).all() for gradient in gradients]
+    )
+    if not bool(finite_flags.all().item()):
+        failed = [
+            gradient_indices[index]
+            for index, finite in enumerate(finite_flags.detach().cpu().tolist())
+            if not finite
+        ]
+        raise FloatingPointError(
+            f"non-finite gradient values in parameter indices {failed}"
+        )
+    largest = torch.stack(
+        [gradient.detach().abs().max() for gradient in gradients]
+    ).max()
+    safe_largest = largest.clamp_min(torch.finfo(largest.dtype).tiny)
+    scaled_norms = torch.stack(
+        [
+            torch.linalg.vector_norm(gradient.detach() / safe_largest)
+            for gradient in gradients
+        ]
+    ).double()
+    total_norm = largest.double() * torch.linalg.vector_norm(scaled_norms)
+    denominator = total_norm.clamp_min(torch.finfo(torch.float64).tiny)
+    coefficient = torch.clamp(
+        total_norm.new_tensor(limit) / denominator,
+        max=1.0,
+    )
+    with torch.no_grad():
+        for gradient in gradients:
+            gradient.mul_(coefficient.to(device=gradient.device, dtype=gradient.dtype))
+    return total_norm
+
+
 @dataclass
 class CHPDeviceCase:
     """One complete trajectory and its mechanics tensors resident on CUDA."""
@@ -497,6 +563,8 @@ def geometry_safe_state_noise(
     minimum_j: float = 0.2,
     max_backtracks: int = 8,
     maximum_invariant_growth: float = 2.0,
+    maximum_i1_bar: float | None = None,
+    maximum_i2_bar: float | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Project 0.003 GPU noise onto the orientation-preserving state domain."""
 
@@ -514,30 +582,56 @@ def geometry_safe_state_noise(
         noise = noise * moving[:, None]
     rms = noise[moving].square().mean().sqrt().clamp_min(1.0e-12)
     noise = noise * (float(standard_deviation) / rms)
-    base_state = invariants(
-        deformation_gradient(position, static.cells, static.dm_inv)
+    if float(maximum_invariant_growth) < 1.0:
+        raise ValueError("maximum_invariant_growth must be at least one")
+    base_deformation = deformation_gradient(position, static.cells, static.dm_inv)
+    base_state = invariants(base_deformation)
+    base_is_finite = (
+        torch.isfinite(base_deformation).all()
+        & torch.isfinite(base_state.c).all()
+        & torch.isfinite(base_state.i1).all()
+        & torch.isfinite(base_state.i1_bar).all()
+        & torch.isfinite(base_state.i2).all()
+        & torch.isfinite(base_state.i2_bar).all()
+        & torch.isfinite(base_state.j).all()
     )
+    if not bool(base_is_finite.item()):
+        raise FloatingPointError("cannot add noise to a non-finite tetrahedral state")
     base_j = base_state.j.min()
     admissible_j = min(
         float(minimum_j),
         max(0.5 * float(base_j.item()), 1.0e-4),
     )
-    admissible_i1 = max(
-        float(base_state.i1_bar.max().item()) * float(maximum_invariant_growth),
-        100.0,
+    admissible_i1 = float(base_state.i1_bar.max().item()) * float(
+        maximum_invariant_growth
     )
-    admissible_i2 = max(
-        float(base_state.i2_bar.max().item()) * float(maximum_invariant_growth),
-        1_000.0,
+    admissible_i2 = float(base_state.i2_bar.max().item()) * float(
+        maximum_invariant_growth
     )
+    if maximum_i1_bar is not None:
+        if float(maximum_i1_bar) <= 0.0 or math.isnan(float(maximum_i1_bar)):
+            raise ValueError("maximum_i1_bar must be positive or None")
+        admissible_i1 = min(admissible_i1, float(maximum_i1_bar))
+    if maximum_i2_bar is not None:
+        if float(maximum_i2_bar) <= 0.0 or math.isnan(float(maximum_i2_bar)):
+            raise ValueError("maximum_i2_bar must be positive or None")
+        admissible_i2 = min(admissible_i2, float(maximum_i2_bar))
     scale = 1.0
     for _ in range(max(int(max_backtracks), 0) + 1):
         candidate = position + scale * noise
-        candidate_state = invariants(
-            deformation_gradient(candidate, static.cells, static.dm_inv)
+        candidate_deformation = deformation_gradient(
+            candidate, static.cells, static.dm_inv
         )
+        candidate_state = invariants(candidate_deformation)
         admissible = (
-            (candidate_state.j.min() >= admissible_j)
+            torch.isfinite(candidate_deformation).all()
+            & torch.isfinite(candidate_state.c).all()
+            & torch.isfinite(candidate_state.i1).all()
+            & torch.isfinite(candidate_state.i1_bar).all()
+            & torch.isfinite(candidate_state.i2).all()
+            & torch.isfinite(candidate_state.i2_bar).all()
+            & torch.isfinite(candidate_state.j).all()
+            & (candidate_state.j.min() >= admissible_j)
             & (candidate_state.i1_bar.max() <= admissible_i1)
             & (candidate_state.i2_bar.max() <= admissible_i2)
         )
@@ -555,17 +649,25 @@ def training_state_admissibility(
 ) -> tuple[bool, float, float]:
     """Return potential-domain validity and the limiting invariants."""
 
-    state = invariants(
-        deformation_gradient(position, static.cells, static.dm_inv)
-    )
+    deformation = deformation_gradient(position, static.cells, static.dm_inv)
+    state = invariants(deformation)
     minimum_j = float(get_cfg(cfg, "training.minimum_start_j", 1.0e-2))
+    maximum_i1 = float(
+        get_cfg(cfg, "training.maximum_start_i1_bar", float("inf"))
+    )
     maximum_i2 = float(get_cfg(cfg, "training.maximum_start_i2_bar", 1.0e5))
     minimum_observed_j = state.j.min()
     maximum_observed_i2 = state.i2_bar.max()
     valid = (
-        torch.isfinite(state.j).all()
+        torch.isfinite(deformation).all()
+        & torch.isfinite(state.c).all()
+        & torch.isfinite(state.j).all()
+        & torch.isfinite(state.i1).all()
+        & torch.isfinite(state.i1_bar).all()
+        & torch.isfinite(state.i2).all()
         & torch.isfinite(state.i2_bar).all()
         & (minimum_observed_j >= minimum_j)
+        & (state.i1_bar.max() <= maximum_i1)
         & (maximum_observed_i2 <= maximum_i2)
     )
     return (
@@ -1582,12 +1684,15 @@ def train_constitutive_epoch(
         if not losses:
             continue
         torch.stack(losses).mean().backward()
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            parameters,
-            float(get_cfg(cfg, "constitutive_pretraining.grad_clip_norm", 10.0)),
-        )
-        if not bool(torch.isfinite(gradient_norm).item()):
-            raise FloatingPointError("non-finite constitutive pretraining gradient")
+        try:
+            stable_clip_grad_norm_(
+                parameters,
+                float(get_cfg(cfg, "constitutive_pretraining.grad_clip_norm", 10.0)),
+            )
+        except FloatingPointError as exc:
+            raise FloatingPointError(
+                "non-finite constitutive pretraining gradient"
+            ) from exc
         optimizer.step()
     averaged = {key: value / max(used_frames, 1) for key, value in totals.items()}
     averaged.update(
@@ -2162,19 +2267,12 @@ def train_exact_dynamics_epoch(
             nonfinite_losses += 1
             continue
         loss.backward()
-        finite_gradient = all(
-            parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
-            for parameter in parameters
-        )
-        if not finite_gradient:
-            nonfinite_gradients += 1
-            optimizer.zero_grad(set_to_none=True)
-            continue
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            parameters,
-            float(get_cfg(cfg, "dynamics_pretraining.grad_clip_norm", 1.0)),
-        )
-        if not bool(torch.isfinite(gradient_norm).item()):
+        try:
+            stable_clip_grad_norm_(
+                parameters,
+                float(get_cfg(cfg, "dynamics_pretraining.grad_clip_norm", 1.0)),
+            )
+        except FloatingPointError:
             nonfinite_gradients += 1
             optimizer.zero_grad(set_to_none=True)
             continue
@@ -2726,6 +2824,20 @@ def train_chp_epoch(
             maximum_invariant_growth=float(
                 get_cfg(cfg, "training.noise_maximum_invariant_growth", 2.0)
             ),
+            maximum_i1_bar=float(
+                get_cfg(
+                    cfg,
+                    "training.noise_maximum_i1_bar",
+                    get_cfg(cfg, "training.maximum_start_i1_bar", float("inf")),
+                )
+            ),
+            maximum_i2_bar=float(
+                get_cfg(
+                    cfg,
+                    "training.noise_maximum_i2_bar",
+                    get_cfg(cfg, "training.maximum_start_i2_bar", 1.0e5),
+                )
+            ),
         )
         position = position + noise
         totals["noise_scale"] = totals.get("noise_scale", 0.0) + noise_scale * horizon
@@ -2837,13 +2949,15 @@ def train_chp_epoch(
             scaler.unscale_(optimizer)
         clip = get_cfg(cfg, "training.grad_clip_norm", 1.0)
         if clip is not None:
-            gradient_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), float(clip)
-            )
-            if not bool(torch.isfinite(gradient_norm).item()):
-                raise FloatingPointError(
-                    f"non-finite CHP gradient for {case.case_id} at frame {start}"
+            try:
+                stable_clip_grad_norm_(
+                    model.parameters(), float(clip)
                 )
+            except FloatingPointError as exc:
+                raise FloatingPointError(
+                    f"non-finite CHP gradient values for {case.case_id} "
+                    f"at frame {start}"
+                ) from exc
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()

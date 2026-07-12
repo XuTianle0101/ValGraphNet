@@ -526,6 +526,9 @@ class CHPGNS(nn.Module):
         self.integration_minimum_j = float(
             model_cfg.get("integration_minimum_j", 1.0e-4)
         )
+        self.integration_maximum_i1_bar = float(
+            model_cfg.get("integration_maximum_i1_bar", float("inf"))
+        )
         self.integration_maximum_i2_bar = float(
             model_cfg.get("integration_maximum_i2_bar", 1.0e6)
         )
@@ -1013,6 +1016,7 @@ class CHPGNS(nn.Module):
                 static.cells,
                 static.dm_inv,
                 minimum_j=self.integration_minimum_j,
+                maximum_i1_bar=self.integration_maximum_i1_bar,
                 maximum_i2_bar=self.integration_maximum_i2_bar,
             )
             integration_domain_penalty = torch.maximum(
@@ -1026,6 +1030,7 @@ class CHPGNS(nn.Module):
                 fixed_mask=static.fixed_mask,
                 prescribed_mask=active_prescribed_mask,
                 minimum_j=self.integration_minimum_j,
+                maximum_i1_bar=self.integration_maximum_i1_bar,
                 maximum_i2_bar=self.integration_maximum_i2_bar,
                 max_backtracks=self.integration_backtracks,
             )
@@ -1185,11 +1190,13 @@ def tetrahedral_domain_penalty(
     dm_inv: torch.Tensor,
     *,
     minimum_j: float = 1.0e-4,
+    maximum_i1_bar: float = float("inf"),
     maximum_i2_bar: float = 1.0e6,
 ) -> torch.Tensor:
     """Differentiable penalty on a raw proposal before safety projection."""
 
-    state = invariants(deformation_gradient(position, cells, dm_inv))
+    deformation = deformation_gradient(position, cells, dm_inv)
+    state = invariants(deformation)
     proposal_j = torch.nan_to_num(
         state.j,
         nan=-1.0e3,
@@ -1197,21 +1204,43 @@ def tetrahedral_domain_penalty(
         neginf=-1.0e3,
     )
     j_violation = F.relu(float(minimum_j) - proposal_j)
-    overflow = float(maximum_i2_bar) * math.exp(10.0)
-    proposal_i2 = torch.nan_to_num(
-        state.i2_bar,
-        nan=overflow,
-        posinf=overflow,
-        neginf=overflow,
-    ).clamp_min(1.0e-12)
-    i2_violation = F.relu(
-        torch.log(proposal_i2 / max(float(maximum_i2_bar), 1.0e-12))
+    finite_cell = (
+        torch.isfinite(deformation).all(dim=(-2, -1))
+        & torch.isfinite(state.c).all(dim=(-2, -1))
+        & torch.isfinite(state.i1)
+        & torch.isfinite(state.i1_bar)
+        & torch.isfinite(state.i2)
+        & torch.isfinite(state.i2_bar)
+        & torch.isfinite(state.j)
     )
+    nonfinite_violation = (~finite_cell).to(proposal_j.dtype)
+
+    def upper_penalty(value: torch.Tensor, maximum: float, name: str) -> torch.Tensor:
+        maximum = float(maximum)
+        if math.isnan(maximum) or maximum <= 0.0:
+            raise ValueError(f"{name} must be positive or infinity")
+        if math.isinf(maximum):
+            return value.new_zeros(())
+        overflow = min(
+            maximum * math.exp(10.0),
+            torch.finfo(value.dtype).max / 4.0,
+        )
+        proposal = torch.nan_to_num(
+            value,
+            nan=overflow,
+            posinf=overflow,
+            neginf=overflow,
+        ).clamp_min(1.0e-12)
+        violation = F.relu(torch.log(proposal / maximum))
+        return violation.square().mean() + violation.square().max()
+
     return (
         j_violation.square().mean()
         + j_violation.square().max()
-        + i2_violation.square().mean()
-        + i2_violation.square().max()
+        + upper_penalty(state.i1_bar, maximum_i1_bar, "maximum_i1_bar")
+        + upper_penalty(state.i2_bar, maximum_i2_bar, "maximum_i2_bar")
+        + nonfinite_violation.mean()
+        + nonfinite_violation.max()
     )
 
 
@@ -1224,6 +1253,7 @@ def backtrack_tetrahedral_update(
     fixed_mask: torch.Tensor | None = None,
     prescribed_mask: torch.Tensor | None = None,
     minimum_j: float = 1.0e-4,
+    maximum_i1_bar: float = float("inf"),
     maximum_i2_bar: float = 1.0e6,
     max_backtracks: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1258,11 +1288,19 @@ def backtrack_tetrahedral_update(
         candidate = torch.where(
             free[None, :, None], candidate, proposed_position.detach()[None]
         )
-        state = invariants(deformation_gradient(candidate, cells, dm_inv))
+        candidate_deformation = deformation_gradient(candidate, cells, dm_inv)
+        state = invariants(candidate_deformation)
         valid = (
-            torch.isfinite(state.j).all(dim=1)
+            torch.isfinite(candidate).all(dim=(-2, -1))
+            & torch.isfinite(candidate_deformation).all(dim=(1, 2, 3))
+            & torch.isfinite(state.c).all(dim=(1, 2, 3))
+            & torch.isfinite(state.j).all(dim=1)
+            & torch.isfinite(state.i1).all(dim=1)
+            & torch.isfinite(state.i1_bar).all(dim=1)
+            & torch.isfinite(state.i2).all(dim=1)
             & torch.isfinite(state.i2_bar).all(dim=1)
             & (state.j.amin(dim=1) >= float(minimum_j))
+            & (state.i1_bar.amax(dim=1) <= float(maximum_i1_bar))
             & (state.i2_bar.amax(dim=1) <= float(maximum_i2_bar))
         )
         has_valid = valid.any()

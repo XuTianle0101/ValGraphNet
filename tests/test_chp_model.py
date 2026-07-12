@@ -16,7 +16,7 @@ from valgraphnet.chp_model import (
 )
 from valgraphnet.config import load_config
 from valgraphnet.data.case import ValveCase
-from valgraphnet.mechanics import deformation_gradient
+from valgraphnet.mechanics import deformation_gradient, invariants
 
 
 def _case() -> ValveCase:
@@ -148,6 +148,10 @@ def test_neural_feature_experiment_config_is_isolated_and_scale_aware():
     ]
     assert cfg["training"]["device"] == "cuda"
     assert cfg["training"]["amp_dtype"] == "bfloat16"
+    assert model_cfg["integration_minimum_j"] == 0.01
+    assert model_cfg["integration_maximum_i1_bar"] == 1.0e4
+    assert model_cfg["integration_maximum_i2_bar"] == 1.0e5
+    assert cfg["training"]["maximum_start_i1_bar"] == 1.0e4
     assert cfg["training"]["output_dir"].endswith(
         "deforming_plate_chp_neural_feature_energy_full400_seed42"
     )
@@ -528,6 +532,50 @@ def test_raw_tetrahedral_proposal_barrier_has_finite_gradient():
     assert proposed.grad is not None
     assert torch.isfinite(proposed.grad).all()
     assert proposed.grad.abs().sum() > 0.0
+
+
+def test_tetrahedral_domain_rejects_finite_high_i1_state():
+    case = _case()
+    current = torch.from_numpy(case.nodes.copy())
+    stretch = 200.0
+    deformation = torch.diag(
+        torch.tensor([stretch, stretch**-0.5, stretch**-0.5])
+    )
+    proposed = (current @ deformation.T).requires_grad_(True)
+    cells = torch.from_numpy(case.cells)
+    dm_inv = torch.from_numpy(case.dm_inv)
+    proposed_state = invariants(deformation_gradient(proposed, cells, dm_inv))
+    assert proposed_state.j.item() == pytest.approx(1.0, rel=1.0e-5)
+    assert proposed_state.i1_bar.item() > 1.0e4
+    assert proposed_state.i2_bar.item() < 1.0e6
+
+    penalty = tetrahedral_domain_penalty(
+        proposed,
+        cells,
+        dm_inv,
+        minimum_j=1.0e-4,
+        maximum_i1_bar=1.0e4,
+        maximum_i2_bar=1.0e6,
+    )
+    penalty.backward()
+    assert penalty > 0.0
+    assert proposed.grad is not None
+    assert torch.isfinite(proposed.grad).all()
+
+    accepted, scale, valid = backtrack_tetrahedral_update(
+        current,
+        proposed.detach(),
+        cells,
+        dm_inv,
+        minimum_j=1.0e-4,
+        maximum_i1_bar=1.0e4,
+        maximum_i2_bar=1.0e6,
+    )
+    assert valid
+    assert 0.0 < float(scale) < 1.0
+    accepted_state = invariants(deformation_gradient(accepted, cells, dm_inv))
+    assert torch.isfinite(accepted_state.i1_bar).all()
+    assert accepted_state.i1_bar.max() <= 1.0e4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

@@ -42,8 +42,9 @@ model:
   residual_acceleration_cap: 3.0e-3
   residual_activity_scale: 1.0e-2
   residual_activity_diffusion_steps: 2
-  integration_minimum_j: 1.0e-4
-  integration_maximum_i2_bar: 1.0e6
+  integration_minimum_j: 0.01
+  integration_maximum_i1_bar: 10000.0
+  integration_maximum_i2_bar: 100000.0
   integration_backtracks: 8
   activation_checkpointing: true
   initial_stress_scale: 1.0e4
@@ -128,8 +129,11 @@ training:
   noise_min_j: 0.2
   noise_backtracks: 8
   noise_maximum_invariant_growth: 2.0
+  noise_maximum_i1_bar: 10000.0
+  noise_maximum_i2_bar: 100000.0
   minimum_start_j: 0.01
-  maximum_start_i2_bar: 1.0e5
+  maximum_start_i1_bar: 10000.0
+  maximum_start_i2_bar: 100000.0
   maximum_start_resamples: 16
   trajectories_per_epoch: 1000
   lr: 1.0e-4
