@@ -55,6 +55,29 @@ def test_noise_corrected_targets_match_public_full_step_convention():
     )
 
 
+def test_noise_corrected_targets_match_two_symplectic_substeps():
+    state = CHPState(
+        position=torch.zeros(1, 3),
+        velocity=torch.tensor([[0.1, 0.0, 0.0]]),
+    )
+    acceleration = torch.tensor([[2.0, -1.0, 0.5]])
+    dt = 0.5
+    exact_next = (
+        state.position
+        + dt * state.velocity
+        + 0.75 * dt**2 * acceleration
+    )
+
+    target_velocity, target_acceleration = integration_consistent_targets(
+        state, exact_next, dt, substeps=2
+    )
+
+    torch.testing.assert_close(target_acceleration, acceleration)
+    torch.testing.assert_close(
+        target_velocity, state.velocity + dt * acceleration
+    )
+
+
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():
     rng = np.random.default_rng(123)
     scores = np.arange(400, dtype=np.float32)

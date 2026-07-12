@@ -30,7 +30,11 @@ from valgraphnet.config import get_cfg
 from valgraphnet.data import ValveGraphDataset
 from valgraphnet.data.case import ValveCase
 from valgraphnet.mechanics import deformation_gradient, invariants
-from valgraphnet.physical_evaluation import validate_reference_protocol
+from valgraphnet.physical_evaluation import (
+    CELL_TENSOR_STRESS_SOURCE,
+    NODAL_STRESS_FALLBACK_SOURCE,
+    validate_reference_protocol,
+)
 from valgraphnet.stress_transform import AsinhStressTransform, robust_stress_loss
 
 
@@ -641,6 +645,7 @@ def chp_step_loss(
         input_state,
         exact_position,
         step_dt,
+        substeps=int(get_cfg(cfg, "model.contact_substeps", 2)),
     )
     moving = ~(static.fixed_mask | static.prescribed_mask)
     if not bool(moving.any().item()):
@@ -746,26 +751,67 @@ def integration_consistent_targets(
     input_state: CHPState,
     exact_next_position: torch.Tensor,
     dt: float | torch.Tensor,
+    *,
+    substeps: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply state-noise correction under the public full-step convention."""
+    """Infer constant acceleration under the configured symplectic substeps.
+
+    For ``S`` equal substeps and constant acceleration, symplectic Euler gives
+    ``dx = dt*v0 + dt^2*a*(S+1)/(2S)``.  This preserves noise correction while
+    keeping position, terminal velocity, and acceleration consistent with the
+    actual integrator used by :class:`CHPGNS`.
+    """
 
     step_dt = torch.as_tensor(
         dt,
         device=input_state.position.device,
         dtype=input_state.position.dtype,
     )
-    target_velocity = (exact_next_position - input_state.position) / step_dt
-    target_acceleration = (target_velocity - input_state.velocity) / step_dt
+    if int(substeps) < 1:
+        raise ValueError("substeps must be at least one")
+    integration_factor = (int(substeps) + 1.0) / (2.0 * int(substeps))
+    target_acceleration = (
+        exact_next_position
+        - input_state.position
+        - step_dt * input_state.velocity
+    ) / (integration_factor * step_dt.square())
+    target_velocity = input_state.velocity + step_dt * target_acceleration
     return target_velocity, target_acceleration
 
 
 def minimax_checkpoint_score(
-    metrics: dict[str, float],
-    native_reference: dict[str, float] | None,
+    metrics: dict[str, Any],
+    native_reference: dict[str, Any] | None,
 ) -> float:
     """Worst relative degradation; no metric can be traded for another."""
 
     references = native_reference or {}
+    metric_source = metrics.get("stress_metric_source")
+    reference_source = references.get("stress_metric_source")
+    allowed_sources = {
+        CELL_TENSOR_STRESS_SOURCE,
+        NODAL_STRESS_FALLBACK_SOURCE,
+    }
+    if metric_source is not None and metric_source not in allowed_sources:
+        raise ValueError(f"unsupported rollout stress metric source: {metric_source!r}")
+    if reference_source is not None and reference_source not in allowed_sources:
+        raise ValueError(
+            f"unsupported native stress metric source: {reference_source!r}"
+        )
+    if reference_source is not None and metric_source != reference_source:
+        raise ValueError(
+            "checkpoint and native reference use different stress metrics: "
+            f"checkpoint={metric_source!r}, native={reference_source!r}"
+        )
+    if (
+        native_reference is not None
+        and metric_source == CELL_TENSOR_STRESS_SOURCE
+        and reference_source is None
+    ):
+        raise ValueError(
+            "cell-tensor checkpoint selection requires a source-compatible "
+            "native reference; use absolute_validation or regenerate the reference"
+        )
     ratios = []
     for key in ROLLOUT_METRIC_KEYS:
         value = float(metrics[key])
@@ -776,7 +822,7 @@ def minimax_checkpoint_score(
     return max(ratios)
 
 
-def load_native_reference(cfg: dict[str, Any]) -> dict[str, float] | None:
+def load_native_reference(cfg: dict[str, Any]) -> dict[str, Any] | None:
     inline = get_cfg(cfg, "validation.native_reference", None)
     path = get_cfg(cfg, "validation.native_reference_file", None)
     reference_mode = str(
@@ -830,7 +876,15 @@ def load_native_reference(cfg: dict[str, Any]) -> dict[str, float] | None:
     missing = [key for key in ROLLOUT_METRIC_KEYS if key not in inline]
     if missing:
         raise ValueError(f"native checkpoint reference is missing: {missing}")
-    return {key: float(inline[key]) for key in ROLLOUT_METRIC_KEYS}
+    result: dict[str, Any] = {
+        key: float(inline[key]) for key in ROLLOUT_METRIC_KEYS
+    }
+    source = inline.get("stress_metric_source")
+    if source is None and isinstance(source_payload.get("metric_definition"), dict):
+        source = source_payload["metric_definition"].get("stress_source")
+    if source is not None:
+        result["stress_metric_source"] = str(source)
+    return result
 
 
 def _constitutive_parameters(model: CHPGNS) -> list[torch.nn.Parameter]:
@@ -1368,7 +1422,10 @@ def exact_dynamics_loss(
     exact_position = static.reference_position + trajectory.displacement[next_step]
     dt = trajectory.times[next_step] - trajectory.times[next_step - 1]
     target_velocity, target_acceleration = integration_consistent_targets(
-        input_state, exact_position, dt
+        input_state,
+        exact_position,
+        dt,
+        substeps=int(get_cfg(cfg, "model.contact_substeps", 2)),
     )
     moving = ~(static.fixed_mask | static.prescribed_mask)
     if not bool(moving.any().item()):
@@ -1598,7 +1655,10 @@ def evaluate_teacher_forced_dynamics(
                 + trajectory.displacement[frame + 1]
             )
             target_velocity, target_acceleration = integration_consistent_targets(
-                state, exact_next, dt
+                state,
+                exact_next,
+                dt,
+                substeps=int(get_cfg(cfg, "model.contact_substeps", 2)),
             )
             prediction = output.acceleration[moving].double()
             target = target_acceleration[moving].double()
@@ -2459,7 +2519,7 @@ def evaluate_chp_rollouts(
     cfg: dict[str, Any],
     *,
     amp_dtype: torch.dtype = torch.bfloat16,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Evaluate fixed, true autoregressive validation trajectories on CUDA."""
 
     model.eval()
@@ -2498,12 +2558,18 @@ def evaluate_chp_rollouts(
     evaluated_steps = 0
     attempted_steps = 0
     tensor_evaluated_steps = 0
+    tensor_label_cases = 0
+    nodal_label_cases = 0
     diverged = 0
     divergence_limit = float(get_cfg(cfg, "validation.divergence_position", 10.0))
     for case_index_value in tqdm(case_indices, desc="rollout-val", leave=False):
         case_index = int(case_index_value)
         case = cases[case_index]
         trajectory = cache.get(case_index)
+        if _trajectory_has_cell_stress_tensor(trajectory):
+            tensor_label_cases += 1
+        else:
+            nodal_label_cases += 1
         state = CHPState(
             trajectory.static.reference_position + trajectory.displacement[0],
             trajectory.velocity[0],
@@ -2666,6 +2732,68 @@ def evaluate_chp_rollouts(
         ].double().square().sum()
         diverged += int(case_diverged)
     eps = torch.tensor(1.0e-12, device=device)
+    nodal_stress_relative = float(
+        torch.sqrt(
+            accum["stress_error"] / accum["stress_reference"].clamp_min(eps)
+        ).item()
+    )
+    nodal_stress_p95_relative = float(
+        torch.sqrt(
+            accum["p95_error"] / accum["p95_reference"].clamp_min(eps)
+        ).item()
+    )
+    cell_tensor_relative = (
+        float(
+            torch.sqrt(
+                accum["cell_tensor_error"]
+                / accum["cell_tensor_reference"].clamp_min(eps)
+            ).item()
+        )
+        if tensor_evaluated_steps
+        else float("inf")
+    )
+    cell_tensor_p95_relative = (
+        float(
+            torch.sqrt(
+                accum["cell_tensor_p95_error"]
+                / accum["cell_tensor_p95_reference"].clamp_min(eps)
+            ).item()
+        )
+        if tensor_evaluated_steps
+        else float("inf")
+    )
+    cell_vm_relative = (
+        float(
+            torch.sqrt(
+                accum["cell_vm_error"]
+                / accum["cell_vm_reference"].clamp_min(eps)
+            ).item()
+        )
+        if tensor_evaluated_steps
+        else float("inf")
+    )
+    cell_vm_p95_relative = (
+        float(
+            torch.sqrt(
+                accum["cell_vm_p95_error"]
+                / accum["cell_vm_p95_reference"].clamp_min(eps)
+            ).item()
+        )
+        if tensor_evaluated_steps
+        else float("inf")
+    )
+    if tensor_label_cases and nodal_label_cases:
+        raise ValueError(
+            "validation subset mixes full cell-tensor and nodal-only stress labels"
+        )
+    if tensor_label_cases:
+        stress_source = CELL_TENSOR_STRESS_SOURCE
+        primary_stress_relative = cell_tensor_relative
+        primary_stress_p95_relative = cell_vm_p95_relative
+    else:
+        stress_source = NODAL_STRESS_FALLBACK_SOURCE
+        primary_stress_relative = nodal_stress_relative
+        primary_stress_p95_relative = nodal_stress_p95_relative
     result = {
         "moving_displacement_relative_rmse": float(
             torch.sqrt(accum["u_error"] / accum["u_reference"].clamp_min(eps)).item()
@@ -2675,58 +2803,20 @@ def evaluate_chp_rollouts(
                 accum["final_error"] / accum["final_reference"].clamp_min(eps)
             ).item()
         ),
-        "stress_relative_rmse": float(
-            torch.sqrt(
-                accum["stress_error"] / accum["stress_reference"].clamp_min(eps)
-            ).item()
-        ),
-        "stress_p95_relative_rmse": float(
-            torch.sqrt(
-                accum["p95_error"] / accum["p95_reference"].clamp_min(eps)
-            ).item()
-        ),
-        "cell_stress_tensor_relative_rmse": (
-            float(
-                torch.sqrt(
-                    accum["cell_tensor_error"]
-                    / accum["cell_tensor_reference"].clamp_min(eps)
-                ).item()
-            )
-            if tensor_evaluated_steps
-            else float("inf")
-        ),
-        "cell_stress_tensor_p95_relative_rmse": (
-            float(
-                torch.sqrt(
-                    accum["cell_tensor_p95_error"]
-                    / accum["cell_tensor_p95_reference"].clamp_min(eps)
-                ).item()
-            )
-            if tensor_evaluated_steps
-            else float("inf")
-        ),
-        "cell_stress_vm_relative_rmse": (
-            float(
-                torch.sqrt(
-                    accum["cell_vm_error"]
-                    / accum["cell_vm_reference"].clamp_min(eps)
-                ).item()
-            )
-            if tensor_evaluated_steps
-            else float("inf")
-        ),
-        "cell_stress_vm_p95_relative_rmse": (
-            float(
-                torch.sqrt(
-                    accum["cell_vm_p95_error"]
-                    / accum["cell_vm_p95_reference"].clamp_min(eps)
-                ).item()
-            )
-            if tensor_evaluated_steps
-            else float("inf")
-        ),
+        "stress_relative_rmse": primary_stress_relative,
+        "stress_p95_relative_rmse": primary_stress_p95_relative,
+        "stress_metric_source": stress_source,
+        "nodal_stress_relative_rmse": nodal_stress_relative,
+        "nodal_stress_p95_relative_rmse": nodal_stress_p95_relative,
+        "cell_stress_tensor_relative_rmse": cell_tensor_relative,
+        "cell_stress_tensor_p95_relative_rmse": cell_tensor_p95_relative,
+        "cell_stress_vm_relative_rmse": cell_vm_relative,
+        "cell_stress_vm_p95_relative_rmse": cell_vm_p95_relative,
         "cell_stress_tensor_coverage": float(
             tensor_evaluated_steps / max(evaluated_steps, 1)
+        ),
+        "cell_stress_tensor_case_coverage": float(
+            tensor_label_cases / max(tensor_label_cases + nodal_label_cases, 1)
         ),
         "diverged_cases": float(diverged),
         "mean_penetration": float((accum["penetration"] / max(evaluated_steps, 1)).item()),
