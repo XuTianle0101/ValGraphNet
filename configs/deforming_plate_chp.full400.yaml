@@ -26,10 +26,11 @@ model:
   potential_j_init: [1.0, 0.1]
   potential_log_j_init: 1.0
   potential_minimum_coefficient: 1.0e-12
-  # Train-only invariant standard deviations are approximately
-  # [0.0134, 0.0174, 0.0145].  The convex ridge extension adds coupled,
-  # objective constitutive capacity while retaining explicit dPsi/dF.
-  potential_ridge_terms: 32
+  # Stage-one falsification pilot: establish the analytic base potential with
+  # robust alternating scale calibration before enabling any ridge capacity.
+  # The former 32-term ridge let one near-singular train frame own 99.96% of
+  # calibration leverage, so it cannot be used as the controlled baseline.
+  potential_ridge_terms: 0
   potential_ridge_init: 1.0e-3
   potential_ridge_input_scales: [0.015, 0.018, 0.015]
   potential_ridge_beta: 2.0
@@ -153,7 +154,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/deforming_plate_chp_gate_aligned_full400_seed42
+  output_dir: outputs/deforming_plate_chp_base_robust_full400_seed42
   resume_from: auto
 
 validation:
