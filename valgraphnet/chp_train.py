@@ -300,25 +300,27 @@ def fit_chp_normalizers(
                 .round()
                 .astype(int)
             )
-        moving = ~(
-            np.asarray(
-                getattr(case, "fixed_mask", np.zeros(case.num_nodes, dtype=bool)),
-                dtype=bool,
-            )
-            | np.asarray(
-                getattr(
-                    case,
-                    "prescribed_mask",
-                    np.zeros(case.num_nodes, dtype=bool),
-                ),
-                dtype=bool,
-            )
+        fixed = np.asarray(
+            getattr(case, "fixed_mask", np.zeros(case.num_nodes, dtype=bool)),
+            dtype=bool,
         )
+        prescribed = np.asarray(
+            getattr(
+                case,
+                "prescribed_mask",
+                np.zeros(case.num_nodes, dtype=bool),
+            ),
+            dtype=bool,
+        )
+        moving = ~(fixed | prescribed)
         free_nodes = np.flatnonzero(moving)
-        stress_node_count = min(node_count, free_nodes.size)
+        supervised_stress_nodes = np.flatnonzero(~prescribed)
+        stress_node_count = min(node_count, supervised_stress_nodes.size)
         stress_nodes = (
-            free_nodes[
-                np.linspace(0, free_nodes.size - 1, stress_node_count)
+            supervised_stress_nodes[
+                np.linspace(
+                    0, supervised_stress_nodes.size - 1, stress_node_count
+                )
                 .round()
                 .astype(int)
             ]

@@ -591,12 +591,12 @@ def test_normalizers_are_finite_invertible_and_do_not_clip_stress():
     assert stress_frame_scores(case).shape == (5,)
 
 
-def test_stress_normalizer_uses_the_same_free_node_supervision_mask():
+def test_stress_normalizer_uses_the_same_non_prescribed_supervision_mask():
     steps = 3
     nodes = 4
     stress = np.ones((steps, nodes, 1), dtype=np.float32)
-    stress[:, :2, 0] = np.asarray([2.0, 4.0], dtype=np.float32)
-    stress[:, 2:, 0] = 1.0e9
+    stress[:, :3, 0] = np.asarray([2.0, 4.0, 6.0], dtype=np.float32)
+    stress[:, 3, 0] = 1.0e9
     velocity = np.zeros((steps, nodes, 3), dtype=np.float32)
     velocity[1:, :2, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
     case = SimpleNamespace(
@@ -615,10 +615,11 @@ def test_stress_normalizer_uses_the_same_free_node_supervision_mask():
         [case], max_cases=1, frames_per_case=2, nodes_per_frame=4
     )
 
-    # The two supervised nodes contain only {2, 4}; constrained/prescribed
-    # billion-scale labels must not set the robust stress reference.
+    # The fixed node is supervised, while the prescribed billion-scale label
+    # must not set the robust stress reference.  The sampled values are two
+    # copies of {2, 4, 6}, whose lower median is 4.
     torch.testing.assert_close(
-        normalizers.stress.reference_scale, torch.tensor([2.0])
+        normalizers.stress.reference_scale, torch.tensor([4.0])
     )
 
 

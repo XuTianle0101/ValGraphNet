@@ -160,7 +160,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/deforming_plate_chp_base_robust_full400_seed42
+  output_dir: outputs/deforming_plate_chp_base_mask_aligned_full400_seed42
   resume_from: auto
 
 validation:
