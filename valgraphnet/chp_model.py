@@ -405,7 +405,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 6
+    dynamics_schema_version = 7
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -910,60 +910,10 @@ class CHPGNS(nn.Module):
             current_position = accepted_position
             current_velocity = accepted_velocity
 
-        # Contact substeps refine forces and the final velocity.  Reconstruct
-        # the public full-step state from that velocity so delta-x, delta-v,
-        # and acceleration obey one unambiguous semi-implicit convention:
-        # x[t+1] = x[t] + dt * v[t+1].
-        full_step_proposal = position + step_dt * current_velocity
-        full_step_proposal = torch.where(
-            static.fixed_mask[:, None], position, full_step_proposal
-        )
-        if active_prescribed_mask is not None and prescribed_position is not None:
-            full_step_proposal = torch.where(
-                active_prescribed_mask[:, None],
-                prescribed_position.float(),
-                full_step_proposal,
-            )
-        full_step_penalty = tetrahedral_domain_penalty(
-            full_step_proposal,
-            static.cells,
-            static.dm_inv,
-            minimum_j=self.integration_minimum_j,
-            maximum_i2_bar=self.integration_maximum_i2_bar,
-        )
-        integration_domain_penalty = torch.maximum(
-            integration_domain_penalty, full_step_penalty
-        )
-        final_position, final_scale, final_valid = backtrack_tetrahedral_update(
-            position,
-            full_step_proposal,
-            static.cells,
-            static.dm_inv,
-            fixed_mask=static.fixed_mask,
-            prescribed_mask=active_prescribed_mask,
-            minimum_j=self.integration_minimum_j,
-            maximum_i2_bar=self.integration_maximum_i2_bar,
-            max_backtracks=self.integration_backtracks,
-        )
-        minimum_update_scale = torch.minimum(minimum_update_scale, final_scale)
-        integration_valid = integration_valid & final_valid
-        final_velocity = torch.where(
-            free_mask[:, None],
-            (final_position - position) / step_dt,
-            current_velocity,
-        )
-        solver_kinetic = 0.5 * (
-            nodal_mass[:, None] * current_velocity.square()
-        ).sum()
-        final_kinetic = 0.5 * (
-            nodal_mass[:, None] * final_velocity.square()
-        ).sum()
-        projection_dissipation = projection_dissipation + (
-            solver_kinetic - final_kinetic
-        ).clamp_min(0.0)
-        current_position = final_position
-        current_velocity = final_velocity
-
+        # Each contact substep already applies symplectic Euler with dt/S.
+        # Keep the accumulated trajectory instead of reconstructing x[t+1]
+        # from only the final velocity, which would discard the first
+        # substep's position and no longer represent the force refresh path.
         acceleration = (current_velocity - velocity) / step_dt
         full_step_displacement = current_position - position
         external_work = (external_force * full_step_displacement).sum()

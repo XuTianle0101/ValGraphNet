@@ -156,24 +156,55 @@ def test_residual_acceleration_preserves_force_contract():
     assert torch.linalg.vector_norm(recovered, dim=1).max() <= 3.0e-3
 
 
-def test_full_step_exports_are_kinematically_consistent_with_two_substeps():
+def test_full_step_accumulates_two_semi_implicit_substeps():
     static = build_chp_static(_case(), "cpu")
     model = CHPGNS(_cfg()).eval()
-    translated = static.reference_position + torch.tensor([0.01, 0.0, 0.0])
-    velocity = torch.full_like(translated, 1.0e-3)
-    state = CHPState(translated, velocity)
-    output = model(static, state, dt=0.5)
+    torch.nn.init.zeros_(model.residual_channel.weight)
+    velocity = torch.zeros_like(static.reference_position)
+    state = CHPState(static.reference_position.clone(), velocity)
+    nodal_force = static.lumped_mass[:, None] * torch.tensor([2.0, 0.0, 0.0])
+    output = model(static, state, dt=0.5, external_force=nodal_force)
+
+    expected_velocity = torch.tensor([1.0, 0.0, 0.0]).expand_as(velocity)
+    # For two symplectic-Euler substeps under constant acceleration a and
+    # zero initial velocity: dx = (3/4) * dt^2 * a.
+    expected_displacement = torch.tensor([0.375, 0.0, 0.0]).expand_as(velocity)
     torch.testing.assert_close(
-        output.next_position - state.position,
-        0.5 * output.next_velocity,
+        output.next_position - state.position, expected_displacement,
         atol=1.0e-6,
         rtol=1.0e-6,
     )
     torch.testing.assert_close(
-        output.next_velocity - state.velocity,
-        0.5 * output.acceleration,
+        output.next_velocity, expected_velocity,
         atol=1.0e-6,
         rtol=1.0e-6,
+    )
+    torch.testing.assert_close(
+        output.acceleration,
+        torch.tensor([2.0, 0.0, 0.0]).expand_as(velocity),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+
+def test_full_step_overwrites_fixed_and_prescribed_nodes_exactly():
+    case = _case()
+    case.fixed_mask[0] = True
+    case.prescribed_mask[1] = True
+    static = build_chp_static(case, "cpu")
+    model = CHPGNS(_cfg()).eval()
+    state = CHPState(
+        static.reference_position.clone(), torch.zeros_like(static.reference_position)
+    )
+    target = static.reference_position.clone()
+    target[1, 0] += 0.02
+    output = model(static, state, dt=0.5, prescribed_position=target)
+
+    torch.testing.assert_close(output.next_position[0], state.position[0], rtol=0, atol=0)
+    torch.testing.assert_close(output.next_velocity[0], torch.zeros(3), rtol=0, atol=0)
+    torch.testing.assert_close(output.next_position[1], target[1], rtol=0, atol=0)
+    torch.testing.assert_close(
+        output.next_velocity[1], (target[1] - state.position[1]) / 0.5, rtol=0, atol=0
     )
 
 
