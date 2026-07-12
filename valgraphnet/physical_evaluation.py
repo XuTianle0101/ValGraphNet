@@ -19,7 +19,10 @@ PRIMARY_METRICS = (
     "stress_relative_rmse",
     "stress_p95_relative_rmse",
 )
-METRIC_SCHEMA_VERSION = 2
+CELL_TENSOR_STRESS_SOURCE = "cell_tensor_with_vm_p95"
+NODAL_STRESS_FALLBACK_SOURCE = "nodal_scalar_vm_fallback"
+METRIC_SCHEMA_VERSION = 3
+MIN_PROVENANCE_SCHEMA_VERSION = 2
 
 
 def select_case_ids(
@@ -56,6 +59,20 @@ class ErrorSums:
     p95_error: float = 0.0
     p95_reference: float = 0.0
     p95_count: int = 0
+    cell_tensor_error: float = 0.0
+    cell_tensor_reference: float = 0.0
+    cell_tensor_count: int = 0
+    cell_tensor_p95_error: float = 0.0
+    cell_tensor_p95_reference: float = 0.0
+    cell_tensor_p95_count: int = 0
+    cell_vm_error: float = 0.0
+    cell_vm_reference: float = 0.0
+    cell_vm_count: int = 0
+    cell_vm_p95_error: float = 0.0
+    cell_vm_p95_reference: float = 0.0
+    cell_vm_p95_count: int = 0
+    tensor_label_cases: int = 0
+    nodal_label_cases: int = 0
     diverged: int = 0
 
     def __add__(self, other: "ErrorSums") -> "ErrorSums":
@@ -66,8 +83,78 @@ class ErrorSums:
             }
         )
 
-    def metrics(self) -> dict[str, float]:
+    def metrics(self) -> dict[str, Any]:
         eps = 1.0e-30
+        nodal_relative = math.sqrt(
+            self.stress_error / max(self.stress_reference, eps)
+        )
+        nodal_rmse = math.sqrt(self.stress_error / max(self.stress_count, 1))
+        nodal_p95_relative = math.sqrt(
+            self.p95_error / max(self.p95_reference, eps)
+        )
+        nodal_p95_rmse = math.sqrt(self.p95_error / max(self.p95_count, 1))
+        tensor_relative = (
+            math.sqrt(
+                self.cell_tensor_error / max(self.cell_tensor_reference, eps)
+            )
+            if self.cell_tensor_count
+            else math.inf
+        )
+        tensor_rmse = (
+            math.sqrt(self.cell_tensor_error / self.cell_tensor_count)
+            if self.cell_tensor_count
+            else math.inf
+        )
+        tensor_p95_relative = (
+            math.sqrt(
+                self.cell_tensor_p95_error
+                / max(self.cell_tensor_p95_reference, eps)
+            )
+            if self.cell_tensor_p95_count
+            else math.inf
+        )
+        cell_vm_relative = (
+            math.sqrt(self.cell_vm_error / max(self.cell_vm_reference, eps))
+            if self.cell_vm_count
+            else math.inf
+        )
+        cell_vm_p95_relative = (
+            math.sqrt(
+                self.cell_vm_p95_error / max(self.cell_vm_p95_reference, eps)
+            )
+            if self.cell_vm_p95_count
+            else math.inf
+        )
+        cell_vm_p95_rmse = (
+            math.sqrt(self.cell_vm_p95_error / self.cell_vm_p95_count)
+            if self.cell_vm_p95_count
+            else math.inf
+        )
+        tensor_cases = int(self.tensor_label_cases)
+        nodal_cases = int(self.nodal_label_cases)
+        if tensor_cases and nodal_cases:
+            raise ValueError(
+                "evaluation mixes full cell-tensor and nodal-only stress labels"
+            )
+        if tensor_cases:
+            if not self.cell_tensor_count or not self.cell_vm_p95_count:
+                raise ValueError(
+                    "full cell-tensor labels require complete tensor and von-Mises metrics"
+                )
+            stress_source = CELL_TENSOR_STRESS_SOURCE
+            primary_rmse = tensor_rmse
+            primary_relative = tensor_relative
+            primary_p95_rmse = cell_vm_p95_rmse
+            primary_p95_relative = cell_vm_p95_relative
+        else:
+            # ``nodal_cases == 0`` preserves compatibility with in-memory legacy
+            # ErrorSums used by analysis/tests; newly evaluated artifacts always
+            # record the explicit fallback count.
+            stress_source = NODAL_STRESS_FALLBACK_SOURCE
+            primary_rmse = nodal_rmse
+            primary_relative = nodal_relative
+            primary_p95_rmse = nodal_p95_rmse
+            primary_p95_relative = nodal_p95_relative
         result = {
             "moving_displacement_rmse": math.sqrt(
                 self.u_error / max(self.u_count, 1)
@@ -81,15 +168,27 @@ class ErrorSums:
             "final_displacement_relative_rmse": math.sqrt(
                 self.final_error / max(self.final_reference, eps)
             ),
-            "stress_rmse": math.sqrt(self.stress_error / max(self.stress_count, 1)),
-            "stress_relative_rmse": math.sqrt(
-                self.stress_error / max(self.stress_reference, eps)
+            "stress_rmse": primary_rmse,
+            "stress_relative_rmse": primary_relative,
+            "stress_p95_rmse": primary_p95_rmse,
+            "stress_p95_relative_rmse": primary_p95_relative,
+            "stress_metric_source": stress_source,
+            "nodal_stress_relative_rmse": nodal_relative,
+            "nodal_stress_p95_relative_rmse": nodal_p95_relative,
+            "cell_stress_tensor_relative_rmse": (
+                tensor_relative if self.cell_tensor_count else None
             ),
-            "stress_p95_rmse": math.sqrt(
-                self.p95_error / max(self.p95_count, 1)
+            "cell_stress_tensor_p95_relative_rmse": (
+                tensor_p95_relative if self.cell_tensor_p95_count else None
             ),
-            "stress_p95_relative_rmse": math.sqrt(
-                self.p95_error / max(self.p95_reference, eps)
+            "cell_stress_vm_relative_rmse": (
+                cell_vm_relative if self.cell_vm_count else None
+            ),
+            "cell_stress_vm_p95_relative_rmse": (
+                cell_vm_p95_relative if self.cell_vm_p95_count else None
+            ),
+            "cell_stress_tensor_case_coverage": float(
+                tensor_cases / max(tensor_cases + nodal_cases, 1)
             ),
             "diverged_cases": float(self.diverged),
         }
@@ -103,8 +202,15 @@ def evaluate_prediction(
     case: ValveCase,
     displacement_prediction: np.ndarray,
     stress_prediction: np.ndarray,
-) -> tuple[ErrorSums, dict[str, float]]:
-    """Evaluate one trajectory with moving and non-prescribed masks."""
+    cell_stress_prediction: np.ndarray | None = None,
+) -> tuple[ErrorSums, dict[str, Any]]:
+    """Evaluate one trajectory with an explicit, label-driven stress protocol.
+
+    Complete ``[T,M,6]`` cell labels select signed full-tensor relative RMSE
+    and cell von-Mises P95 relative RMSE.  Nodal scalar stress is retained as
+    an auxiliary diagnostic.  Datasets without complete tensors explicitly
+    fall back to the legacy nodal scalar/von-Mises labels.
+    """
 
     predicted_u = np.asarray(displacement_prediction, dtype=np.float64)
     predicted_s = np.asarray(stress_prediction, dtype=np.float64)
@@ -149,6 +255,83 @@ def evaluate_prediction(
     else:
         peak = np.zeros_like(truth_s, dtype=bool)
 
+    has_cell_tensor = _case_has_full_cell_stress(case)
+    cell_tensor_error = 0.0
+    cell_tensor_reference = 0.0
+    cell_tensor_count = 0
+    cell_tensor_p95_error = 0.0
+    cell_tensor_p95_reference = 0.0
+    cell_tensor_p95_count = 0
+    cell_vm_error = 0.0
+    cell_vm_reference = 0.0
+    cell_vm_count = 0
+    cell_vm_p95_error = 0.0
+    cell_vm_p95_reference = 0.0
+    cell_vm_p95_count = 0
+    finite_cell = True
+    complete_cell_frames = True
+    if has_cell_tensor:
+        if cell_stress_prediction is None:
+            raise ValueError(
+                f"{case.case_id}: full cell-tensor labels require S_cell_pred.npy"
+            )
+        predicted_cell = _canonical_cell_tensor6(cell_stress_prediction)
+        truth_cell = np.asarray(case.cell_stress[1:steps], dtype=np.float64)
+        if predicted_cell.shape[0] == steps:
+            predicted_cell = predicted_cell[1:]
+        cell_steps = min(predicted_cell.shape[0], truth_cell.shape[0])
+        complete_cell_frames = cell_steps == truth_cell.shape[0]
+        predicted_cell = predicted_cell[:cell_steps]
+        truth_cell = truth_cell[:cell_steps]
+        expected_shape = truth_cell.shape
+        if predicted_cell.shape != expected_shape:
+            raise ValueError(
+                f"{case.case_id}: cell stress prediction must have shape "
+                f"[T-1,M,6] or [T-1,M,3,3]; expected {expected_shape}, "
+                f"got {predicted_cell.shape}"
+            )
+        finite_cell = bool(np.isfinite(predicted_cell).all())
+        if not finite_cell:
+            predicted_cell = np.nan_to_num(
+                predicted_cell,
+                nan=1.0e12,
+                posinf=1.0e12,
+                neginf=-1.0e12,
+            )
+        cell_residual = predicted_cell - truth_cell
+        target_vm = _tensor6_von_mises_numpy(truth_cell)
+        predicted_vm = _tensor6_von_mises_numpy(predicted_cell)
+        vm_residual = predicted_vm - target_vm
+        if target_vm.size:
+            cell_threshold = float(np.quantile(np.abs(target_vm), 0.95))
+            cell_peak = np.abs(target_vm) >= cell_threshold
+        else:
+            cell_peak = np.zeros_like(target_vm, dtype=bool)
+        cell_tensor_error = float(
+            np.sum(np.square(cell_residual), dtype=np.float64)
+        )
+        cell_tensor_reference = float(
+            np.sum(np.square(truth_cell), dtype=np.float64)
+        )
+        cell_tensor_count = int(cell_residual.size)
+        cell_tensor_p95_error = float(
+            np.sum(np.square(cell_residual[cell_peak]), dtype=np.float64)
+        )
+        cell_tensor_p95_reference = float(
+            np.sum(np.square(truth_cell[cell_peak]), dtype=np.float64)
+        )
+        cell_tensor_p95_count = int(cell_residual[cell_peak].size)
+        cell_vm_error = float(np.sum(np.square(vm_residual), dtype=np.float64))
+        cell_vm_reference = float(np.sum(np.square(target_vm), dtype=np.float64))
+        cell_vm_count = int(vm_residual.size)
+        cell_vm_p95_error = float(
+            np.sum(np.square(vm_residual[cell_peak]), dtype=np.float64)
+        )
+        cell_vm_p95_reference = float(
+            np.sum(np.square(target_vm[cell_peak]), dtype=np.float64)
+        )
+        cell_vm_p95_count = int(np.count_nonzero(cell_peak))
+
     sums = ErrorSums(
         u_error=float(np.sum(np.square(u_residual), dtype=np.float64)),
         u_reference=float(np.sum(np.square(truth_u[:, moving]), dtype=np.float64)),
@@ -162,12 +345,80 @@ def evaluate_prediction(
         p95_error=float(np.sum(np.square(stress_residual[peak]), dtype=np.float64)),
         p95_reference=float(np.sum(np.square(truth_s[peak]), dtype=np.float64)),
         p95_count=int(np.count_nonzero(peak)),
-        diverged=int(not finite_u or not finite_s or steps < case.num_steps),
+        cell_tensor_error=cell_tensor_error,
+        cell_tensor_reference=cell_tensor_reference,
+        cell_tensor_count=cell_tensor_count,
+        cell_tensor_p95_error=cell_tensor_p95_error,
+        cell_tensor_p95_reference=cell_tensor_p95_reference,
+        cell_tensor_p95_count=cell_tensor_p95_count,
+        cell_vm_error=cell_vm_error,
+        cell_vm_reference=cell_vm_reference,
+        cell_vm_count=cell_vm_count,
+        cell_vm_p95_error=cell_vm_p95_error,
+        cell_vm_p95_reference=cell_vm_p95_reference,
+        cell_vm_p95_count=cell_vm_p95_count,
+        tensor_label_cases=int(has_cell_tensor),
+        nodal_label_cases=int(not has_cell_tensor),
+        diverged=int(
+            not finite_u
+            or not finite_s
+            or not finite_cell
+            or not complete_cell_frames
+            or steps < case.num_steps
+        ),
     )
     metrics = sums.metrics()
     metrics["case_id"] = case.case_id
     metrics["evaluated_frames"] = float(steps)
     return sums, metrics
+
+
+def _case_has_full_cell_stress(case: ValveCase | Any) -> bool:
+    if not hasattr(case, "cell_stress"):
+        return False
+    raw = np.asarray(case.cell_stress)
+    if raw.ndim == 3 and raw.shape[1] == 0:
+        return False
+    expected_frames = int(getattr(case, "num_steps", raw.shape[0]))
+    if raw.ndim != 3 or raw.shape[0] != expected_frames or raw.shape[2] != 6:
+        raise ValueError(
+            f"{getattr(case, 'case_id', 'case')}: cell stress labels must have "
+            f"shape [T,M,6], got {raw.shape}"
+        )
+    return raw.shape[1] > 0
+
+
+def _canonical_cell_tensor6(value: np.ndarray) -> np.ndarray:
+    stress = np.asarray(value, dtype=np.float64)
+    if stress.ndim == 3 and stress.shape[-1] == 6:
+        return stress
+    if stress.ndim == 4 and stress.shape[-2:] == (3, 3):
+        return np.stack(
+            (
+                stress[..., 0, 0],
+                stress[..., 1, 1],
+                stress[..., 2, 2],
+                stress[..., 0, 1],
+                stress[..., 0, 2],
+                stress[..., 1, 2],
+            ),
+            axis=-1,
+        )
+    raise ValueError(
+        "cell stress prediction must have shape [T,M,6] or [T,M,3,3]"
+    )
+
+
+def _tensor6_von_mises_numpy(stress: np.ndarray) -> np.ndarray:
+    s11, s22, s33, s12, s13, s23 = np.moveaxis(stress, -1, 0)
+    return np.sqrt(
+        np.maximum(
+            0.5
+            * ((s11 - s22) ** 2 + (s22 - s33) ** 2 + (s33 - s11) ** 2)
+            + 3.0 * (s12**2 + s13**2 + s23**2),
+            0.0,
+        )
+    )
 
 
 def evaluate_prediction_directory(
@@ -187,7 +438,7 @@ def evaluate_prediction_directory(
     case_ids = read_split_file(split_file, split)
     case_ids = select_case_ids(case_ids, max_cases, case_selection)
     total = ErrorSums()
-    per_case: list[dict[str, float]] = []
+    per_case: list[dict[str, Any]] = []
     raw_sums: list[ErrorSums] = []
     missing: list[str] = []
     for case_id in case_ids:
@@ -196,10 +447,17 @@ def evaluate_prediction_directory(
             missing.append(case_id)
             continue
         case = load_case(case_root / case_id)
+        cell_prediction_path = artifact / "S_cell_pred.npy"
+        cell_prediction = (
+            np.load(cell_prediction_path, allow_pickle=False)
+            if cell_prediction_path.exists()
+            else None
+        )
         sums, metrics = evaluate_prediction(
             case,
             np.load(artifact / "U_pred.npy", allow_pickle=False),
             np.load(artifact / "S_pred.npy", allow_pickle=False),
+            cell_prediction,
         )
         total = total + sums
         raw_sums.append(sums)
@@ -218,7 +476,22 @@ def evaluate_prediction_directory(
         "metric_definition": {
             "displacement_mask": "~(fixed|prescribed)",
             "stress_mask": "~prescribed",
-            "p95_region": "per-trajectory truth top 5% stress values",
+            "stress_source": summary["stress_metric_source"],
+            "tensor_primary": (
+                "signed cell tensor component relative RMSE"
+                if summary["stress_metric_source"] == CELL_TENSOR_STRESS_SOURCE
+                else None
+            ),
+            "p95_region": (
+                "per-trajectory truth top 5% cell von-Mises values"
+                if summary["stress_metric_source"] == CELL_TENSOR_STRESS_SOURCE
+                else "per-trajectory truth top 5% nodal stress values"
+            ),
+            "p95_primary": (
+                "cell von-Mises relative RMSE"
+                if summary["stress_metric_source"] == CELL_TENSOR_STRESS_SOURCE
+                else "nodal scalar stress relative RMSE"
+            ),
             "aggregation": "pooled physical-unit squared errors",
         },
         "summary": summary,
@@ -242,7 +515,7 @@ def validate_reference_protocol(
 ) -> None:
     """Reject checkpoint references evaluated on a different development set."""
 
-    if int(payload.get("schema_version", 0)) < METRIC_SCHEMA_VERSION:
+    if int(payload.get("schema_version", 0)) < MIN_PROVENANCE_SCHEMA_VERSION:
         raise ValueError("native reference uses a metric schema without provenance")
     evaluation = payload.get("evaluation")
     if not isinstance(evaluation, dict):
@@ -287,6 +560,21 @@ def compare_experiments(
 
     if baseline not in experiments or candidate not in experiments:
         raise KeyError("baseline and candidate must be present in experiments")
+    baseline_source = str(
+        experiments[baseline].get("summary", {}).get(
+            "stress_metric_source", NODAL_STRESS_FALLBACK_SOURCE
+        )
+    )
+    candidate_source = str(
+        experiments[candidate].get("summary", {}).get(
+            "stress_metric_source", NODAL_STRESS_FALLBACK_SOURCE
+        )
+    )
+    if baseline_source != candidate_source:
+        raise ValueError(
+            "paired comparison requires the same stress metric source; "
+            f"baseline={baseline_source!r}, candidate={candidate_source!r}"
+        )
     base_ids = [value["case_id"] for value in experiments[baseline]["per_case"]]
     candidate_ids = [value["case_id"] for value in experiments[candidate]["per_case"]]
     if base_ids != candidate_ids:
@@ -346,6 +634,7 @@ def save_comparison(path: str | Path, comparison: dict[str, Any]) -> None:
 
 
 def native_reference_payload(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result["summary"]
     return {
         "schema_version": int(result.get("schema_version", METRIC_SCHEMA_VERSION)),
         "evaluation": dict(result.get("evaluation", {})),
@@ -357,7 +646,12 @@ def native_reference_payload(result: dict[str, Any]) -> dict[str, Any]:
             for value in result.get("per_case", [])
         ],
         "rollout": {
-            key: float(result["summary"][key]) for key in PRIMARY_METRICS
+            **{key: float(summary[key]) for key in PRIMARY_METRICS},
+            "stress_metric_source": str(
+                summary.get(
+                    "stress_metric_source", NODAL_STRESS_FALLBACK_SOURCE
+                )
+            ),
         }
     }
 
@@ -374,7 +668,12 @@ def _sums_dict(value: ErrorSums) -> dict[str, float | int]:
 
 
 def _dict_sums(value: dict[str, Any]) -> ErrorSums:
-    return ErrorSums(**{field: value[field] for field in ErrorSums.__dataclass_fields__})
+    return ErrorSums(
+        **{
+            field: value.get(field, 0)
+            for field in ErrorSums.__dataclass_fields__
+        }
+    )
 
 
 def _write_json(path: Path, value: Any) -> None:

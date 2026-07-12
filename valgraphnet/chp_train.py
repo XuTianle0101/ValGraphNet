@@ -44,6 +44,7 @@ ROLLOUT_METRIC_KEYS = (
     "stress_relative_rmse",
     "stress_p95_relative_rmse",
 )
+FAILED_RELATIVE_METRIC = 1.0e30
 
 
 @dataclass
@@ -816,8 +817,12 @@ def minimax_checkpoint_score(
     for key in ROLLOUT_METRIC_KEYS:
         value = float(metrics[key])
         reference = float(references.get(key, 1.0))
-        if not math.isfinite(value) or reference <= 0.0:
-            return float("inf")
+        if (
+            not math.isfinite(value)
+            or not math.isfinite(reference)
+            or reference <= 0.0
+        ):
+            return FAILED_RELATIVE_METRIC
         ratios.append(value / reference)
     return max(ratios)
 
@@ -2580,6 +2585,21 @@ def evaluate_chp_rollouts(
         moving = ~(trajectory.static.fixed_mask | trajectory.static.prescribed_mask)
         if not bool(moving.any().item()):
             moving = ~trajectory.static.fixed_mask
+        stress_mask = ~trajectory.static.prescribed_mask
+        if not bool(stress_mask.any().item()):
+            stress_mask = torch.ones_like(trajectory.static.prescribed_mask)
+        rollout_stress_target = trajectory.stress[1 : steps + 1, stress_mask, :1]
+        nodal_p95_threshold = torch.quantile(
+            rollout_stress_target.abs().reshape(-1), 0.95
+        )
+        cell_vm_p95_threshold = None
+        if _trajectory_has_cell_stress_tensor(trajectory):
+            rollout_cell_vm_target = _tensor6_von_mises(
+                trajectory.cell_stress[1 : steps + 1]
+            )
+            cell_vm_p95_threshold = torch.quantile(
+                rollout_cell_vm_target.abs().reshape(-1), 0.95
+            )
         case_diverged = False
         for step in range(steps):
             attempted_steps += 1
@@ -2671,15 +2691,11 @@ def evaluate_chp_rollouts(
             u_reference = trajectory.displacement[step + 1, moving]
             accum["u_error"] += u_error.double().square().sum()
             accum["u_reference"] += u_reference.double().square().sum()
-            stress_mask = ~trajectory.static.prescribed_mask
-            if not bool(stress_mask.any().item()):
-                stress_mask = torch.ones_like(trajectory.static.prescribed_mask)
             target_stress = trajectory.stress[step + 1, stress_mask, :1]
             stress_error = output.nodal_stress[stress_mask, :1] - target_stress
             accum["stress_error"] += stress_error.double().square().sum()
             accum["stress_reference"] += target_stress.double().square().sum()
-            threshold = torch.quantile(target_stress.abs().reshape(-1), 0.95)
-            peak = target_stress.abs() >= threshold
+            peak = target_stress.abs() >= nodal_p95_threshold
             accum["p95_error"] += stress_error[peak].double().square().sum()
             accum["p95_reference"] += target_stress[peak].double().square().sum()
             if _trajectory_has_cell_stress_tensor(trajectory):
@@ -2691,8 +2707,8 @@ def evaluate_chp_rollouts(
                 target_vm = _tensor6_von_mises(target_tensor)
                 predicted_vm = _tensor6_von_mises(predicted_tensor)
                 vm_error = predicted_vm - target_vm
-                cell_threshold = torch.quantile(target_vm.abs(), 0.95)
-                cell_peak = target_vm.abs() >= cell_threshold
+                assert cell_vm_p95_threshold is not None
+                cell_peak = target_vm.abs() >= cell_vm_p95_threshold
                 accum["cell_tensor_error"] += tensor_error.double().square().sum()
                 accum["cell_tensor_reference"] += target_tensor.double().square().sum()
                 accum["cell_tensor_p95_error"] += (
@@ -2742,7 +2758,7 @@ def evaluate_chp_rollouts(
             accum["p95_error"] / accum["p95_reference"].clamp_min(eps)
         ).item()
     )
-    cell_tensor_relative = (
+    cell_tensor_relative: float | None = (
         float(
             torch.sqrt(
                 accum["cell_tensor_error"]
@@ -2750,9 +2766,9 @@ def evaluate_chp_rollouts(
             ).item()
         )
         if tensor_evaluated_steps
-        else float("inf")
+        else None
     )
-    cell_tensor_p95_relative = (
+    cell_tensor_p95_relative: float | None = (
         float(
             torch.sqrt(
                 accum["cell_tensor_p95_error"]
@@ -2760,9 +2776,9 @@ def evaluate_chp_rollouts(
             ).item()
         )
         if tensor_evaluated_steps
-        else float("inf")
+        else None
     )
-    cell_vm_relative = (
+    cell_vm_relative: float | None = (
         float(
             torch.sqrt(
                 accum["cell_vm_error"]
@@ -2770,9 +2786,9 @@ def evaluate_chp_rollouts(
             ).item()
         )
         if tensor_evaluated_steps
-        else float("inf")
+        else None
     )
-    cell_vm_p95_relative = (
+    cell_vm_p95_relative: float | None = (
         float(
             torch.sqrt(
                 accum["cell_vm_p95_error"]
@@ -2780,16 +2796,49 @@ def evaluate_chp_rollouts(
             ).item()
         )
         if tensor_evaluated_steps
-        else float("inf")
+        else None
     )
+    if tensor_evaluated_steps:
+        cell_tensor_relative = (
+            cell_tensor_relative
+            if cell_tensor_relative is not None and math.isfinite(cell_tensor_relative)
+            else FAILED_RELATIVE_METRIC
+        )
+        cell_tensor_p95_relative = (
+            cell_tensor_p95_relative
+            if cell_tensor_p95_relative is not None
+            and math.isfinite(cell_tensor_p95_relative)
+            else FAILED_RELATIVE_METRIC
+        )
+        cell_vm_relative = (
+            cell_vm_relative
+            if cell_vm_relative is not None and math.isfinite(cell_vm_relative)
+            else FAILED_RELATIVE_METRIC
+        )
+        cell_vm_p95_relative = (
+            cell_vm_p95_relative
+            if cell_vm_p95_relative is not None
+            and math.isfinite(cell_vm_p95_relative)
+            else FAILED_RELATIVE_METRIC
+        )
     if tensor_label_cases and nodal_label_cases:
         raise ValueError(
             "validation subset mixes full cell-tensor and nodal-only stress labels"
         )
     if tensor_label_cases:
         stress_source = CELL_TENSOR_STRESS_SOURCE
-        primary_stress_relative = cell_tensor_relative
-        primary_stress_p95_relative = cell_vm_p95_relative
+        primary_stress_relative = (
+            cell_tensor_relative
+            if cell_tensor_relative is not None
+            and math.isfinite(cell_tensor_relative)
+            else FAILED_RELATIVE_METRIC
+        )
+        primary_stress_p95_relative = (
+            cell_vm_p95_relative
+            if cell_vm_p95_relative is not None
+            and math.isfinite(cell_vm_p95_relative)
+            else FAILED_RELATIVE_METRIC
+        )
     else:
         stress_source = NODAL_STRESS_FALLBACK_SOURCE
         primary_stress_relative = nodal_stress_relative
@@ -2950,11 +2999,16 @@ def evaluate_teacher_forced_stress(
                 tensor_label_frames += 1
     eps = torch.tensor(1.0e-12, device=cache.device)
 
-    def relative(error_key: str, reference_key: str, frames: int) -> float:
+    def relative(
+        error_key: str, reference_key: str, frames: int
+    ) -> float | None:
         reference = accum[reference_key]
         if frames and bool((reference > eps).item()):
-            return float(torch.sqrt(accum[error_key] / reference.clamp_min(eps)).item())
-        return float("inf")
+            value = float(
+                torch.sqrt(accum[error_key] / reference.clamp_min(eps)).item()
+            )
+            return value if math.isfinite(value) else FAILED_RELATIVE_METRIC
+        return None
 
     nodal_relative = relative("nodal_error", "nodal_reference", nodal_label_frames)
     nodal_peak_relative = relative(
@@ -2973,14 +3027,28 @@ def evaluate_teacher_forced_stress(
         "cell_vm_peak_error", "cell_vm_peak_reference", tensor_label_frames
     )
     if tensor_label_frames:
-        source = "cell_tensor"
-        primary_relative = tensor_relative
-        primary_peak_relative = tensor_peak_relative
+        source = CELL_TENSOR_STRESS_SOURCE
+        primary_relative = (
+            tensor_relative
+            if tensor_relative is not None
+            else FAILED_RELATIVE_METRIC
+        )
+        primary_peak_relative = (
+            cell_vm_peak_relative
+            if cell_vm_peak_relative is not None
+            else FAILED_RELATIVE_METRIC
+        )
         label_frames = tensor_label_frames
     else:
-        source = "nodal_scalar_vm_fallback"
-        primary_relative = nodal_relative
-        primary_peak_relative = nodal_peak_relative
+        source = NODAL_STRESS_FALLBACK_SOURCE
+        primary_relative = (
+            nodal_relative if nodal_relative is not None else FAILED_RELATIVE_METRIC
+        )
+        primary_peak_relative = (
+            nodal_peak_relative
+            if nodal_peak_relative is not None
+            else FAILED_RELATIVE_METRIC
+        )
         label_frames = nodal_label_frames
     return {
         # Stable API: these aliases always hold the preferred supervision source.
@@ -3260,7 +3328,7 @@ def _enforce_scientific_gates(
             "threshold": teacher_threshold,
             "action": (
                 "stop rollout curriculum and revise constitutive model/data"
-                if teacher_source == "cell_tensor"
+                if teacher_source == CELL_TENSOR_STRESS_SOURCE
                 else "stop rollout curriculum and add full tensor labels"
             ),
         }

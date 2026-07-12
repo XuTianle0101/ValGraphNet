@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +15,7 @@ from valgraphnet.chp_train import (
     fit_chp_normalizers,
 )
 from valgraphnet.mechanics import von_mises
+from valgraphnet.physical_evaluation import CELL_TENSOR_STRESS_SOURCE
 
 
 def _tensor6_matrix(value: torch.Tensor) -> torch.Tensor:
@@ -224,7 +226,7 @@ def _teacher_fixture(*, with_tensor: bool):
 
 def test_teacher_gate_prefers_tensor_and_explicitly_reports_scalar_fallback():
     tensor_metrics = evaluate_teacher_forced_stress(*_teacher_fixture(with_tensor=True))
-    assert tensor_metrics["teacher_stress_source"] == "cell_tensor"
+    assert tensor_metrics["teacher_stress_source"] == CELL_TENSOR_STRESS_SOURCE
     assert tensor_metrics["teacher_stress_relative_rmse"] == 0.0
     assert tensor_metrics["teacher_nodal_stress_relative_rmse"] == 1.0
     assert tensor_metrics["teacher_cell_stress_tensor_coverage"] == 1.0
@@ -235,7 +237,8 @@ def test_teacher_gate_prefers_tensor_and_explicitly_reports_scalar_fallback():
     assert scalar_metrics["teacher_stress_source"] == "nodal_scalar_vm_fallback"
     assert scalar_metrics["teacher_stress_relative_rmse"] == 1.0
     assert scalar_metrics["teacher_cell_stress_tensor_coverage"] == 0.0
-    assert scalar_metrics["teacher_cell_stress_tensor_relative_rmse"] == float("inf")
+    assert scalar_metrics["teacher_cell_stress_tensor_relative_rmse"] is None
+    json.dumps(scalar_metrics, allow_nan=False)
 
 
 def test_device_case_contract_includes_cell_stress():

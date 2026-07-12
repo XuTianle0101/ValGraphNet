@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 
 from valgraphnet.physical_evaluation import (
+    CELL_TENSOR_STRESS_SOURCE,
+    NODAL_STRESS_FALLBACK_SOURCE,
     ErrorSums,
     compare_experiments,
     evaluate_prediction,
@@ -64,6 +66,67 @@ def test_zero_prediction_is_unit_relative_error_and_uses_masks():
     assert sums.stress_count == 3 * 2
     assert np.isclose(metrics["moving_displacement_relative_rmse"], 1.0)
     assert np.isclose(metrics["stress_relative_rmse"], 1.0)
+    assert metrics["stress_metric_source"] == NODAL_STRESS_FALLBACK_SOURCE
+    json.dumps(metrics, allow_nan=False)
+
+
+def test_full_cell_tensor_drives_primary_stress_metrics_and_requires_prediction():
+    case = _case()
+    case.num_cells = 1
+    case.cell_stress = np.zeros((4, 1, 6), dtype=np.float32)
+    case.cell_stress[1:, 0] = np.asarray(
+        [2.0, -1.0, 0.5, 0.25, -0.75, 1.25], dtype=np.float32
+    )
+    exact_cell = np.zeros((3, 1, 3, 3), dtype=np.float32)
+    exact_cell[..., 0, 0] = case.cell_stress[1:, :, 0]
+    exact_cell[..., 1, 1] = case.cell_stress[1:, :, 1]
+    exact_cell[..., 2, 2] = case.cell_stress[1:, :, 2]
+    exact_cell[..., 0, 1] = exact_cell[..., 1, 0] = case.cell_stress[1:, :, 3]
+    exact_cell[..., 0, 2] = exact_cell[..., 2, 0] = case.cell_stress[1:, :, 4]
+    exact_cell[..., 1, 2] = exact_cell[..., 2, 1] = case.cell_stress[1:, :, 5]
+    deliberately_wrong_nodal = np.zeros_like(case.stress[1:])
+
+    _, metrics = evaluate_prediction(
+        case,
+        case.displacement.copy(),
+        deliberately_wrong_nodal,
+        exact_cell,
+    )
+
+    assert metrics["stress_metric_source"] == CELL_TENSOR_STRESS_SOURCE
+    assert metrics["stress_relative_rmse"] == 0.0
+    assert metrics["stress_p95_relative_rmse"] == 0.0
+    assert metrics["nodal_stress_relative_rmse"] == 1.0
+    assert metrics["cell_stress_tensor_case_coverage"] == 1.0
+    json.dumps(metrics, allow_nan=False)
+
+    with pytest.raises(ValueError, match="require S_cell_pred"):
+        evaluate_prediction(
+            case,
+            case.displacement.copy(),
+            deliberately_wrong_nodal,
+        )
+
+
+def test_mixed_tensor_and_nodal_stress_protocol_fails_closed():
+    mixed = ErrorSums(
+        stress_error=1.0,
+        stress_reference=1.0,
+        stress_count=1,
+        p95_error=1.0,
+        p95_reference=1.0,
+        p95_count=1,
+        cell_tensor_error=1.0,
+        cell_tensor_reference=1.0,
+        cell_tensor_count=1,
+        cell_vm_p95_error=1.0,
+        cell_vm_p95_reference=1.0,
+        cell_vm_p95_count=1,
+        tensor_label_cases=1,
+        nodal_label_cases=1,
+    )
+    with pytest.raises(ValueError, match="mixes full cell-tensor"):
+        mixed.metrics()
 
 
 def test_paired_bootstrap_requires_every_metric_to_improve():

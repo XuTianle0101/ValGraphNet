@@ -171,16 +171,32 @@ def run_chp_rollouts(
                 [np.full((case.num_nodes, 1), np.nan, dtype=np.float32)]
                 * (steps - len(stress))
             )
+            if save_cell_stress:
+                num_cells = int(trajectory.static.cells.shape[0])
+                cell_stress.extend(
+                    [
+                        np.full(
+                            (num_cells, 3, 3), np.nan, dtype=np.float32
+                        )
+                    ]
+                    * (steps - len(cell_stress))
+                )
         case_output = output / case.case_id
         case_output.mkdir(parents=True, exist_ok=True)
         np.save(case_output / "U_pred.npy", np.asarray(displacement, dtype=np.float32))
         np.save(case_output / "V_pred.npy", np.asarray(velocity, dtype=np.float32))
         np.save(case_output / "A_pred.npy", np.asarray(acceleration, dtype=np.float32))
         np.save(case_output / "S_pred.npy", np.asarray(stress, dtype=np.float32))
-        if save_cell_stress and cell_stress:
+        if save_cell_stress:
+            num_cells = int(trajectory.static.cells.shape[0])
+            cell_array = (
+                np.asarray(cell_stress, dtype=np.float32)
+                if cell_stress
+                else np.empty((0, num_cells, 3, 3), dtype=np.float32)
+            )
             np.save(
                 case_output / "S_cell_pred.npy",
-                np.asarray(cell_stress, dtype=np.float32),
+                cell_array,
             )
         with (case_output / "diagnostics.json").open("w", encoding="utf-8") as handle:
             json.dump(diagnostics, handle, indent=2, allow_nan=False)

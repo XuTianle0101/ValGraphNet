@@ -21,6 +21,10 @@ from valgraphnet.chp_train import (
     stress_frame_scores,
     validate_chp_checkpoint_semantics,
 )
+from valgraphnet.physical_evaluation import (
+    CELL_TENSOR_STRESS_SOURCE,
+    NODAL_STRESS_FALLBACK_SOURCE,
+)
 
 
 def test_default_curriculum_matches_fixed_long_horizon_schedule():
@@ -104,6 +108,32 @@ def test_minimax_checkpoint_cannot_trade_stress_for_displacement():
     assert minimax_checkpoint_score(stress_regression, native) == 1.1
 
 
+def test_minimax_rejects_nodal_native_denominator_for_cell_tensor_metrics():
+    metrics = {
+        key: 0.5 for key in ROLLOUT_METRIC_KEYS
+    } | {"stress_metric_source": CELL_TENSOR_STRESS_SOURCE}
+    nodal_native = {
+        key: 1.0 for key in ROLLOUT_METRIC_KEYS
+    } | {"stress_metric_source": NODAL_STRESS_FALLBACK_SOURCE}
+    with pytest.raises(ValueError, match="different stress metrics"):
+        minimax_checkpoint_score(metrics, nodal_native)
+    with pytest.raises(ValueError, match="source-compatible"):
+        minimax_checkpoint_score(
+            metrics, {key: 1.0 for key in ROLLOUT_METRIC_KEYS}
+        )
+    tensor_native = {
+        key: 1.0 for key in ROLLOUT_METRIC_KEYS
+    } | {"stress_metric_source": CELL_TENSOR_STRESS_SOURCE}
+    assert minimax_checkpoint_score(metrics, tensor_native) == 0.5
+    legacy_nodal_metrics = {
+        key: 0.75 for key in ROLLOUT_METRIC_KEYS
+    } | {"stress_metric_source": NODAL_STRESS_FALLBACK_SOURCE}
+    assert minimax_checkpoint_score(
+        legacy_nodal_metrics,
+        {key: 1.0 for key in ROLLOUT_METRIC_KEYS},
+    ) == 0.75
+
+
 def test_checkpoint_rejects_ambiguous_legacy_residual_semantics():
     legacy = {"schema_version": CHPGNS.checkpoint_schema_version}
     with pytest.raises(ValueError, match="dynamics semantics"):
@@ -170,6 +200,20 @@ def test_native_reference_loads_shared_evaluator_summary(tmp_path):
     assert load_native_reference(
         {"validation": {"native_reference_file": str(path)}}
     ) == values
+
+    tensor_payload = {
+        "summary": {
+            **values,
+            "stress_metric_source": CELL_TENSOR_STRESS_SOURCE,
+        }
+    }
+    path.write_text(json.dumps(tensor_payload), encoding="utf-8")
+    assert load_native_reference(
+        {"validation": {"native_reference_file": str(path)}}
+    ) == {
+        **values,
+        "stress_metric_source": CELL_TENSOR_STRESS_SOURCE,
+    }
 
 
 def test_absolute_validation_mode_rejects_native_reference_leakage():
