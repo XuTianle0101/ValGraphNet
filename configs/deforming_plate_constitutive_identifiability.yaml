@@ -1,0 +1,44 @@
+# Direct scalar-stress identifiability control. This is deliberately not CHP:
+# it has no energy potential, full stress tensor, or internal-force output.
+schema_version: 1
+seed: 20260712
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+
+model:
+  input_dim: 3
+  hidden_dim: 64
+  hidden_layers: 2
+  output: nonnegative_cell_scalar
+
+training:
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+  cases: 256
+  frames: 8
+  epochs: 20
+  checkpoint_selection: fixed_final_epoch
+  lr: 1.0e-3
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-6
+  grad_clip_norm: 5.0
+  fused_optimizer: true
+  minimum_j: 0.01
+  maximum_i2_bar: 1.0e5
+  output_dir: outputs/deforming_plate_constitutive_identifiability_seed20260712
+
+validation:
+  cases: 20
+  frames: 16
+  case_selection: even
+
+loss:
+  huber_delta: 0.1
+  physical_mse_weight: 1.0
+  peak_mse_weight: 0.25
