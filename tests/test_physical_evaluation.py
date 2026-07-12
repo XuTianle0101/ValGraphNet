@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from valgraphnet.physical_evaluation import (
+    _case_has_full_cell_stress,
     CELL_TENSOR_STRESS_SOURCE,
     NODAL_STRESS_FALLBACK_SOURCE,
     ErrorSums,
@@ -32,6 +33,25 @@ def _case():
         fixed_mask=np.asarray([False, False, True]),
         prescribed_mask=np.asarray([False, False, True]),
     )
+
+
+def test_empty_cell_tensor_channel_selects_nodal_fallback():
+    absent = SimpleNamespace(
+        case_id="nodal-only",
+        num_steps=400,
+        num_cells=17,
+        cell_stress=np.zeros((400, 17, 0), dtype=np.float32),
+    )
+    assert not _case_has_full_cell_stress(absent)
+
+    partial = SimpleNamespace(
+        case_id="partial",
+        num_steps=400,
+        num_cells=17,
+        cell_stress=np.zeros((400, 17, 3), dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match=r"\[T,M,6\]"):
+        _case_has_full_cell_stress(partial)
 
 
 def _result(sums: ErrorSums):

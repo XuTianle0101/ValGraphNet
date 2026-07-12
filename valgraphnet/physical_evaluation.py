@@ -377,15 +377,30 @@ def _case_has_full_cell_stress(case: ValveCase | Any) -> bool:
     if not hasattr(case, "cell_stress"):
         return False
     raw = np.asarray(case.cell_stress)
-    if raw.ndim == 3 and raw.shape[1] == 0:
-        return False
     expected_frames = int(getattr(case, "num_steps", raw.shape[0]))
+    expected_cells = int(
+        getattr(
+            case,
+            "num_cells",
+            raw.shape[1] if raw.ndim >= 2 else 0,
+        )
+    )
+    # ValveCase represents an unavailable optional tensor as [T,M,0].  This
+    # is a complete absence, not partial tensor coverage, and must select the
+    # explicit nodal-scalar fallback used by deforming_plate.
+    if raw.shape == (expected_frames, expected_cells, 0):
+        return False
     if raw.ndim != 3 or raw.shape[0] != expected_frames or raw.shape[2] != 6:
         raise ValueError(
             f"{getattr(case, 'case_id', 'case')}: cell stress labels must have "
             f"shape [T,M,6], got {raw.shape}"
         )
-    return raw.shape[1] > 0
+    if raw.shape[1] != expected_cells:
+        raise ValueError(
+            f"{getattr(case, 'case_id', 'case')}: cell stress labels must have "
+            f"shape [T,M,6], got {raw.shape}"
+        )
+    return expected_cells > 0
 
 
 def _canonical_cell_tensor6(value: np.ndarray) -> np.ndarray:
