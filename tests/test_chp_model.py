@@ -151,6 +151,36 @@ def test_reference_contact_gap_has_zero_force_and_dissipation():
     torch.testing.assert_close(dissipation, torch.zeros_like(dissipation))
 
 
+def test_contact_tangent_is_dissipative_and_bounded_by_normal_force():
+    heads = PairForceHeads(4, tangential_ratio_cap=0.5)
+    for parameter in heads.parameters():
+        torch.nn.init.zeros_(parameter)
+    scalar = torch.zeros(2, 4)
+    reference = torch.tensor([[0.0, 0.0, 0.0], [0.02, 0.0, 0.0]])
+    position = torch.tensor([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    velocity = torch.tensor([[0.0, 0.0, 0.0], [0.0, 100.0, 0.0]])
+    pairs = torch.tensor([[0], [1]])
+
+    force, penetration, dissipation = heads.contact_force(
+        scalar,
+        position,
+        velocity,
+        pairs,
+        radius=0.03,
+        reference_position=reference,
+    )
+
+    assert penetration > 0.0
+    detached_force = force.detach()
+    assert abs(float(detached_force[0, 1])) <= (
+        0.5 * abs(float(detached_force[0, 0])) + 1.0e-7
+    )
+    torch.testing.assert_close(force.sum(0), torch.zeros(3), atol=1.0e-7, rtol=0.0)
+    assert dissipation > 0.0
+    mechanical_power = (force * velocity).sum()
+    assert mechanical_power <= 0.0
+
+
 def test_unique_undirected_pairs_removes_reverse_duplicates():
     edges = torch.tensor([[0, 1, 2, 3, 2], [1, 0, 3, 2, 2]])
     pairs = unique_undirected_pairs(edges, 4)
@@ -242,6 +272,30 @@ def test_chp_model_cuda_forward_uses_gpu():
     output = model(static, state)
     assert output.next_position.is_cuda
     assert output.cell_stress_tensor.is_cuda
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_contact_pairs_are_refreshed_between_cuda_substeps(monkeypatch):
+    static = build_chp_static(_case(), "cuda")
+    model = CHPGNS(_cfg()).cuda().eval()
+    state = CHPState(
+        static.reference_position.clone(), torch.zeros_like(static.reference_position)
+    )
+    calls = []
+
+    def fake_radius_search(position, *args, **kwargs):
+        calls.append(position.detach().clone())
+        return torch.zeros((2, 0), dtype=torch.long, device=position.device)
+
+    monkeypatch.setattr("valgraphnet.chp_model.radius_contact_pairs", fake_radius_search)
+    output = model(
+        static,
+        state,
+        contact_pairs=torch.zeros((2, 0), dtype=torch.long, device="cuda"),
+    )
+
+    assert len(calls) == model.contact_substeps - 1
+    assert output.energy_diagnostics["contact_pair_count"].item() == 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

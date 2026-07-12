@@ -63,6 +63,7 @@ model:
   inversion_stiffness: 10.0
   minimum_j: 0.0
   contact_substeps: 2
+  contact_tangential_ratio_cap: 1.0
   residual_acceleration_reference: 1.0e-3
   residual_acceleration_cap: 1.0e-2
   residual_activity_scale: 1.0e-2
@@ -84,6 +85,7 @@ contact:
   # with a mesh-derived radius before launching the formal experiment.
   radius: 0.03
   max_neighbors: 32
+  refresh_each_substep: true
 
 loss:
   position: 1.0

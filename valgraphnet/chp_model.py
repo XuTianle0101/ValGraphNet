@@ -130,8 +130,11 @@ class CellNodeBlock(nn.Module):
 class PairForceHeads(nn.Module):
     """Non-negative damping/contact magnitudes assembled as pair forces."""
 
-    def __init__(self, scalar_dim: int) -> None:
+    def __init__(self, scalar_dim: int, tangential_ratio_cap: float = 1.0) -> None:
         super().__init__()
+        self.tangential_ratio_cap = float(tangential_ratio_cap)
+        if self.tangential_ratio_cap < 0.0:
+            raise ValueError("tangential_ratio_cap must be non-negative")
         symmetric_dim = 2 * scalar_dim + 4
         self.damping = nn.Sequential(
             nn.Linear(symmetric_dim, scalar_dim), nn.SiLU(), nn.Linear(scalar_dim, 1)
@@ -278,9 +281,20 @@ class PairForceHeads(nn.Module):
         normal_force_src = -normal_magnitude * direction
         tangential_velocity = relative_velocity - normal_velocity * direction
         tangential_coefficient = F.softplus(raw[:, 1:2])
-        tangential_force_src = (
-            tangential_coefficient * tangential_velocity * penetration
+        tangential_speed = torch.linalg.vector_norm(
+            tangential_velocity, dim=1, keepdim=True
         )
+        candidate_tangent = (
+            tangential_coefficient * tangential_speed * penetration
+        )
+        tangent_cap = self.tangential_ratio_cap * normal_magnitude
+        bounded_tangent = tangent_cap * torch.tanh(
+            candidate_tangent / tangent_cap.clamp_min(1.0e-8)
+        )
+        tangential_direction = tangential_velocity / tangential_speed.clamp_min(
+            1.0e-8
+        )
+        tangential_force_src = bounded_tangent * tangential_direction
         force_src = normal_force_src + tangential_force_src
         pair_mass = None
         pair_weight = self.pair_normalization(contact_pairs, position.shape[0]).to(
@@ -292,9 +306,8 @@ class PairForceHeads(nn.Module):
             force_src = force_src * pair_mass
         force = self.scatter_pair(force_src, contact_pairs, position.shape[0])
         dissipation_density = (
-            tangential_coefficient
-            * tangential_velocity.square().sum(1, keepdim=True)
-            * penetration
+            bounded_tangent
+            * tangential_speed
             * pair_weight
         )
         if pair_mass is not None:
@@ -307,7 +320,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 3
+    dynamics_schema_version = 4
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -319,6 +332,11 @@ class CHPGNS(nn.Module):
         self.cell_dim = int(model_cfg.get("cell_dim", 64))
         self.material_dim = int(material_dim)
         self.contact_radius = float(get_cfg(cfg, "contact.radius", 0.03))
+        self.contact_enabled = bool(get_cfg(cfg, "contact.enabled", True))
+        self.contact_max_neighbors = int(get_cfg(cfg, "contact.max_neighbors", 32))
+        self.refresh_contact_pairs_each_substep = bool(
+            get_cfg(cfg, "contact.refresh_each_substep", True)
+        )
         self.contact_substeps = int(model_cfg.get("contact_substeps", 2))
         self.residual_acceleration_reference = float(
             model_cfg.get("residual_acceleration_reference", 1.9e-4)
@@ -390,7 +408,12 @@ class CHPGNS(nn.Module):
         self.cell_blocks = nn.ModuleList(
             [CellNodeBlock(self.scalar_dim, self.cell_dim) for _ in range(4)]
         )
-        self.force_heads = PairForceHeads(self.scalar_dim)
+        self.force_heads = PairForceHeads(
+            self.scalar_dim,
+            tangential_ratio_cap=float(
+                model_cfg.get("contact_tangential_ratio_cap", 1.0)
+            ),
+        )
         self.residual_channel = VectorChannelLinear(self.vector_dim, 1)
         self.potential = AnalyticPotential(
             order=int(model_cfg.get("potential_order", 2)),
@@ -646,9 +669,24 @@ class CHPGNS(nn.Module):
         total_force = torch.zeros_like(position)
         current_fields = initial_fields
         force_scalar = scalar.detach() if detach_pair_force_features else scalar
+        active_contact_pairs = contact_pairs
         for substep in range(max(self.contact_substeps, 1)):
             if substep:
                 current_fields = self.constitutive_fields(static, current_position)
+                if (
+                    self.contact_enabled
+                    and self.refresh_contact_pairs_each_substep
+                    and current_position.is_cuda
+                ):
+                    active_contact_pairs = radius_contact_pairs(
+                        current_position,
+                        static.mesh_edge_index,
+                        static.fixed_mask,
+                        self.contact_radius,
+                        max_neighbors=self.contact_max_neighbors,
+                        prescribed_mask=static.prescribed_mask,
+                        surface_mask=static.contact_surface_mask,
+                    )
             damping, damping_rate = self.force_heads.mesh_damping(
                 force_scalar,
                 current_position,
@@ -661,7 +699,7 @@ class CHPGNS(nn.Module):
                 force_scalar,
                 current_position,
                 current_velocity,
-                contact_pairs,
+                active_contact_pairs,
                 self.contact_radius,
                 nodal_mass,
                 reference,
@@ -877,6 +915,9 @@ class CHPGNS(nn.Module):
                 "mass_scale": mass_scale,
                 "contact_scale": contact_scale,
                 "damping_scale": damping_scale,
+                "contact_pair_count": position.new_tensor(
+                    active_contact_pairs.shape[1]
+                ),
             },
         )
 

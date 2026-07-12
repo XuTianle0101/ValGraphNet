@@ -30,6 +30,7 @@ model:
   inversion_stiffness: 10.0
   minimum_j: 0.0
   contact_substeps: 2
+  contact_tangential_ratio_cap: 1.0
   # Train-only acceleration statistics: free-node P99 ~=1.9e-4.  The bounded
   # correction may cover the P99.9 tail but cannot bypass the constitutive law.
   residual_acceleration_reference: 1.9e-4
@@ -52,6 +53,7 @@ contact:
   enabled: true
   radius: 0.03
   max_neighbors: 32
+  refresh_each_substep: true
 
 loss:
   position: 1.0
