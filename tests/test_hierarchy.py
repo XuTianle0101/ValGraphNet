@@ -1,8 +1,10 @@
+import pytest
 import torch
 
 from valgraphnet.hierarchy import (
     HierarchicalScalarVectorProcessor,
     ScalarVectorBlock,
+    _single_bistride_assignment,
     build_topology_hierarchy,
     pool_mean,
 )
@@ -19,11 +21,22 @@ def test_topology_hierarchy_is_deterministic_and_coarsens_without_geometry():
     second = build_topology_hierarchy(64, edges)
 
     assert first.node_counts == [64, 16, 4]
+    assert first.coarsening == "topology_bistride"
     assert all(torch.equal(a, b) for a, b in zip(first.assignments, second.assignments))
     assert all(torch.equal(a, b) for a, b in zip(first.edge_indices, second.edge_indices))
     value = torch.arange(64, dtype=torch.float32)[:, None]
     pooled = pool_mean(value, first.assignments[0], first.node_counts[1])
     assert pooled.shape == (16, 1)
+
+
+def test_bistride_keeps_alternate_bfs_frontiers_and_rejects_non_power_ratio():
+    assignment, count = _single_bistride_assignment(10, _chain_edges(10))
+    assert count == 5
+    assert assignment.unique().numel() == 5
+    assert torch.equal(assignment[::2], torch.arange(5))
+
+    with pytest.raises(ValueError, match="powers of two"):
+        build_topology_hierarchy(10, _chain_edges(10), ratios=(3,))
 
 
 def test_scalar_vector_block_is_rotation_equivariant():

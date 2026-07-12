@@ -17,12 +17,14 @@ class TopologyHierarchy:
     edge_indices: list[torch.Tensor]
     assignments: list[torch.Tensor]
     node_counts: list[int]
+    coarsening: str = "topology_bistride"
 
     def to(self, device: torch.device | str) -> "TopologyHierarchy":
         return TopologyHierarchy(
             edge_indices=[edge.to(device) for edge in self.edge_indices],
             assignments=[assignment.to(device) for assignment in self.assignments],
             node_counts=self.node_counts,
+            coarsening=self.coarsening,
         )
 
 
@@ -31,18 +33,18 @@ def build_topology_hierarchy(
     edge_index: torch.Tensor,
     ratios: tuple[int, ...] = (4, 4),
 ) -> TopologyHierarchy:
-    """Build deterministic BFS coarsenings without geometry-based shortcut edges."""
+    """Build repeated alternate-frontier bi-stride topology coarsenings."""
 
     edges = edge_index.detach().long().cpu()
     hierarchy_edges = [_coalesce_directed(edges, int(num_nodes))]
     assignments: list[torch.Tensor] = []
     counts = [int(num_nodes)]
     for ratio in ratios:
-        assignment, coarse_count = _bfs_assignment(
+        assignment, coarse_edges, coarse_count = _bistride_coarsen(
             counts[-1], hierarchy_edges[-1], max(int(ratio), 2)
         )
         assignments.append(assignment)
-        hierarchy_edges.append(_coarse_edges(hierarchy_edges[-1], assignment, coarse_count))
+        hierarchy_edges.append(coarse_edges)
         counts.append(coarse_count)
     return TopologyHierarchy(hierarchy_edges, assignments, counts)
 
@@ -239,29 +241,61 @@ class HierarchicalScalarVectorProcessor(nn.Module):
         return scalar, vector
 
 
-def _bfs_assignment(
+def _bistride_coarsen(
     num_nodes: int, edge_index: torch.Tensor, ratio: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compose true bi-stride passes until the requested power-of-two ratio."""
+
+    if ratio < 2 or ratio & (ratio - 1):
+        raise ValueError("bi-stride hierarchy ratios must be powers of two")
+    composed = torch.arange(num_nodes, dtype=torch.long)
+    current_edges = edge_index
+    current_count = int(num_nodes)
+    passes = ratio.bit_length() - 1
+    for _ in range(passes):
+        stride_assignment, next_count = _single_bistride_assignment(
+            current_count, current_edges
+        )
+        composed = stride_assignment[composed]
+        current_edges = _coarse_edges(
+            current_edges, stride_assignment, next_count
+        )
+        current_count = next_count
+    return composed, current_edges, current_count
+
+
+def _single_bistride_assignment(
+    num_nodes: int, edge_index: torch.Tensor
 ) -> tuple[torch.Tensor, int]:
+    """Keep the smaller parity of each component's BFS frontiers."""
+
     adjacency = [set() for _ in range(num_nodes)]
     for src, dst in edge_index.t().tolist():
         if src != dst:
             adjacency[int(src)].add(int(dst))
             adjacency[int(dst)].add(int(src))
-    order: list[int] = []
     seen = [False] * num_nodes
+    representatives: list[int] = []
     for root in range(num_nodes):
         if seen[root]:
             continue
         queue = deque([root])
         seen[root] = True
+        distance = {root: 0}
+        component: list[int] = []
         while queue:
             node = queue.popleft()
-            order.append(node)
+            component.append(node)
             for neighbor in sorted(adjacency[node]):
                 if not seen[neighbor]:
                     seen[neighbor] = True
+                    distance[neighbor] = distance[node] + 1
                     queue.append(neighbor)
-    representatives = order[::ratio] or [0]
+        even = [node for node in component if distance[node] % 2 == 0]
+        odd = [node for node in component if distance[node] % 2 == 1]
+        kept = even if len(even) <= len(odd) or not odd else odd
+        representatives.extend(kept)
+    representatives = sorted(representatives) or [0]
     assignment = torch.full((num_nodes,), -1, dtype=torch.long)
     queue: deque[int] = deque()
     for coarse, node in enumerate(representatives):
