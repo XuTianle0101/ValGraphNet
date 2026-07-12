@@ -112,7 +112,11 @@ def test_isochoric_potential_has_nonzero_small_strain_tangent():
 
 
 def test_rigid_rotation_preserves_energy_and_rotates_stress():
-    potential = AnalyticPotential(fiber_order=1).double()
+    potential = AnalyticPotential(
+        fiber_order=1,
+        ridge_terms=8,
+        ridge_input_scales=[0.1, 0.1, 0.2],
+    ).double()
     deformation = torch.tensor(
         [[[1.08, 0.08, 0.0], [0.02, 0.94, 0.04], [0.0, 0.03, 1.02]]],
         dtype=torch.float64,
@@ -165,6 +169,8 @@ def test_closed_form_first_piola_matches_energy_finite_difference():
     potential = AnalyticPotential(
         order=2,
         fiber_order=1,
+        ridge_terms=12,
+        ridge_input_scales=[0.1, 0.1, 0.2],
         i1_init=[0.7, 0.04],
         i2_init=[0.2, 0.03],
         j_init=[1.3, 0.08],
@@ -186,6 +192,38 @@ def test_closed_form_first_piola_matches_energy_finite_difference():
             finite_difference[0, row, column] = (energy_plus - energy_minus) / (2.0 * epsilon)
 
     torch.testing.assert_close(analytical, finite_difference, atol=2.0e-8, rtol=2.0e-6)
+
+
+def test_convex_ridge_basis_has_zero_reference_energy_and_stress():
+    potential = AnalyticPotential(
+        ridge_terms=16,
+        ridge_input_scales=[0.01, 0.01, 0.02],
+    ).double()
+    identity = torch.eye(3, dtype=torch.float64)[None]
+    reference = potential(identity)
+    torch.testing.assert_close(
+        reference.energy_density, torch.zeros(1, dtype=torch.float64), atol=1.0e-12, rtol=0
+    )
+    torch.testing.assert_close(
+        reference.first_piola, torch.zeros(1, 3, 3, dtype=torch.float64), atol=1.0e-11, rtol=0
+    )
+    deformed = torch.tensor(
+        [[[1.04, 0.03, 0.0], [0.0, 0.98, 0.01], [0.0, 0.0, 1.02]]],
+        dtype=torch.float64,
+    )
+    response = potential(deformed)
+    assert response.energy_density.item() >= -1.0e-12
+    assert torch.isfinite(response.first_piola).all()
+    assert torch.all(potential.ridge_coefficients > 0.0)
+    assert torch.all(potential.ridge_centers.abs() < potential.ridge_center_limit)
+
+    reference_fp32 = potential.float()(torch.eye(3)[None])
+    torch.testing.assert_close(
+        reference_fp32.energy_density, torch.zeros(1), atol=2.0e-7, rtol=0
+    )
+    torch.testing.assert_close(
+        reference_fp32.first_piola, torch.zeros(1, 3, 3), atol=2.0e-6, rtol=0
+    )
 
 
 def test_negative_determinant_barrier_is_finite_and_selective():
@@ -235,7 +273,10 @@ def test_cpu_cuda_mechanics_parity():
     cpu_nodes, cpu_cells = _unit_tetra(dtype=torch.float32)
     cpu_reference = precompute_tetrahedra(cpu_nodes, cpu_cells, density=2.0)
     cpu_f = deformation_gradient(cpu_nodes * torch.tensor([1.05, 0.97, 1.02]), cpu_cells, cpu_reference.dm_inv)
-    cpu_response = AnalyticPotential().eval()(cpu_f)
+    cpu_potential = AnalyticPotential(
+        ridge_terms=8, ridge_input_scales=[0.1, 0.1, 0.2]
+    ).eval()
+    cpu_response = cpu_potential(cpu_f)
     cpu_force = assemble_internal_force(
         cpu_response.first_piola,
         cpu_cells,
@@ -252,8 +293,10 @@ def test_cpu_cuda_mechanics_parity():
         gpu_cells,
         gpu_reference.dm_inv,
     )
-    gpu_potential = AnalyticPotential().eval().cuda()
-    gpu_potential.load_state_dict(AnalyticPotential().eval().state_dict())
+    gpu_potential = AnalyticPotential(
+        ridge_terms=8, ridge_input_scales=[0.1, 0.1, 0.2]
+    ).eval().cuda()
+    gpu_potential.load_state_dict(cpu_potential.state_dict())
     gpu_response = gpu_potential(gpu_f)
     gpu_force = assemble_internal_force(
         gpu_response.first_piola,
@@ -274,7 +317,9 @@ def test_cuda_bf16_autocast_keeps_all_analytic_mechanics_fp32():
     nodes = nodes.cuda().requires_grad_(True)
     cells = cells.cuda()
     reference = precompute_tetrahedra(nodes.detach(), cells)
-    potential = AnalyticPotential().cuda()
+    potential = AnalyticPotential(
+        ridge_terms=8, ridge_input_scales=[0.1, 0.1, 0.2]
+    ).cuda()
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
         deformation = deformation_gradient(
@@ -302,6 +347,13 @@ def test_cuda_bf16_autocast_keeps_all_analytic_mechanics_fp32():
     loss.backward()
     assert nodes.grad is not None
     assert torch.isfinite(nodes.grad).all()
+    for parameter in (
+        potential.raw_ridge,
+        potential.raw_ridge_directions,
+        potential.raw_ridge_centers,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_positive_material_multipliers_change_stress_but_not_reference_state():

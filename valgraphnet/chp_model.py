@@ -405,7 +405,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 7
+    dynamics_schema_version = 8
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -517,9 +517,21 @@ class CHPGNS(nn.Module):
             minimum_coefficient=float(
                 model_cfg.get("potential_minimum_coefficient", 1.0e-8)
             ),
+            ridge_terms=int(model_cfg.get("potential_ridge_terms", 0)),
+            ridge_init=float(model_cfg.get("potential_ridge_init", 1.0e-3)),
+            ridge_input_scales=model_cfg.get(
+                "potential_ridge_input_scales", [1.0, 1.0, 1.0]
+            ),
+            ridge_beta=float(model_cfg.get("potential_ridge_beta", 2.0)),
+            ridge_center_limit=float(
+                model_cfg.get("potential_ridge_center_limit", 4.0)
+            ),
         )
         self.material_coefficient_count = (
-            3 * self.potential.order + 1 + self.potential.fiber_order
+            3 * self.potential.order
+            + 1
+            + self.potential.fiber_order
+            + self.potential.ridge_terms
         )
         self.material_potential = None
         if self.material_dim:
@@ -564,6 +576,8 @@ class CHPGNS(nn.Module):
         }
         if self.potential.fiber_order:
             result["fiber"] = take(self.potential.fiber_order)
+        if self.potential.ridge_terms:
+            result["ridge"] = take(self.potential.ridge_terms)
         if offset != self.material_coefficient_count:
             raise RuntimeError("material potential coefficient partition is inconsistent")
         return result

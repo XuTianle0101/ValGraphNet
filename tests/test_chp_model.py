@@ -87,17 +87,20 @@ def test_reference_state_remains_static_and_has_zero_stress():
 
 
 def test_material_features_modulate_every_positive_potential_basis():
-    model = CHPGNS(_cfg(), material_dim=3)
+    cfg = _cfg()
+    cfg["model"]["potential_ridge_terms"] = 5
+    model = CHPGNS(cfg, material_dim=3)
     material = torch.tensor(
         [[2.0e5, 0.45, 1000.0], [9.0e5, 0.475, 1100.0]]
     )
     multipliers = model.material_coefficient_multipliers(material)
 
-    assert set(multipliers) == {"i1", "i2", "j", "log_j"}
+    assert set(multipliers) == {"i1", "i2", "j", "log_j", "ridge"}
     assert multipliers["i1"].shape == (2, model.potential.order)
     assert multipliers["i2"].shape == (2, model.potential.order)
     assert multipliers["j"].shape == (2, model.potential.order)
     assert multipliers["log_j"].shape == (2, 1)
+    assert multipliers["ridge"].shape == (2, 5)
     assert all(torch.all(value > 0.0) for value in multipliers.values())
     for value in multipliers.values():
         torch.testing.assert_close(value, torch.ones_like(value), atol=2.0e-6, rtol=0.0)

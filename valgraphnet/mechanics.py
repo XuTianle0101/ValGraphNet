@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import math
 from typing import Iterator, Mapping, Sequence
 
 import torch
@@ -391,6 +392,11 @@ class AnalyticPotential(nn.Module):
         minimum_j: float = 0.0,
         determinant_eps: float | None = None,
         minimum_coefficient: float = 1.0e-8,
+        ridge_terms: int = 0,
+        ridge_init: float = 1.0e-3,
+        ridge_input_scales: Sequence[float] = (1.0, 1.0, 1.0),
+        ridge_beta: float = 2.0,
+        ridge_center_limit: float = 4.0,
     ) -> None:
         super().__init__()
         self.order = int(order)
@@ -399,12 +405,27 @@ class AnalyticPotential(nn.Module):
         self.minimum_j = float(minimum_j)
         self.determinant_eps = determinant_eps
         self.minimum_coefficient = float(minimum_coefficient)
+        self.ridge_terms = int(ridge_terms)
+        self.ridge_beta = float(ridge_beta)
+        self.ridge_center_limit = float(ridge_center_limit)
         if self.inversion_stiffness < 0.0:
             raise ValueError("inversion_stiffness must be non-negative")
         if self.minimum_coefficient < 0.0:
             raise ValueError("minimum_coefficient must be non-negative")
         if self.fiber_order < 0:
             raise ValueError("fiber_order must be non-negative")
+        if self.ridge_terms < 0:
+            raise ValueError("ridge_terms must be non-negative")
+        if float(ridge_init) <= 0.0:
+            raise ValueError("ridge_init must be strictly positive")
+        if self.ridge_beta <= 0.0:
+            raise ValueError("ridge_beta must be strictly positive")
+        if self.ridge_center_limit <= 0.0:
+            raise ValueError("ridge_center_limit must be strictly positive")
+        ridge_scales = torch.as_tensor(list(ridge_input_scales), dtype=torch.float32)
+        if ridge_scales.shape != (3,) or bool(torch.any(ridge_scales <= 0.0)):
+            raise ValueError("ridge_input_scales must contain three positive values")
+        self.register_buffer("ridge_input_scales", ridge_scales)
 
         self.raw_i1 = nn.Parameter(
             _inverse_softplus(_initial_coefficients(i1_init, self.order, "i1_init"))
@@ -428,6 +449,36 @@ class AnalyticPotential(nn.Module):
             )
         else:
             self.register_parameter("raw_fiber", None)
+
+        if self.ridge_terms:
+            self.raw_ridge = nn.Parameter(
+                _inverse_softplus(
+                    torch.full((self.ridge_terms,), float(ridge_init), dtype=torch.float32)
+                )
+            )
+            # Deterministic approximately uniform directions on S^2 provide
+            # coupled I1/I2/J ridge bases without changing the global RNG.
+            index = torch.arange(self.ridge_terms, dtype=torch.float32)
+            z = 1.0 - 2.0 * (index + 0.5) / float(self.ridge_terms)
+            azimuth = index * (math.pi * (3.0 - math.sqrt(5.0)))
+            radial = torch.sqrt((1.0 - z.square()).clamp_min(0.0))
+            directions = torch.stack(
+                [radial * torch.cos(azimuth), radial * torch.sin(azimuth), z],
+                dim=1,
+            )
+            self.raw_ridge_directions = nn.Parameter(directions)
+            initial_centers = torch.linspace(
+                -0.625 * self.ridge_center_limit,
+                0.625 * self.ridge_center_limit,
+                self.ridge_terms,
+            )
+            self.raw_ridge_centers = nn.Parameter(
+                torch.atanh(initial_centers / self.ridge_center_limit)
+            )
+        else:
+            self.register_parameter("raw_ridge", None)
+            self.register_parameter("raw_ridge_directions", None)
+            self.register_parameter("raw_ridge_centers", None)
 
         if fiber_direction is None:
             self.register_buffer("default_fiber_direction", None)
@@ -458,6 +509,24 @@ class AnalyticPotential(nn.Module):
         if self.raw_fiber is None:
             return self.raw_i1.new_empty(0)
         return functional.softplus(self.raw_fiber) + self.minimum_coefficient
+
+    @property
+    def ridge_coefficients(self) -> torch.Tensor:
+        if self.raw_ridge is None:
+            return self.raw_i1.new_empty(0)
+        return functional.softplus(self.raw_ridge) + self.minimum_coefficient
+
+    @property
+    def ridge_directions(self) -> torch.Tensor:
+        if self.raw_ridge_directions is None:
+            return self.raw_i1.new_empty((0, 3))
+        return functional.normalize(self.raw_ridge_directions, dim=1, eps=1.0e-8)
+
+    @property
+    def ridge_centers(self) -> torch.Tensor:
+        if self.raw_ridge_centers is None:
+            return self.raw_i1.new_empty(0)
+        return self.ridge_center_limit * torch.tanh(self.raw_ridge_centers)
 
     def forward(
         self,
@@ -518,6 +587,44 @@ class AnalyticPotential(nn.Module):
         energy_j, derivative_j = _polynomial_energy_and_derivative(
             xj, j_coefficients
         )
+        ridge_energy = torch.zeros_like(x1)
+        ridge_derivative = torch.zeros((*x1.shape, 3), device=x1.device, dtype=x1.dtype)
+        if self.ridge_terms:
+            normalized_invariants = torch.stack([x1, x2, xj], dim=-1) / (
+                self.ridge_input_scales.to(device=work_f.device, dtype=work_f.dtype)
+            )
+            directions = self.ridge_directions.to(work_f.dtype)
+            centers = self.ridge_centers.to(work_f.dtype)
+            ridge_coordinate = normalized_invariants @ directions.T
+            beta = ridge_coordinate.new_tensor(self.ridge_beta)
+            reference_argument = -beta * centers
+            reference_value = functional.softplus(reference_argument) / beta
+            reference_slope = torch.sigmoid(reference_argument)
+            basis = (
+                functional.softplus(beta * (ridge_coordinate - centers)) / beta
+                - reference_value
+                - reference_slope * ridge_coordinate
+            )
+            basis_derivative = (
+                torch.sigmoid(beta * (ridge_coordinate - centers))
+                - reference_slope
+            )
+            ridge_coefficients = self._conditioned_coefficients(
+                self.ridge_coefficients,
+                multipliers.get("ridge"),
+                "ridge",
+                work_f,
+            )
+            ridge_energy = (ridge_coefficients * basis).sum(dim=-1)
+            normalized_derivative = (
+                ridge_coefficients * basis_derivative
+            ) @ directions
+            ridge_derivative = normalized_derivative / self.ridge_input_scales.to(
+                device=work_f.device, dtype=work_f.dtype
+            )
+            derivative_i1 = derivative_i1 + ridge_derivative[..., 0]
+            derivative_i2 = derivative_i2 + ridge_derivative[..., 1]
+            derivative_j = derivative_j + ridge_derivative[..., 2]
 
         identity = torch.eye(3, dtype=work_f.dtype, device=work_f.device)
         derivative_i1_bar = (
@@ -560,7 +667,7 @@ class AnalyticPotential(nn.Module):
             + derivative_i2[..., None, None] * derivative_i2_bar
             + (derivative_j + log_derivative)[..., None, None] * cofactor
         )
-        energy_density = energy_i1 + energy_i2 + energy_j + log_energy
+        energy_density = energy_i1 + energy_i2 + energy_j + ridge_energy + log_energy
 
         direction = fiber_direction
         if direction is None:
