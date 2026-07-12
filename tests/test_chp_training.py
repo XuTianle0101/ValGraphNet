@@ -13,6 +13,7 @@ from valgraphnet.chp_train import (
     _enforce_scientific_gates,
     _scientific_gate_status,
     _save_constitutive_gate_artifact,
+    _exact_constitutive_loss,
     acceleration_frame_scores,
     curriculum_horizon,
     fit_chp_normalizers,
@@ -21,12 +22,14 @@ from valgraphnet.chp_train import (
     pooled_positive_constitutive_scale,
     reaction_equilibrium_loss,
     load_native_reference,
+    run_constitutive_pretraining,
     select_rollout_start,
     stress_frame_scores,
     train_constitutive_epoch,
     validate_chp_checkpoint_semantics,
     validate_chp_problem_semantics,
 )
+from valgraphnet.stress_transform import AsinhStressTransform
 from valgraphnet.physical_evaluation import (
     CELL_TENSOR_STRESS_SOURCE,
     NODAL_STRESS_FALLBACK_SOURCE,
@@ -111,6 +114,102 @@ def test_constitutive_scale_minimizes_the_pooled_gate_objective():
         + target_square
     )
     assert selected_error < median_error
+
+
+def test_constitutive_loss_adds_non_saturating_gate_residual():
+    transform = AsinhStressTransform(
+        reference_scale=torch.tensor([2.0]),
+        mean=torch.tensor([0.0]),
+        std=torch.tensor([1.0]),
+    )
+    normalizers = SimpleNamespace(stress=transform)
+    prediction = torch.tensor([[4.0], [0.0]])
+    target = torch.zeros_like(prediction)
+    base_cfg = {
+        "loss": {
+            "stress_physical_weight": 0.0,
+            "stress_gate_mse_weight": 0.0,
+            "peak_weight": 0.0,
+        }
+    }
+    base, _ = _exact_constitutive_loss(
+        prediction, target, normalizers, base_cfg
+    )
+    aligned_cfg = json.loads(json.dumps(base_cfg))
+    aligned_cfg["loss"]["stress_gate_mse_weight"] = 1.0
+    aligned, metrics = _exact_constitutive_loss(
+        prediction, target, normalizers, aligned_cfg
+    )
+
+    torch.testing.assert_close(metrics["stress_gate_mse"], torch.tensor(2.0))
+    torch.testing.assert_close(aligned - base, torch.tensor(2.0))
+
+
+def test_closed_form_modulus_is_refit_after_each_shape_epoch(
+    monkeypatch, tmp_path
+):
+    class ShapeOnlyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.log_stress_scale = torch.nn.Parameter(torch.tensor(0.0))
+            self.potential = torch.nn.Linear(1, 1, bias=False)
+            self.material_potential = None
+
+    model = ShapeOnlyModel()
+    calibration_calls = []
+
+    def calibrate(model, cases, cache, cfg):
+        del cases, cache, cfg
+        calibration_calls.append(float(model.log_stress_scale.detach().exp()))
+        with torch.no_grad():
+            model.log_stress_scale.add_(torch.log(torch.tensor(2.0)))
+        return {
+            "physical_modulus": float(model.log_stress_scale.detach().exp()),
+            "scale_factor": 2.0,
+        }
+
+    def train_epoch(model, *args, **kwargs):
+        del args, kwargs
+        assert not model.log_stress_scale.requires_grad
+        return {
+            "loss": 0.0,
+            "physical_modulus": float(model.log_stress_scale.detach().exp()),
+        }
+
+    def validate(model, *args, **kwargs):
+        del args, kwargs
+        return {
+            "teacher_stress_relative_rmse": 1.0
+            / float(model.log_stress_scale.detach().exp()),
+            "teacher_stress_source": NODAL_STRESS_FALLBACK_SOURCE,
+            "teacher_stress_label_coverage": 1.0,
+        }
+
+    monkeypatch.setattr(chp_train_module, "calibrate_constitutive_modulus", calibrate)
+    monkeypatch.setattr(chp_train_module, "train_constitutive_epoch", train_epoch)
+    monkeypatch.setattr(chp_train_module, "evaluate_teacher_forced_stress", validate)
+    history = run_constitutive_pretraining(
+        model,
+        [],
+        [],
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            "constitutive_pretraining": {
+                "epochs": 2,
+                "lr": 1.0e-3,
+                "closed_form_scale_each_epoch": True,
+            }
+        },
+        tmp_path,
+        amp_dtype=torch.bfloat16,
+    )
+
+    assert len(calibration_calls) == 3
+    assert model.log_stress_scale.requires_grad
+    assert all("calibration" in record for record in history["epochs"])
+    assert history["selected_teacher_stress_relative_rmse"] == pytest.approx(0.125)
 
 
 def test_fixed_reaction_equilibrium_loss_uses_action_reaction_sign():

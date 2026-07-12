@@ -903,11 +903,13 @@ def load_native_reference(cfg: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
-def _constitutive_parameters(model: CHPGNS) -> list[torch.nn.Parameter]:
-    parameters: list[torch.nn.Parameter] = [
-        model.log_stress_scale,
-        *model.potential.parameters(),
-    ]
+def _constitutive_parameters(
+    model: CHPGNS, *, include_stress_scale: bool = True
+) -> list[torch.nn.Parameter]:
+    parameters: list[torch.nn.Parameter] = []
+    if include_stress_scale:
+        parameters.append(model.log_stress_scale)
+    parameters.extend(model.potential.parameters())
     if model.material_potential is not None:
         parameters.extend(model.material_potential.parameters())
     return parameters
@@ -1120,19 +1122,28 @@ def _exact_constitutive_loss(
     scale = normalizers.stress.reference_scale.to(
         prediction.device, prediction.dtype
     ).clamp_min(1.0e-8)
+    normalized_residual = (prediction - target) / scale
     physical = F.huber_loss(
-        (prediction - target) / scale,
+        normalized_residual,
         torch.zeros_like(prediction),
         delta=float(get_cfg(cfg, "loss.huber_delta", 1.0)),
     )
+    # The scientific gate is a pooled physical rRMSE.  Its denominator is
+    # fixed by the labels, so a non-saturating squared residual directly
+    # targets its numerator under the training sampler.  Keep asinh+Huber for
+    # the heavy-tailed bulk and add this term instead of replacing it.
+    gate_mse = normalized_residual.square().mean()
     total = transformed + float(
         get_cfg(cfg, "loss.stress_physical_weight", 0.25)
-    ) * physical
+    ) * physical + float(
+        get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0)
+    ) * gate_mse
     return total, {
         "loss": total.detach(),
         "stress_transformed": transformed.detach(),
         "stress_base": parts["stress_base"],
         "stress_physical": physical.detach(),
+        "stress_gate_mse": gate_mse.detach(),
         "stress_peak": parts["stress_peak"],
         "stress_tensor_supervision": total.new_zeros(()).detach(),
     }
@@ -1216,14 +1227,18 @@ def _cell_tensor_constitutive_loss(
     tensor_scale = tensor_transform.reference_scale.to(
         prediction6.device, prediction6.dtype
     ).clamp_min(1.0e-8)
+    tensor_normalized_residual = (prediction6 - target) / tensor_scale
     tensor_physical = F.huber_loss(
-        (prediction6 - target) / tensor_scale,
+        tensor_normalized_residual,
         torch.zeros_like(prediction6),
         delta=huber_delta,
     )
+    tensor_gate_mse = tensor_normalized_residual.square().mean()
     tensor_loss = tensor_transformed + float(
         get_cfg(cfg, "loss.stress_physical_weight", 0.25)
-    ) * tensor_physical
+    ) * tensor_physical + float(
+        get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0)
+    ) * tensor_gate_mse
 
     vm_prediction = prediction_vm[:, None]
     vm_target = target_vm[:, None]
@@ -1249,6 +1264,7 @@ def _cell_tensor_constitutive_loss(
         "stress_transformed": tensor_transformed.detach(),
         "stress_base": tensor_base.detach(),
         "stress_physical": tensor_physical.detach(),
+        "stress_gate_mse": tensor_gate_mse.detach(),
         "stress_peak": tensor_peak.detach(),
         "stress_tensor": tensor_loss.detach(),
         "stress_tensor_vm": vm_loss.detach(),
@@ -1359,7 +1375,12 @@ def train_constitutive_epoch(
         int(get_cfg(cfg, "constitutive_pretraining.frames_per_case", 8)), 1
     )
     case_indices = rng.choice(len(cases), size=case_count, replace=False)
-    parameters = _constitutive_parameters(model)
+    closed_form_scale = bool(
+        get_cfg(cfg, "constitutive_pretraining.closed_form_scale_each_epoch", False)
+    )
+    parameters = _constitutive_parameters(
+        model, include_stress_scale=not closed_form_scale
+    )
     totals: dict[str, float] = {}
     used_frames = 0
     skipped_frames = 0
@@ -1494,40 +1515,66 @@ def run_constitutive_pretraining(
     best_state = {
         key: value.detach().cpu().clone() for key, value in model.state_dict().items()
     }
+    closed_form_scale = bool(
+        get_cfg(cfg, "constitutive_pretraining.closed_form_scale_each_epoch", False)
+    )
     optimizer = torch.optim.Adam(
-        _constitutive_parameters(model),
+        _constitutive_parameters(
+            model, include_stress_scale=not closed_form_scale
+        ),
         lr=float(get_cfg(cfg, "constitutive_pretraining.lr", 1.0e-3)),
         weight_decay=0.0,
     )
     epochs = max(int(get_cfg(cfg, "constitutive_pretraining.epochs", 2)), 0)
-    for epoch in range(1, epochs + 1):
-        train_metrics = train_constitutive_epoch(
-            model,
-            train_cases,
-            train_cache,
-            normalizers,
-            optimizer,
-            cfg,
-            epoch=epoch,
-        )
-        validation = (
-            evaluate_teacher_forced_stress(
-                model, val_cases, val_cache, cfg, amp_dtype=amp_dtype
+    original_scale_requires_grad = bool(model.log_stress_scale.requires_grad)
+    if closed_form_scale:
+        model.log_stress_scale.requires_grad_(False)
+    try:
+        for epoch in range(1, epochs + 1):
+            train_metrics = train_constitutive_epoch(
+                model,
+                train_cases,
+                train_cache,
+                normalizers,
+                optimizer,
+                cfg,
+                epoch=epoch,
             )
-            if val_cases is not None and val_cache is not None
-            else {}
-        )
-        metric = float(validation.get("teacher_stress_relative_rmse", float("inf")))
-        if metric < best_metric:
-            best_metric = metric
-            best_validation = dict(validation)
-            best_state = {
-                key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
+            epoch_calibration = None
+            if closed_form_scale:
+                epoch_calibration = calibrate_constitutive_modulus(
+                    model, train_cases, train_cache, cfg
+                )
+                train_metrics["post_calibration_physical_modulus"] = float(
+                    epoch_calibration["physical_modulus"]
+                )
+            validation = (
+                evaluate_teacher_forced_stress(
+                    model, val_cases, val_cache, cfg, amp_dtype=amp_dtype
+                )
+                if val_cases is not None and val_cache is not None
+                else {}
+            )
+            metric = float(
+                validation.get("teacher_stress_relative_rmse", float("inf"))
+            )
+            if metric < best_metric:
+                best_metric = metric
+                best_validation = dict(validation)
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+            record: dict[str, Any] = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "validation": validation,
             }
-        history["epochs"].append(
-            {"epoch": epoch, "train": train_metrics, "validation": validation}
-        )
+            if epoch_calibration is not None:
+                record["calibration"] = epoch_calibration
+            history["epochs"].append(record)
+    finally:
+        model.log_stress_scale.requires_grad_(original_scale_requires_grad)
     model.load_state_dict(best_state)
     history["selected_teacher_stress_relative_rmse"] = best_metric
     history["selected_teacher_stress_source"] = best_validation.get(

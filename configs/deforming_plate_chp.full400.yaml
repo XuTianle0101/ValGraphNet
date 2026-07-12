@@ -68,6 +68,8 @@ loss:
   velocity: 1.0
   stress: 1.0
   stress_physical_weight: 0.25
+  # Non-saturating physical residual aligned with the pooled teacher gate.
+  stress_gate_mse_weight: 1.0
   exact_constitutive: 0.5
   work_energy: 0.1
   penetration: 1.0
@@ -84,6 +86,9 @@ constitutive_pretraining:
   minimum_scale_factor: 1.0e-3
   maximum_scale_factor: 1.0e4
   preserve_force_mass_ratio: true
+  # Refit the one identifiable global modulus on train-only frames after each
+  # shape update instead of letting Adam trade physical scale against asinh.
+  closed_form_scale_each_epoch: true
   epochs: 12
   cases_per_epoch: 256
   frames_per_case: 8
@@ -144,7 +149,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/deforming_plate_chp_ridge_full400_seed42
+  output_dir: outputs/deforming_plate_chp_gate_aligned_full400_seed42
   resume_from: auto
 
 validation:
