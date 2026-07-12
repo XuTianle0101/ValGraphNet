@@ -18,7 +18,11 @@ def conditional_variance_ratio(
     """Estimate Var(stress | nearby invariants) / Var(stress)."""
 
     features = np.asarray(invariants, dtype=np.float64)
-    target = np.asarray(stress, dtype=np.float64).reshape(-1)
+    target = np.asarray(stress, dtype=np.float64)
+    if target.ndim == 1:
+        target = target[:, None]
+    if target.ndim != 2:
+        raise ValueError("stress must have shape [N] or [N,D]")
     if features.ndim != 2 or features.shape[0] != target.shape[0]:
         raise ValueError("invariants and stress must share their sample dimension")
     if features.shape[0] < 3:
@@ -40,9 +44,32 @@ def conditional_variance_ratio(
             largest=False,
         ).indices.numpy()
     local = target[indices[:, 1:]]
-    conditional = float(np.mean(np.var(local, axis=1)))
-    global_variance = float(np.var(target))
+    conditional = float(np.var(local, axis=1).mean(axis=0).sum())
+    global_variance = float(np.var(target, axis=0).sum())
     return conditional / max(global_variance, 1.0e-30)
+
+
+def objective_stress_invariants(stress_tensor: np.ndarray) -> np.ndarray:
+    """Return hydrostatic stress and von-Mises stress from tensor6 labels."""
+
+    tensor = np.asarray(stress_tensor, dtype=np.float64)
+    if tensor.ndim != 2 or tensor.shape[1] < 6:
+        raise ValueError("cell stress tensor must have shape [N,6]")
+    s11, s22, s33, s12, s13, s23 = [tensor[:, index] for index in range(6)]
+    mean = (s11 + s22 + s33) / 3.0
+    von_mises = np.sqrt(
+        np.maximum(
+            0.5
+            * (
+                (s11 - s22) ** 2
+                + (s22 - s33) ** 2
+                + (s33 - s11) ** 2
+                + 6.0 * (s12**2 + s13**2 + s23**2)
+            ),
+            0.0,
+        )
+    )
+    return np.stack([mean, von_mises], axis=1)
 
 
 def sample_constitutive_pairs(
@@ -93,16 +120,35 @@ def sample_constitutive_pairs(
             )
             j = np.linalg.det(deformation)
             safe_j = np.maximum(j, 1.0e-8)
-            feature_parts.append(
-                np.stack(
-                    [i1 * safe_j ** (-2.0 / 3.0), i2 * safe_j ** (-4.0 / 3.0), j],
+            constitutive_features = np.stack(
+                [i1 * safe_j ** (-2.0 / 3.0), i2 * safe_j ** (-4.0 / 3.0), j],
+                axis=1,
+            )
+            if case.fiber_direction.shape == (case.num_cells, 3):
+                fiber = case.fiber_direction[cell_ids].astype(np.float64)
+                fiber_norm = np.linalg.norm(fiber, axis=1, keepdims=True)
+                unit_fiber = fiber / np.maximum(fiber_norm, 1.0e-12)
+                fiber_stretch = np.einsum(
+                    "ni,nij,nj->n", unit_fiber, c, unit_fiber
+                )[:, None]
+                constitutive_features = np.concatenate(
+                    [constitutive_features, fiber_stretch], axis=1
+                )
+            if case.material_features.shape[1] > 0:
+                constitutive_features = np.concatenate(
+                    [
+                        constitutive_features,
+                        case.material_features[cell_ids].astype(np.float64),
+                    ],
                     axis=1,
                 )
-            )
-            if case.cell_stress.shape[-1] > 0:
-                cell_stress = case.cell_stress[frame, cell_ids, 0]
+            feature_parts.append(constitutive_features)
+            if case.cell_stress.shape[-1] >= 6:
+                cell_stress = objective_stress_invariants(
+                    case.cell_stress[frame, cell_ids, :6]
+                )
             else:
-                cell_stress = case.stress[frame, connectivity, 0].mean(axis=1)
+                cell_stress = case.stress[frame, connectivity, 0].mean(axis=1)[:, None]
             stress_parts.append(np.asarray(cell_stress, dtype=np.float64))
     features = np.concatenate(feature_parts)
     targets = np.concatenate(stress_parts)
@@ -146,7 +192,11 @@ def main() -> None:
         "conditional_to_global_variance": ratio,
         "trigger_threshold": float(args.threshold),
         "enable_cell_memory": bool(ratio > args.threshold),
-        "stress_source": "cell tensor if available, otherwise tetra nodal mean",
+        "stress_source": (
+            "objective cell mean/von-Mises invariants when tensor6 is available; "
+            "otherwise tetra nodal scalar mean"
+        ),
+        "conditioning": "strain invariants, optional fiber stretch, material features",
     }
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
