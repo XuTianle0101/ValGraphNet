@@ -364,6 +364,55 @@ def _polynomial_energy_and_derivative(
     return energy, derivative
 
 
+class _AnalyticInvariantFeatureMap(nn.Module):
+    """Two-layer SiLU feature map with an explicitly propagated Jacobian."""
+
+    def __init__(self, hidden_dim: int, output_dim: int) -> None:
+        super().__init__()
+        if int(hidden_dim) < 1 or int(output_dim) < 1:
+            raise ValueError("feature hidden/output dimensions must be positive")
+        self.first = nn.Linear(3, int(hidden_dim))
+        self.second = nn.Linear(int(hidden_dim), int(output_dim))
+
+    @staticmethod
+    def _silu_and_derivative(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sigmoid = torch.sigmoid(value)
+        activation = value * sigmoid
+        derivative = sigmoid * (1.0 + value * (1.0 - sigmoid))
+        return activation, derivative
+
+    @staticmethod
+    def _linear(
+        value: torch.Tensor, layer: nn.Linear
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        weight = layer.weight.to(device=value.device, dtype=value.dtype)
+        bias = (
+            None
+            if layer.bias is None
+            else layer.bias.to(device=value.device, dtype=value.dtype)
+        )
+        return functional.linear(value, weight, bias), weight, bias
+
+    def value_and_jacobian(
+        self, normalized_invariants: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``h(z)`` and ``dh/dz`` using tensor operations only."""
+
+        z = torch.as_tensor(normalized_invariants)
+        if z.shape[-1:] != (3,):
+            raise ValueError("normalized invariants must have shape [...,3]")
+        first_pre, first_weight, _ = self._linear(z, self.first)
+        first_value, first_derivative = self._silu_and_derivative(first_pre)
+        first_jacobian = first_derivative[..., :, None] * first_weight
+        second_pre, second_weight, _ = self._linear(first_value, self.second)
+        second_value, second_derivative = self._silu_and_derivative(second_pre)
+        second_linear_jacobian = torch.einsum(
+            "oh,...hi->...oi", second_weight, first_jacobian
+        )
+        jacobian = second_derivative[..., :, None] * second_linear_jacobian
+        return second_value, jacobian
+
+
 class AnalyticPotential(nn.Module):
     """Objective hyperelastic potential with an explicit first derivative.
 
@@ -401,6 +450,10 @@ class AnalyticPotential(nn.Module):
         ridge_mode: str = "coupled",
         ridge_train_directions: bool = True,
         ridge_train_centers: bool = True,
+        feature_hidden_dim: int = 32,
+        feature_output_dim: int = 0,
+        feature_input_scales: Sequence[float] = (1.0, 1.0, 1.0),
+        feature_coefficient_init: float = 1.0e-3,
     ) -> None:
         super().__init__()
         self.order = int(order)
@@ -414,6 +467,8 @@ class AnalyticPotential(nn.Module):
         self.ridge_center_limit = float(ridge_center_limit)
         self.ridge_curvature_normalization = bool(ridge_curvature_normalization)
         self.ridge_mode = str(ridge_mode).lower()
+        self.feature_hidden_dim = int(feature_hidden_dim)
+        self.feature_output_dim = int(feature_output_dim)
         if self.inversion_stiffness < 0.0:
             raise ValueError("inversion_stiffness must be non-negative")
         if self.minimum_coefficient < 0.0:
@@ -430,10 +485,28 @@ class AnalyticPotential(nn.Module):
             raise ValueError("ridge_center_limit must be strictly positive")
         if self.ridge_mode not in {"coupled", "separable"}:
             raise ValueError("ridge_mode must be 'coupled' or 'separable'")
+        if self.feature_hidden_dim < 1:
+            raise ValueError("feature_hidden_dim must be positive")
+        if self.feature_output_dim < 0:
+            raise ValueError("feature_output_dim must be non-negative")
+        if float(feature_coefficient_init) <= 0.0:
+            raise ValueError("feature_coefficient_init must be strictly positive")
         ridge_scales = torch.as_tensor(list(ridge_input_scales), dtype=torch.float32)
         if ridge_scales.shape != (3,) or bool(torch.any(ridge_scales <= 0.0)):
             raise ValueError("ridge_input_scales must contain three positive values")
         self.register_buffer("ridge_input_scales", ridge_scales)
+        feature_scales = torch.as_tensor(
+            list(feature_input_scales), dtype=torch.float32
+        )
+        if feature_scales.shape != (3,) or bool(torch.any(feature_scales <= 0.0)):
+            raise ValueError("feature_input_scales must contain three positive values")
+        # The scales are immutable experiment configuration rather than learned
+        # state.  Keeping them non-persistent lets feature-disabled schema-v2
+        # checkpoints continue to load strictly after this optional branch is
+        # introduced.
+        self.register_buffer(
+            "feature_input_scales", feature_scales, persistent=False
+        )
 
         self.raw_i1 = nn.Parameter(
             _inverse_softplus(_initial_coefficients(i1_init, self.order, "i1_init"))
@@ -481,6 +554,23 @@ class AnalyticPotential(nn.Module):
             self.register_parameter("raw_ridge_directions", None)
             self.register_parameter("raw_ridge_centers", None)
 
+        if self.feature_output_dim:
+            self.feature_map = _AnalyticInvariantFeatureMap(
+                self.feature_hidden_dim, self.feature_output_dim
+            )
+            self.raw_feature_coefficients = nn.Parameter(
+                _inverse_softplus(
+                    torch.full(
+                        (self.feature_output_dim,),
+                        float(feature_coefficient_init),
+                        dtype=torch.float32,
+                    )
+                )
+            )
+        else:
+            self.feature_map = None
+            self.register_parameter("raw_feature_coefficients", None)
+
         if fiber_direction is None:
             self.register_buffer("default_fiber_direction", None)
         else:
@@ -518,6 +608,76 @@ class AnalyticPotential(nn.Module):
         coefficients = functional.softplus(self.raw_ridge) + self.minimum_coefficient
         return coefficients * self._ridge_basis_scales.to(
             device=coefficients.device, dtype=coefficients.dtype
+        )
+
+    @property
+    def feature_coefficients(self) -> torch.Tensor:
+        if self.raw_feature_coefficients is None:
+            return self.raw_i1.new_empty(0)
+        return (
+            functional.softplus(self.raw_feature_coefficients)
+            + self.minimum_coefficient
+        )
+
+    def neural_feature_energy_and_derivative(
+        self,
+        normalized_invariants: torch.Tensor,
+        coefficient_multiplier: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return non-negative feature energy and explicit ``dpsi/dz``.
+
+        The reference feature value is evaluated with the same parameters and
+        subtracted before squaring.  Consequently both feature energy and its
+        first derivative are exactly zero at ``z=0``.
+        """
+
+        z = torch.as_tensor(normalized_invariants)
+        if z.shape[-1:] != (3,):
+            raise ValueError("normalized invariants must have shape [...,3]")
+        if self.feature_map is None:
+            return z.new_zeros(z.shape[:-1]), torch.zeros_like(z)
+        feature, jacobian = self.feature_map.value_and_jacobian(z)
+        # The reference is global for a material law.  Evaluate it once and
+        # broadcast instead of materializing a redundant [*batch,K,3]
+        # reference Jacobian for every tetrahedron/frame.
+        reference, _ = self.feature_map.value_and_jacobian(z.new_zeros(3))
+        difference = feature - reference
+        # GEMV (reference) and batched GEMM (features) can differ by a few
+        # round-off bits even for an exactly zero input.  Preserve the model's
+        # exact reference-state contract explicitly.
+        at_reference = (z == 0.0).all(dim=-1, keepdim=True)
+        difference = torch.where(at_reference, torch.zeros_like(difference), difference)
+        coefficients = self._conditioned_coefficients(
+            self.feature_coefficients,
+            coefficient_multiplier,
+            "feature",
+            z,
+        )
+        energy = (coefficients * difference.square()).sum(dim=-1)
+        derivative = torch.einsum(
+            "...k,...ki->...i",
+            2.0 * coefficients * difference,
+            jacobian,
+        )
+        return energy, derivative
+
+    def neural_feature_reference_hessian(self) -> torch.Tensor:
+        """Return the analytic feature Hessian w.r.t. raw invariant offsets."""
+
+        if self.feature_map is None:
+            return self.raw_i1.new_zeros((3, 3))
+        zero = self.raw_i1.new_zeros(3)
+        _, jacobian = self.feature_map.value_and_jacobian(zero)
+        normalized_hessian = 2.0 * torch.einsum(
+            "k,ki,kj->ij", self.feature_coefficients, jacobian, jacobian
+        )
+        inverse_scale = self.feature_input_scales.reciprocal().to(
+            device=normalized_hessian.device, dtype=normalized_hessian.dtype
+        )
+        return (
+            inverse_scale[:, None]
+            * normalized_hessian
+            * inverse_scale[None, :]
         )
 
     def _initial_ridge_geometry(
@@ -715,6 +875,25 @@ class AnalyticPotential(nn.Module):
             derivative_i2 = derivative_i2 + ridge_derivative[..., 1]
             derivative_j = derivative_j + ridge_derivative[..., 2]
 
+        feature_energy = torch.zeros_like(x1)
+        if self.feature_output_dim:
+            feature_scales = self.feature_input_scales.to(
+                device=work_f.device, dtype=work_f.dtype
+            )
+            normalized_invariants = torch.stack([x1, x2, xj], dim=-1) / (
+                feature_scales
+            )
+            feature_energy, normalized_feature_derivative = (
+                self.neural_feature_energy_and_derivative(
+                    normalized_invariants,
+                    multipliers.get("feature"),
+                )
+            )
+            feature_derivative = normalized_feature_derivative / feature_scales
+            derivative_i1 = derivative_i1 + feature_derivative[..., 0]
+            derivative_i2 = derivative_i2 + feature_derivative[..., 1]
+            derivative_j = derivative_j + feature_derivative[..., 2]
+
         identity = torch.eye(3, dtype=work_f.dtype, device=work_f.device)
         derivative_i1_bar = (
             2.0 * j_safe.pow(-2.0 / 3.0)[..., None, None] * work_f
@@ -756,7 +935,14 @@ class AnalyticPotential(nn.Module):
             + derivative_i2[..., None, None] * derivative_i2_bar
             + (derivative_j + log_derivative)[..., None, None] * cofactor
         )
-        energy_density = energy_i1 + energy_i2 + energy_j + ridge_energy + log_energy
+        energy_density = (
+            energy_i1
+            + energy_i2
+            + energy_j
+            + ridge_energy
+            + feature_energy
+            + log_energy
+        )
 
         direction = fiber_direction
         if direction is None:

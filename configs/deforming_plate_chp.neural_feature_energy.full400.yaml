@@ -1,0 +1,166 @@
+# CHP-GNS analytic neural-feature potential experiment. Training and rollout
+# are CUDA-only; the neural graph uses BF16 while all mechanics stays FP32.
+seed: 42
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+  noise_std: 0.003
+  pressure_sign: 1.0
+
+model:
+  scalar_dim: 96
+  vector_dim: 16
+  cell_dim: 64
+  potential_order: 2
+  normalize_potential_scale: true
+  potential_i1_init: [0.5, 1.0e-6]
+  potential_i2_init: [0.01, 1.0e-10]
+  potential_j_init: [1.0, 0.1]
+  potential_log_j_init: 1.0
+  potential_minimum_coefficient: 1.0e-12
+  # Isolate the new conservative feature potential from the earlier fixed
+  # ridge basis. The analytic polynomial base and log-J barrier remain active.
+  potential_ridge_terms: 0
+  potential_feature_hidden_dim: 32
+  potential_feature_output_dim: 32
+  # Train-only invariant-offset standard deviations from the formal
+  # direct-control split. Do not center: identity must remain exactly z=0.
+  # In particular, the I2 scale avoids the 16x amplification caused by
+  # reusing the former local ridge scale.
+  potential_feature_input_scales: [0.0291458, 0.2913425, 0.0121148]
+  potential_feature_coefficient_init: 1.0e-3
+  fiber_order: 0
+  inversion_stiffness: 10.0
+  minimum_j: 0.0
+  contact_substeps: 2
+  contact_tangential_ratio_cap: 1.0
+  residual_acceleration_reference: 1.9e-4
+  residual_acceleration_cap: 3.0e-3
+  residual_activity_scale: 1.0e-2
+  residual_activity_diffusion_steps: 2
+  integration_minimum_j: 1.0e-4
+  integration_maximum_i2_bar: 1.0e6
+  integration_backtracks: 8
+  activation_checkpointing: true
+  initial_stress_scale: 1.0e4
+  initial_mass_scale: 1.0e16
+  initial_contact_scale: 1.0e-5
+  initial_damping_scale: 0.1
+
+contact:
+  enabled: true
+  radius: 0.03
+  max_neighbors: 32
+  refresh_each_substep: true
+
+loss:
+  position: 1.0
+  velocity: 1.0
+  stress: 1.0
+  stress_physical_weight: 0.25
+  stress_gate_mse_weight: 1.0
+  exact_constitutive: 0.5
+  work_energy: 0.1
+  penetration: 1.0
+  residual: 0.01
+  negative_j: 10.0
+  huber_delta: 1.0
+  peak_fraction: 0.1
+  peak_weight: 0.5
+
+constitutive_pretraining:
+  enabled: true
+  calibration_cases: 32
+  calibration_frames: 8
+  scale_estimator: winsorized_relative
+  calibration_leverage_quantile: 0.99
+  minimum_scale_factor: 1.0e-3
+  maximum_scale_factor: 1.0e4
+  preserve_force_mass_ratio: true
+  closed_form_scale_each_epoch: true
+  epochs: 12
+  cases_per_epoch: 256
+  frames_per_case: 8
+  lr: 1.0e-3
+  grad_clip_norm: 10.0
+
+dynamics_pretraining:
+  enabled: true
+  epochs: 3
+  head_warmup_epochs: 1
+  trajectories_per_epoch: 500
+  validation_cases: 10
+  validation_frames: 8
+  lr: 1.0e-4
+  head_warmup_lr: 1.0e-3
+  joint_head_lr: 5.0e-4
+  weight_decay: 1.0e-6
+  grad_clip_norm: 1.0
+  position_weight: 0.25
+  velocity_weight: 0.25
+  acceleration_weight: 1.0
+  direction_weight: 0.25
+  quiet_weight: 0.05
+  active_node_fraction: 0.2
+  active_threshold: 0.05
+  stress_weight: 0.1
+  residual_weight: 1.0e-3
+
+training:
+  device: cuda
+  amp: true
+  amp_dtype: bfloat16
+  epochs: 16
+  curriculum:
+    - {horizon: 1, epochs: 4}
+    - {horizon: 2, epochs: 3}
+    - {horizon: 4, epochs: 3}
+    - {horizon: 8, epochs: 3}
+    - {horizon: 16, epochs: 3}
+  tbptt_chunk: 4
+  checkpoint_min_horizon: 8
+  pushforward_stop_gradient: true
+  noise_smoothing_steps: 4
+  noise_min_j: 0.2
+  noise_backtracks: 8
+  noise_maximum_invariant_growth: 2.0
+  minimum_start_j: 0.01
+  maximum_start_i2_bar: 1.0e5
+  maximum_start_resamples: 16
+  trajectories_per_epoch: 1000
+  lr: 1.0e-4
+  constitutive_lr_scale: 0.1
+  weight_decay: 1.0e-6
+  warmup_steps: 500
+  grad_clip_norm: 1.0
+  fused_optimizer: true
+  gpu_case_cache_size: 3
+  normalizer_cases: 128
+  normalizer_frames: 8
+  normalizer_nodes: 256
+  output_dir: outputs/deforming_plate_chp_neural_feature_energy_full400_seed42
+  resume_from: auto
+
+validation:
+  stage_end_only: true
+  cases: 20
+  steps: 399
+  teacher_stress_cases: 20
+  teacher_stress_frames: 16
+  teacher_stress_threshold: 0.50
+  enforce_teacher_stress_gate: true
+  enforce_rollout_pilot_gate: true
+  pilot_moving_relative_rmse_threshold: 0.80
+  pilot_stress_relative_rmse_threshold: 0.65
+  gpu_case_cache_size: 2
+  divergence_position: 10.0
+  minimum_predicted_j: 1.0e-4
+  maximum_predicted_i2_bar: 1.0e6
+  require_native_reference_provenance: true
+  native_reference_split: val
+  native_reference_case_selection: even
+  native_reference_file: outputs/deforming_plate_chp_evidence/native_val20/metrics.json

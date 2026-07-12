@@ -116,6 +116,9 @@ def test_rigid_rotation_preserves_energy_and_rotates_stress():
         fiber_order=1,
         ridge_terms=8,
         ridge_input_scales=[0.1, 0.1, 0.2],
+        feature_hidden_dim=8,
+        feature_output_dim=6,
+        feature_input_scales=[0.1, 0.1, 0.2],
     ).double()
     deformation = torch.tensor(
         [[[1.08, 0.08, 0.0], [0.02, 0.94, 0.04], [0.0, 0.03, 1.02]]],
@@ -166,11 +169,16 @@ def test_assembled_internal_force_has_zero_resultant_and_projection_is_weighted(
 
 
 def test_closed_form_first_piola_matches_energy_finite_difference():
+    torch.manual_seed(19)
     potential = AnalyticPotential(
         order=2,
         fiber_order=1,
         ridge_terms=12,
         ridge_input_scales=[0.1, 0.1, 0.2],
+        feature_hidden_dim=8,
+        feature_output_dim=6,
+        feature_input_scales=[0.1, 0.1, 0.2],
+        feature_coefficient_init=0.02,
         i1_init=[0.7, 0.04],
         i2_init=[0.2, 0.03],
         j_init=[1.3, 0.08],
@@ -192,6 +200,76 @@ def test_closed_form_first_piola_matches_energy_finite_difference():
             finite_difference[0, row, column] = (energy_plus - energy_minus) / (2.0 * epsilon)
 
     torch.testing.assert_close(analytical, finite_difference, atol=2.0e-8, rtol=2.0e-6)
+
+
+def test_neural_feature_potential_is_reference_zero_nonnegative_and_psd():
+    torch.manual_seed(23)
+    potential = AnalyticPotential(
+        feature_hidden_dim=8,
+        feature_output_dim=7,
+        feature_input_scales=[0.1, 0.2, 0.3],
+        feature_coefficient_init=0.03,
+    ).double()
+    zero = torch.zeros(4, 3, dtype=torch.float64)
+    reference_energy, reference_derivative = (
+        potential.neural_feature_energy_and_derivative(zero)
+    )
+    torch.testing.assert_close(
+        reference_energy, torch.zeros(4, dtype=torch.float64), atol=0.0, rtol=0.0
+    )
+    torch.testing.assert_close(
+        reference_derivative, torch.zeros_like(zero), atol=0.0, rtol=0.0
+    )
+
+    normalized_invariants = torch.tensor(
+        [[0.2, -0.1, 0.4], [-0.5, 0.3, -0.2], [1.0, 0.7, 0.1]],
+        dtype=torch.float64,
+    )
+    energy, derivative = potential.neural_feature_energy_and_derivative(
+        normalized_invariants
+    )
+    assert torch.all(energy >= 0.0)
+    assert torch.isfinite(derivative).all()
+    assert torch.all(potential.feature_coefficients > 0.0)
+
+    hessian = potential.neural_feature_reference_hessian()
+    torch.testing.assert_close(hessian, hessian.T, atol=1.0e-12, rtol=0.0)
+    assert torch.linalg.eigvalsh(hessian).min().item() >= -1.0e-12
+
+    response = potential(torch.eye(3, dtype=torch.float64)[None])
+    torch.testing.assert_close(
+        response.energy_density, torch.zeros(1, dtype=torch.float64), atol=1.0e-12, rtol=0.0
+    )
+    torch.testing.assert_close(
+        response.first_piola,
+        torch.zeros(1, 3, 3, dtype=torch.float64),
+        atol=1.0e-11,
+        rtol=0.0,
+    )
+
+
+def test_neural_feature_parameters_receive_finite_gradients():
+    torch.manual_seed(29)
+    potential = AnalyticPotential(
+        feature_hidden_dim=7,
+        feature_output_dim=5,
+        feature_input_scales=[0.1, 0.1, 0.2],
+        feature_coefficient_init=0.02,
+    ).double()
+    deformation = torch.tensor(
+        [[[1.08, 0.04, 0.0], [0.01, 0.96, 0.03], [0.0, 0.02, 1.03]]],
+        dtype=torch.float64,
+    )
+    response = potential(deformation)
+    (response.energy_density.sum() + response.first_piola.square().sum()).backward()
+
+    parameters = [
+        potential.raw_feature_coefficients,
+        *potential.feature_map.parameters(),
+    ]
+    for parameter in parameters:
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_convex_ridge_basis_has_zero_reference_energy_and_stress():
@@ -341,7 +419,11 @@ def test_cpu_cuda_mechanics_parity():
     cpu_reference = precompute_tetrahedra(cpu_nodes, cpu_cells, density=2.0)
     cpu_f = deformation_gradient(cpu_nodes * torch.tensor([1.05, 0.97, 1.02]), cpu_cells, cpu_reference.dm_inv)
     cpu_potential = AnalyticPotential(
-        ridge_terms=8, ridge_input_scales=[0.1, 0.1, 0.2]
+        ridge_terms=8,
+        ridge_input_scales=[0.1, 0.1, 0.2],
+        feature_hidden_dim=8,
+        feature_output_dim=6,
+        feature_input_scales=[0.1, 0.1, 0.2],
     ).eval()
     cpu_response = cpu_potential(cpu_f)
     cpu_force = assemble_internal_force(
@@ -361,7 +443,11 @@ def test_cpu_cuda_mechanics_parity():
         gpu_reference.dm_inv,
     )
     gpu_potential = AnalyticPotential(
-        ridge_terms=8, ridge_input_scales=[0.1, 0.1, 0.2]
+        ridge_terms=8,
+        ridge_input_scales=[0.1, 0.1, 0.2],
+        feature_hidden_dim=8,
+        feature_output_dim=6,
+        feature_input_scales=[0.1, 0.1, 0.2],
     ).eval().cuda()
     gpu_potential.load_state_dict(cpu_potential.state_dict())
     gpu_response = gpu_potential(gpu_f)
@@ -385,7 +471,11 @@ def test_cuda_bf16_autocast_keeps_all_analytic_mechanics_fp32():
     cells = cells.cuda()
     reference = precompute_tetrahedra(nodes.detach(), cells)
     potential = AnalyticPotential(
-        ridge_terms=8, ridge_input_scales=[0.1, 0.1, 0.2]
+        ridge_terms=8,
+        ridge_input_scales=[0.1, 0.1, 0.2],
+        feature_hidden_dim=8,
+        feature_output_dim=6,
+        feature_input_scales=[0.1, 0.1, 0.2],
     ).cuda()
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -418,6 +508,8 @@ def test_cuda_bf16_autocast_keeps_all_analytic_mechanics_fp32():
         potential.raw_ridge,
         potential.raw_ridge_directions,
         potential.raw_ridge_centers,
+        potential.raw_feature_coefficients,
+        *potential.feature_map.parameters(),
     ):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()

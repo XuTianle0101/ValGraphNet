@@ -14,6 +14,7 @@ from valgraphnet.chp_model import (
     tetra_surface_node_mask,
     unique_undirected_pairs,
 )
+from valgraphnet.config import load_config
 from valgraphnet.data.case import ValveCase
 from valgraphnet.mechanics import deformation_gradient
 
@@ -103,21 +104,53 @@ def test_reference_state_remains_static_and_has_zero_stress():
 def test_material_features_modulate_every_positive_potential_basis():
     cfg = _cfg()
     cfg["model"]["potential_ridge_terms"] = 5
+    cfg["model"]["potential_feature_hidden_dim"] = 6
+    cfg["model"]["potential_feature_output_dim"] = 4
+    cfg["model"]["potential_feature_input_scales"] = [0.1, 0.2, 0.3]
     model = CHPGNS(cfg, material_dim=3)
     material = torch.tensor(
         [[2.0e5, 0.45, 1000.0], [9.0e5, 0.475, 1100.0]]
     )
     multipliers = model.material_coefficient_multipliers(material)
 
-    assert set(multipliers) == {"i1", "i2", "j", "log_j", "ridge"}
+    assert set(multipliers) == {
+        "i1",
+        "i2",
+        "j",
+        "log_j",
+        "ridge",
+        "feature",
+    }
     assert multipliers["i1"].shape == (2, model.potential.order)
     assert multipliers["i2"].shape == (2, model.potential.order)
     assert multipliers["j"].shape == (2, model.potential.order)
     assert multipliers["log_j"].shape == (2, 1)
     assert multipliers["ridge"].shape == (2, 5)
+    assert multipliers["feature"].shape == (2, 4)
     assert all(torch.all(value > 0.0) for value in multipliers.values())
     for value in multipliers.values():
         torch.testing.assert_close(value, torch.ones_like(value), atol=2.0e-6, rtol=0.0)
+
+
+def test_neural_feature_experiment_config_is_isolated_and_scale_aware():
+    cfg = load_config(
+        "configs/deforming_plate_chp.neural_feature_energy.full400.yaml"
+    )
+    model_cfg = cfg["model"]
+
+    assert model_cfg["potential_ridge_terms"] == 0
+    assert model_cfg["potential_feature_hidden_dim"] == 32
+    assert model_cfg["potential_feature_output_dim"] == 32
+    assert model_cfg["potential_feature_input_scales"] == [
+        0.0291458,
+        0.2913425,
+        0.0121148,
+    ]
+    assert cfg["training"]["device"] == "cuda"
+    assert cfg["training"]["amp_dtype"] == "bfloat16"
+    assert cfg["training"]["output_dir"].endswith(
+        "deforming_plate_chp_neural_feature_energy_full400_seed42"
+    )
 
 
 def test_cell_node_incidence_block_is_rotation_equivariant():

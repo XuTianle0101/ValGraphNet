@@ -636,12 +636,25 @@ class CHPGNS(nn.Module):
             ridge_train_centers=bool(
                 model_cfg.get("potential_ridge_train_centers", True)
             ),
+            feature_hidden_dim=int(
+                model_cfg.get("potential_feature_hidden_dim", 32)
+            ),
+            feature_output_dim=int(
+                model_cfg.get("potential_feature_output_dim", 0)
+            ),
+            feature_input_scales=model_cfg.get(
+                "potential_feature_input_scales", [1.0, 1.0, 1.0]
+            ),
+            feature_coefficient_init=float(
+                model_cfg.get("potential_feature_coefficient_init", 1.0e-3)
+            ),
         )
         self.material_coefficient_count = (
             3 * self.potential.order
             + 1
             + self.potential.fiber_order
             + self.potential.ridge_terms
+            + self.potential.feature_output_dim
         )
         self.material_potential = None
         if self.material_dim:
@@ -688,6 +701,8 @@ class CHPGNS(nn.Module):
             result["fiber"] = take(self.potential.fiber_order)
         if self.potential.ridge_terms:
             result["ridge"] = take(self.potential.ridge_terms)
+        if self.potential.feature_output_dim:
+            result["feature"] = take(self.potential.feature_output_dim)
         if offset != self.material_coefficient_count:
             raise RuntimeError("material potential coefficient partition is inconsistent")
         return result
