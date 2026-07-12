@@ -98,33 +98,118 @@ class VectorChannelLinear(nn.Module):
 
 
 class CellNodeBlock(nn.Module):
-    def __init__(self, node_dim: int = 96, cell_dim: int = 64) -> None:
+    """Rotation-equivariant messages on tetrahedron--vertex incidences.
+
+    Cells carry scalar constitutive state.  A cell-to-node vector message can
+    only point along the centroid-to-vertex direction, while its learned
+    weight depends exclusively on scalar invariants.  Consequently the block
+    is translation invariant and O(3)-equivariant without choosing a global
+    coordinate frame.
+    """
+
+    def __init__(
+        self,
+        node_dim: int = 96,
+        vector_dim: int = 16,
+        cell_dim: int = 64,
+    ) -> None:
         super().__init__()
-        self.cell_update = nn.Sequential(
-            nn.Linear(cell_dim + node_dim, cell_dim),
+        self.node_dim = int(node_dim)
+        self.vector_dim = int(vector_dim)
+        self.cell_dim = int(cell_dim)
+        invariant_dim = self.node_dim + self.cell_dim + 1 + 2 * self.vector_dim
+        self.node_to_cell = nn.Sequential(
+            nn.Linear(invariant_dim, self.cell_dim),
             nn.SiLU(),
-            nn.Linear(cell_dim, cell_dim),
+            nn.Linear(self.cell_dim, self.cell_dim),
         )
-        self.node_update = nn.Sequential(
-            nn.Linear(node_dim + cell_dim, node_dim),
+        self.cell_to_node = nn.Sequential(
+            nn.Linear(invariant_dim, self.node_dim),
             nn.SiLU(),
-            nn.Linear(node_dim, node_dim),
+            nn.Linear(self.node_dim, self.node_dim + self.vector_dim),
         )
-        self.cell_norm = nn.LayerNorm(cell_dim)
-        self.node_norm = nn.LayerNorm(node_dim)
+        self.vector_gate = nn.Sequential(
+            nn.Linear(self.node_dim, self.vector_dim), nn.Sigmoid()
+        )
+        self.cell_norm = nn.LayerNorm(self.cell_dim)
+        self.node_norm = nn.LayerNorm(self.node_dim)
+
+    def _incidence_invariants(
+        self,
+        node: torch.Tensor,
+        vector: torch.Tensor,
+        cell: torch.Tensor,
+        cells: torch.Tensor,
+        position: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        vertices_per_cell = int(cells.shape[1])
+        centroid = position[cells].mean(dim=1)
+        relative = position[cells] - centroid[:, None, :]
+        distance = torch.linalg.vector_norm(relative, dim=-1, keepdim=True).clamp_min(
+            1.0e-8
+        )
+        direction = relative / distance
+        incidence_vector = vector[cells]
+        vector_norm = torch.linalg.vector_norm(incidence_vector, dim=-1)
+        vector_projection = (incidence_vector * direction[:, :, None, :]).sum(-1)
+        repeated_cell = cell[:, None, :].expand(-1, vertices_per_cell, -1)
+        features = torch.cat(
+            [
+                node[cells],
+                repeated_cell,
+                distance,
+                vector_norm,
+                vector_projection,
+            ],
+            dim=-1,
+        )
+        return features, direction
 
     def forward(
-        self, node: torch.Tensor, cell: torch.Tensor, cells: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        node_at_cell = node[cells].mean(dim=1)
-        cell = self.cell_norm(cell + self.cell_update(torch.cat([cell, node_at_cell], 1)))
-        messages = cell[:, None, :].expand(-1, 4, -1)
-        node_message = node.new_zeros((node.shape[0], cell.shape[1]))
-        node_message.index_add_(0, cells.reshape(-1), messages.reshape(-1, cell.shape[1]))
-        degree = torch.bincount(cells.reshape(-1), minlength=node.shape[0]).to(node.dtype)
-        node_message = node_message / degree.clamp_min(1.0)[:, None]
-        node = self.node_norm(node + self.node_update(torch.cat([node, node_message], 1)))
-        return node, cell
+        self,
+        node: torch.Tensor,
+        vector: torch.Tensor,
+        cell: torch.Tensor,
+        cells: torch.Tensor,
+        position: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if cells.ndim != 2 or cells.shape[1] != 4:
+            raise ValueError(
+                "CellNodeBlock expects tetrahedra [M,4], got "
+                f"{tuple(cells.shape)}"
+            )
+        features, direction = self._incidence_invariants(
+            node, vector, cell, cells, position
+        )
+        cell_delta = self.node_to_cell(features).mean(dim=1)
+        cell = self.cell_norm(cell + cell_delta)
+
+        features, direction = self._incidence_invariants(
+            node, vector, cell, cells, position
+        )
+        raw = self.cell_to_node(features)
+        scalar_message = raw[..., : self.node_dim].to(node.dtype)
+        direction_weight = raw[..., self.node_dim :].to(vector.dtype)
+        vector_message = direction_weight[..., None] * direction[:, :, None, :]
+
+        flat_nodes = cells.reshape(-1)
+        scalar_aggregate = node.new_zeros(node.shape)
+        vector_aggregate = vector.new_zeros(vector.shape)
+        scalar_aggregate.index_add_(
+            0, flat_nodes, scalar_message.reshape(-1, self.node_dim)
+        )
+        vector_aggregate.index_add_(
+            0,
+            flat_nodes,
+            vector_message.reshape(-1, self.vector_dim, 3).to(vector.dtype),
+        )
+        degree = torch.bincount(flat_nodes, minlength=node.shape[0]).to(node.dtype)
+        degree = degree.clamp_min(1.0)
+        scalar_aggregate = scalar_aggregate / degree[:, None]
+        vector_aggregate = vector_aggregate / degree[:, None, None]
+        node = self.node_norm(node + scalar_aggregate)
+        vector = vector + self.vector_gate(node)[:, :, None] * vector_aggregate
+        return node, vector, cell
 
 
 class PairForceHeads(nn.Module):
@@ -320,7 +405,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 5
+    dynamics_schema_version = 6
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -406,7 +491,10 @@ class CHPGNS(nn.Module):
             nn.LayerNorm(self.cell_dim),
         )
         self.cell_blocks = nn.ModuleList(
-            [CellNodeBlock(self.scalar_dim, self.cell_dim) for _ in range(4)]
+            [
+                CellNodeBlock(self.scalar_dim, self.vector_dim, self.cell_dim)
+                for _ in range(4)
+            ]
         )
         self.force_heads = PairForceHeads(
             self.scalar_dim,
@@ -604,8 +692,6 @@ class CHPGNS(nn.Module):
             dim=1,
         )
         vector = self.vector_encoder(vector_input)
-        scalar, vector = self.processor(scalar, vector, position, static.hierarchy)
-
         deformation = deformation_gradient(position, static.cells, static.dm_inv)
         strain = invariants(deformation)
         invariant_features = torch.stack(
@@ -626,8 +712,17 @@ class CHPGNS(nn.Module):
                 f"Expected {self.material_dim} material features, got {material.shape[1]}"
             )
         cell = self.cell_encoder(torch.cat([cell_node, invariant_features, material], 1))
-        for block in self.cell_blocks:
-            scalar, cell = block(scalar, cell, static.cells)
+        # Encode local constitutive incidence before the topology hierarchy so
+        # coarse propagation can transmit cell state over long graph distances.
+        for block in self.cell_blocks[:2]:
+            scalar, vector, cell = block(
+                scalar, vector, cell, static.cells, position
+            )
+        scalar, vector = self.processor(scalar, vector, position, static.hierarchy)
+        for block in self.cell_blocks[2:]:
+            scalar, vector, cell = block(
+                scalar, vector, cell, static.cells, position
+            )
 
         initial_fields = self.constitutive_fields(
             static, position, deformation=deformation

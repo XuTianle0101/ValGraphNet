@@ -5,6 +5,7 @@ import torch
 from valgraphnet.chp_model import (
     CHPGNS,
     CHPState,
+    CellNodeBlock,
     PairForceHeads,
     backtrack_tetrahedral_update,
     build_chp_static,
@@ -100,6 +101,40 @@ def test_material_features_modulate_every_positive_potential_basis():
     assert all(torch.all(value > 0.0) for value in multipliers.values())
     for value in multipliers.values():
         torch.testing.assert_close(value, torch.ones_like(value), atol=2.0e-6, rtol=0.0)
+
+
+def test_cell_node_incidence_block_is_rotation_equivariant():
+    torch.manual_seed(7)
+    block = CellNodeBlock(node_dim=8, vector_dim=3, cell_dim=5).eval()
+    node = torch.randn(4, 8)
+    vector = torch.randn(4, 3, 3)
+    cell = torch.randn(1, 5)
+    cells = torch.tensor([[0, 1, 2, 3]])
+    position = torch.from_numpy(_case().nodes.copy())
+    angle = torch.tensor(0.63)
+    cosine, sine = torch.cos(angle), torch.sin(angle)
+    rotation = torch.stack(
+        [
+            torch.stack([cosine, -sine, torch.tensor(0.0)]),
+            torch.stack([sine, cosine, torch.tensor(0.0)]),
+            torch.tensor([0.0, 0.0, 1.0]),
+        ]
+    )
+
+    scalar_a, vector_a, cell_a = block(node, vector, cell, cells, position)
+    scalar_b, vector_b, cell_b = block(
+        node,
+        vector @ rotation.T,
+        cell,
+        cells,
+        position @ rotation.T + torch.tensor([2.0, -1.0, 0.5]),
+    )
+
+    torch.testing.assert_close(scalar_a, scalar_b, atol=2.0e-5, rtol=2.0e-5)
+    torch.testing.assert_close(cell_a, cell_b, atol=2.0e-5, rtol=2.0e-5)
+    torch.testing.assert_close(
+        vector_a @ rotation.T, vector_b, atol=2.0e-5, rtol=2.0e-5
+    )
 
 
 def test_residual_acceleration_preserves_force_contract():
