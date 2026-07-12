@@ -26,11 +26,11 @@ model:
   potential_j_init: [1.0, 0.1]
   potential_log_j_init: 1.0
   potential_minimum_coefficient: 1.0e-12
-  # Stage-one falsification pilot: establish the analytic base potential with
-  # robust alternating scale calibration before enabling any ridge capacity.
-  # The former 32-term ridge let one near-singular train frame own 99.96% of
-  # calibration leverage, so it cannot be used as the controlled baseline.
-  potential_ridge_terms: 0
+  # Stage one established the analytic base at val rRMSE=0.52047. Stage two
+  # adds only eight curvature-normalized terms. The former raw 32-term ridge
+  # let one near-singular train frame own 99.96% of calibration leverage and
+  # is retained only as a failed experiment, never as this controlled model.
+  potential_ridge_terms: 8
   # When the stage-two ridge is enabled, coefficients represent curvature
   # rather than raw energy and have a term-count-invariant total budget.
   potential_ridge_init: 1.0
@@ -160,7 +160,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/deforming_plate_chp_base_mask_aligned_full400_seed42
+  output_dir: outputs/deforming_plate_chp_ridge8_mask_aligned_full400_seed42
   resume_from: auto
 
 validation:

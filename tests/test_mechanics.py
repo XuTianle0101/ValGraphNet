@@ -243,6 +243,7 @@ def test_separable_ridge_has_term_invariant_curvature_budget():
 
     assert int(iso.sum()) == 4
     assert int(vol.sum()) == 4
+    assert torch.all(directions[iso, :2].abs() > 1.0e-4)
     torch.testing.assert_close(
         directions[vol, :2], torch.zeros_like(directions[vol, :2])
     )

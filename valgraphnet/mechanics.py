@@ -546,7 +546,10 @@ class AnalyticPotential(nn.Module):
             iso_terms = max(self.ridge_terms // 2, 1)
             vol_terms = self.ridge_terms - iso_terms
             iso_index = torch.arange(iso_terms, dtype=torch.float32)
-            iso_angle = 2.0 * math.pi * iso_index / float(iso_terms)
+            # Half-step angular offset avoids axis-only directions when four
+            # isochoric terms are used. The base polynomial already supplies
+            # pure I1/I2 responses; these ridges target their missing coupling.
+            iso_angle = 2.0 * math.pi * (iso_index + 0.5) / float(iso_terms)
             iso_directions = torch.stack(
                 [
                     torch.cos(iso_angle),
