@@ -1383,8 +1383,15 @@ def train_constitutive_epoch(
             ):
                 skipped_frames += 1
                 continue
-            nodal_prediction, cell_prediction = model.nodal_stress_at(
+            # Evaluate the shared potential once: stress supervision and the
+            # fixed-support equilibrium term must use the exact same
+            # constitutive state (and autograd graph).
+            exact_fields = model.constitutive_fields(
                 trajectory.static, exact_position
+            )
+            cell_prediction = exact_fields.cauchy_stress
+            nodal_prediction = _nodal_stress_from_cell_tensor(
+                cell_prediction, trajectory.static
             )
             mask = ~trajectory.static.prescribed_mask
             if not bool(mask.any().item()):

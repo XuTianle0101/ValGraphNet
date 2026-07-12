@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+import valgraphnet.chp_train as chp_train_module
 from valgraphnet.chp_model import CHPGNS, CHPState
 from valgraphnet.chp_train import (
     ROLLOUT_METRIC_KEYS,
@@ -22,6 +23,7 @@ from valgraphnet.chp_train import (
     load_native_reference,
     select_rollout_start,
     stress_frame_scores,
+    train_constitutive_epoch,
     validate_chp_checkpoint_semantics,
     validate_chp_problem_semantics,
 )
@@ -129,6 +131,112 @@ def test_fixed_reaction_equilibrium_loss_uses_action_reaction_sign():
     )
     assert wrong_sign_loss > 0.0
     torch.testing.assert_close(wrong_sign_relative, torch.tensor(2.0))
+
+
+def test_constitutive_pretraining_reaction_path_reuses_fields_and_backpropagates(
+    monkeypatch,
+):
+    class ConstitutiveOnlyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.log_stress_scale = torch.nn.Parameter(torch.tensor(np.log(2.0)))
+            self.potential = torch.nn.Module()
+            self.material_potential = None
+            self.constitutive_calls = 0
+
+        def constitutive_fields(self, static, position):
+            del position
+            self.constitutive_calls += 1
+            scale = self.log_stress_scale.exp()
+            base_force = torch.zeros(
+                static.num_nodes, 3, dtype=scale.dtype, device=scale.device
+            )
+            base_force[0, 0] = 1.0
+            cell_stress = scale * torch.zeros(
+                1, 3, 3, dtype=scale.dtype, device=scale.device
+            )
+            return SimpleNamespace(
+                cauchy_stress=cell_stress,
+                internal_force=scale * base_force,
+            )
+
+        def nodal_stress_at(self, *args, **kwargs):
+            raise AssertionError("constitutive potential must not be evaluated twice")
+
+    static = SimpleNamespace(
+        reference_position=torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        ),
+        cells=torch.tensor([[0, 1, 2, 3]]),
+        volume=torch.ones(1),
+        num_nodes=4,
+        prescribed_mask=torch.zeros(4, dtype=torch.bool),
+        fixed_mask=torch.tensor([True, False, False, False]),
+    )
+    solver_force = torch.zeros(2, 4, 3)
+    solver_force[1, 0, 0] = -1.0
+    trajectory = SimpleNamespace(
+        static=static,
+        displacement=torch.zeros(2, 4, 3),
+        has_solver_nodal_force=True,
+        solver_nodal_force=solver_force,
+    )
+    case = SimpleNamespace(num_steps=2)
+    cache = SimpleNamespace(get=lambda index: trajectory)
+    model = ConstitutiveOnlyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    monkeypatch.setattr(
+        chp_train_module,
+        "is_admissible_training_state",
+        lambda static, position, cfg: True,
+    )
+
+    def zero_stress_loss(
+        nodal_prediction,
+        cell_prediction,
+        trajectory,
+        frame,
+        normalizers,
+        cfg,
+        *,
+        nodal_mask,
+    ):
+        del nodal_prediction, trajectory, frame, normalizers, cfg, nodal_mask
+        zero = cell_prediction.sum() * 0.0
+        return zero, {"stress": zero.detach()}
+
+    monkeypatch.setattr(
+        chp_train_module, "_supervised_constitutive_loss", zero_stress_loss
+    )
+    initial_log_scale = model.log_stress_scale.detach().clone()
+    metrics = train_constitutive_epoch(
+        model,
+        [case],
+        cache,
+        SimpleNamespace(),
+        optimizer,
+        {
+            "seed": 42,
+            "loss": {"reaction_equilibrium": 1.0, "huber_delta": 1.0},
+            "constitutive_pretraining": {
+                "cases_per_epoch": 1,
+                "frames_per_case": 1,
+                "grad_clip_norm": 10.0,
+            },
+        },
+        epoch=1,
+    )
+
+    assert model.constitutive_calls == 1
+    assert model.log_stress_scale < initial_log_scale
+    assert metrics["reaction_equilibrium"] > 0.0
+    assert metrics["reaction_equilibrium_relative_rmse"] == pytest.approx(1.0)
 
 
 def test_quasistatic_protocol_rejects_transient_losses_and_pretraining():
