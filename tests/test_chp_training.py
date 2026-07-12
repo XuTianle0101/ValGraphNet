@@ -22,6 +22,7 @@ from valgraphnet.chp_train import (
     select_rollout_start,
     stress_frame_scores,
     validate_chp_checkpoint_semantics,
+    validate_chp_problem_semantics,
 )
 from valgraphnet.physical_evaluation import (
     CELL_TENSOR_STRESS_SOURCE,
@@ -127,6 +128,30 @@ def test_fixed_reaction_equilibrium_loss_uses_action_reaction_sign():
     )
     assert wrong_sign_loss > 0.0
     torch.testing.assert_close(wrong_sign_relative, torch.tensor(2.0))
+
+
+def test_quasistatic_protocol_rejects_transient_losses_and_pretraining():
+    cfg = {
+        "data": {"time_semantics": "quasi_static_normalized_load_path"},
+        "training": {"problem_type": "quasi_static_continuation"},
+        "dynamics_pretraining": {"enabled": False},
+        "loss": {
+            "velocity": 0.0,
+            "work_energy": 0.0,
+            "reaction_equilibrium": 0.25,
+        },
+    }
+    assert validate_chp_problem_semantics(cfg) == "quasi_static_continuation"
+
+    transient_loss = json.loads(json.dumps(cfg))
+    transient_loss["loss"]["work_energy"] = 0.1
+    with pytest.raises(ValueError, match="kinetic energy"):
+        validate_chp_problem_semantics(transient_loss)
+
+    transient_pretrain = json.loads(json.dumps(cfg))
+    transient_pretrain["dynamics_pretraining"]["enabled"] = True
+    with pytest.raises(ValueError, match="dynamics pretraining"):
+        validate_chp_problem_semantics(transient_pretrain)
 
 
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():

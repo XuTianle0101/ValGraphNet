@@ -98,11 +98,13 @@ contact:
 
 loss:
   position: 1.0
-  velocity: 1.0
+  # V/A are derivatives of a normalized load path, not physical transient
+  # observables. State continuation is supervised by position/stress/force.
+  velocity: 0.0
   stress: 1.0
   stress_physical_weight: 0.25
   exact_constitutive: 0.5
-  work_energy: 0.1
+  work_energy: 0.0
   penetration: 1.0
   residual: 0.01
   negative_j: 10.0
@@ -132,6 +134,7 @@ dynamics_pretraining:
   enabled: false
 
 training:
+  problem_type: quasi_static_continuation
   device: cuda
   amp: true
   amp_dtype: bfloat16

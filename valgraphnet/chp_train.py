@@ -2147,6 +2147,7 @@ def run_dynamics_pretraining(
 def run_chp_training(cfg: dict[str, Any]) -> Path:
     """Train CHP-GNS using BF16 neural blocks and FP32 mechanics on CUDA."""
 
+    validate_chp_problem_semantics(cfg)
     seed = int(cfg.get("seed", 42))
     _set_seed(seed)
     device = _require_cuda(cfg)
@@ -3357,6 +3358,40 @@ def _build_chp_datasets(
     return ValveGraphDataset(root, cfg), None
 
 
+def validate_chp_problem_semantics(cfg: dict[str, Any]) -> str:
+    """Separate transient dynamics from quasi-static continuation claims."""
+
+    problem_type = str(get_cfg(cfg, "training.problem_type", "dynamic")).lower()
+    if problem_type not in {"dynamic", "quasi_static_continuation"}:
+        raise ValueError(
+            "training.problem_type must be 'dynamic' or "
+            "'quasi_static_continuation'"
+        )
+    if problem_type == "quasi_static_continuation":
+        time_semantics = str(get_cfg(cfg, "data.time_semantics", "")).lower()
+        if "quasi_static" not in time_semantics:
+            raise ValueError(
+                "quasi-static continuation requires explicit data.time_semantics"
+            )
+        if bool(get_cfg(cfg, "dynamics_pretraining.enabled", False)):
+            raise ValueError(
+                "quasi-static load paths cannot use transient dynamics pretraining"
+            )
+        if float(get_cfg(cfg, "loss.velocity", 0.0)) != 0.0:
+            raise ValueError("quasi-static load paths must set loss.velocity=0")
+        if float(get_cfg(cfg, "loss.work_energy", 0.0)) != 0.0:
+            raise ValueError(
+                "quasi-static load paths must set loss.work_energy=0; "
+                "pseudo-time kinetic energy is not physical evidence"
+            )
+        if float(get_cfg(cfg, "loss.reaction_equilibrium", 0.0)) <= 0.0:
+            raise ValueError(
+                "quasi-static continuation requires positive fixed-reaction "
+                "equilibrium supervision"
+            )
+    return problem_type
+
+
 def _checkpoint_payload(
     model: CHPGNS,
     optimizer: torch.optim.Optimizer,
@@ -3378,6 +3413,8 @@ def _checkpoint_payload(
         "residual_parameterization": CHPGNS.residual_parameterization,
         "residual_gate": CHPGNS.residual_gate,
         "architecture": "CHP-GNS",
+        "problem_type": str(get_cfg(cfg, "training.problem_type", "dynamic")),
+        "time_semantics": str(get_cfg(cfg, "data.time_semantics", "dynamic")),
         "scientific_gate_status": str(scientific_gate_status),
         "epoch": int(epoch),
         "score": float(score),
