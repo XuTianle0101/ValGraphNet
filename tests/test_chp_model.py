@@ -146,14 +146,22 @@ def test_neural_feature_experiment_config_is_isolated_and_scale_aware():
         0.2913425,
         0.0121148,
     ]
+    assert model_cfg["potential_feature_input_transform"] == "asinh"
     assert cfg["training"]["device"] == "cuda"
     assert cfg["training"]["amp_dtype"] == "bfloat16"
     assert model_cfg["integration_minimum_j"] == 0.01
     assert model_cfg["integration_maximum_i1_bar"] == 1.0e4
     assert model_cfg["integration_maximum_i2_bar"] == 1.0e5
     assert cfg["training"]["maximum_start_i1_bar"] == 1.0e4
+    assert cfg["loss"]["stress_gate_mse_weight"] == 1.0
+    assert cfg["loss"]["rollout_stress_gate_mse_weight"] == 0.0
+    assert cfg["dynamics_pretraining"]["stress_gate_mse_weight"] == 0.0
+    assert (
+        cfg["validation"]["teacher_stress_minimum_admissible_coverage"]
+        == 0.99
+    )
     assert cfg["training"]["output_dir"].endswith(
-        "deforming_plate_chp_neural_feature_energy_full400_seed42"
+        "deforming_plate_chp_neural_feature_energy_full400_stable_seed42"
     )
 
 

@@ -648,6 +648,12 @@ class CHPGNS(nn.Module):
             feature_input_scales=model_cfg.get(
                 "potential_feature_input_scales", [1.0, 1.0, 1.0]
             ),
+            feature_input_transform=str(
+                model_cfg.get(
+                    "potential_feature_input_transform",
+                    model_cfg.get("feature_input_transform", "identity"),
+                )
+            ),
             feature_coefficient_init=float(
                 model_cfg.get("potential_feature_coefficient_init", 1.0e-3)
             ),

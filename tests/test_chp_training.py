@@ -1,4 +1,5 @@
 import json
+import random
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,10 +11,12 @@ from valgraphnet.chp_model import CHPGNS, CHPState
 from valgraphnet.chp_train import (
     ROLLOUT_METRIC_KEYS,
     _assert_no_gate_failure_artifact,
+    _capture_rng_state,
     _enforce_scientific_gates,
     _scientific_gate_status,
     _save_constitutive_gate_artifact,
     _exact_constitutive_loss,
+    _restore_rng_state,
     acceleration_frame_scores,
     curriculum_horizon,
     fit_chp_normalizers,
@@ -234,6 +237,79 @@ def test_constitutive_loss_adds_non_saturating_gate_residual():
 
     torch.testing.assert_close(metrics["stress_gate_mse"], torch.tensor(2.0))
     torch.testing.assert_close(aligned - base, torch.tensor(2.0))
+
+
+def test_phase_gate_override_preserves_raw_audit_but_changes_gradient():
+    transform = AsinhStressTransform(
+        reference_scale=torch.tensor([2.0]),
+        mean=torch.tensor([0.0]),
+        std=torch.tensor([1.0]),
+    )
+    normalizers = SimpleNamespace(stress=transform)
+    cfg = {
+        "loss": {
+            "stress_physical_weight": 0.0,
+            "stress_gate_mse_weight": 1.0,
+            "peak_weight": 0.0,
+        }
+    }
+    prediction = torch.tensor([[8.0], [0.0]], requires_grad=True)
+    target = torch.zeros_like(prediction)
+    rollout_loss, rollout_metrics = _exact_constitutive_loss(
+        prediction,
+        target,
+        normalizers,
+        cfg,
+        gate_mse_weight=0.0,
+    )
+    rollout_gradient = torch.autograd.grad(
+        rollout_loss, prediction, retain_graph=True
+    )[0]
+    exact_loss, exact_metrics = _exact_constitutive_loss(
+        prediction,
+        target,
+        normalizers,
+        cfg,
+        gate_mse_weight=1.0,
+    )
+    exact_gradient = torch.autograd.grad(exact_loss, prediction)[0]
+
+    torch.testing.assert_close(
+        rollout_metrics["stress_gate_mse"], exact_metrics["stress_gate_mse"]
+    )
+    torch.testing.assert_close(
+        exact_loss - rollout_loss, exact_metrics["stress_gate_mse"]
+    )
+    assert torch.linalg.vector_norm(exact_gradient) > torch.linalg.vector_norm(
+        rollout_gradient
+    )
+
+
+def test_cpu_rng_snapshot_round_trip_without_initializing_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    random.seed(901)
+    np.random.seed(902)
+    torch.manual_seed(903)
+    snapshot = _capture_rng_state()
+    assert snapshot["torch_cuda"] is None
+    expected = (
+        random.random(),
+        np.random.random(4),
+        torch.rand(4),
+    )
+    random.seed(1)
+    np.random.seed(2)
+    torch.manual_seed(3)
+    _restore_rng_state(snapshot)
+    actual = (
+        random.random(),
+        np.random.random(4),
+        torch.rand(4),
+    )
+
+    assert actual[0] == expected[0]
+    np.testing.assert_array_equal(actual[1], expected[1])
+    torch.testing.assert_close(actual[2], expected[2], atol=0.0, rtol=0.0)
 
 
 def test_closed_form_modulus_is_refit_after_each_shape_epoch(
@@ -481,6 +557,38 @@ def test_failed_constitutive_gate_state_is_auditable_but_not_rollout_loadable(
     assert "no rollout claim" in artifact["scientific_scope"]
     with pytest.raises(ValueError, match="legacy checkpoint"):
         validate_chp_checkpoint_semantics(artifact, source=path)
+
+
+def test_teacher_gate_rejects_insufficient_admissible_coverage(tmp_path):
+    stages = [{"horizon": 1, "epochs": 4}, {"horizon": 2, "epochs": 1}]
+    cfg = {
+        "validation": {
+            "enforce_teacher_stress_gate": True,
+            "teacher_stress_threshold": 0.5,
+            "teacher_stress_minimum_admissible_coverage": 0.99,
+        }
+    }
+    with pytest.raises(RuntimeError, match="admissible_coverage"):
+        _enforce_scientific_gates(
+            4,
+            stages,
+            {
+                "teacher_stress_relative_rmse": 0.2,
+                "teacher_stress_source": NODAL_STRESS_FALLBACK_SOURCE,
+                "teacher_stress_label_coverage": 1.0,
+                "teacher_stress_admissible_coverage": 0.98,
+            },
+            {},
+            cfg,
+            tmp_path,
+        )
+    failure = json.loads(
+        (tmp_path / "teacher_stress_gate_failure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failure["teacher_stress_admissible_coverage"] == 0.98
+    assert failure["minimum_admissible_coverage"] == 0.99
 
 
 def test_rollout_start_sampler_has_requested_mixture_and_stress_tail():

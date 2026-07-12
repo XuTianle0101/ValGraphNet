@@ -280,6 +280,60 @@ def test_neural_feature_potential_is_reference_zero_nonnegative_and_psd():
     )
 
 
+def test_asinh_neural_feature_derivative_matches_finite_difference():
+    torch.manual_seed(24)
+    potential = AnalyticPotential(
+        feature_hidden_dim=9,
+        feature_output_dim=6,
+        feature_input_transform="asinh",
+        feature_coefficient_init=0.02,
+    ).double()
+    normalized = torch.tensor(
+        [[1.0e3, -8.0e2, 2.5e2], [0.4, -0.2, 0.1]],
+        dtype=torch.float64,
+    )
+    _, analytic = potential.neural_feature_energy_and_derivative(normalized)
+    finite_difference = torch.empty_like(analytic)
+    epsilon = 1.0e-4
+    for component in range(3):
+        perturbation = torch.zeros_like(normalized)
+        perturbation[:, component] = epsilon
+        plus, _ = potential.neural_feature_energy_and_derivative(
+            normalized + perturbation
+        )
+        minus, _ = potential.neural_feature_energy_and_derivative(
+            normalized - perturbation
+        )
+        finite_difference[:, component] = (plus - minus) / (2.0 * epsilon)
+
+    torch.testing.assert_close(
+        analytic, finite_difference, atol=2.0e-8, rtol=2.0e-5
+    )
+
+
+def test_asinh_neural_feature_extreme_input_has_finite_backward():
+    torch.manual_seed(25)
+    potential = AnalyticPotential(
+        feature_hidden_dim=12,
+        feature_output_dim=8,
+        feature_input_transform="asinh",
+        feature_coefficient_init=0.02,
+    )
+    normalized = torch.tensor(
+        [[1.0e8, -1.0e8, 5.0e7], [-1.0e12, 1.0e10, -1.0e9]],
+        requires_grad=True,
+    )
+    energy, derivative = potential.neural_feature_energy_and_derivative(normalized)
+    (energy.mean() + derivative.square().mean()).backward()
+
+    assert torch.isfinite(energy).all()
+    assert torch.isfinite(derivative).all()
+    assert torch.isfinite(normalized.grad).all()
+    for parameter in potential.parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+
+
 def test_neural_feature_parameters_receive_finite_gradients():
     torch.manual_seed(29)
     potential = AnalyticPotential(

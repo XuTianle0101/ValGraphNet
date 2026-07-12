@@ -148,7 +148,8 @@ def stable_clip_grad_norm_(
             if not finite
         ]
         raise FloatingPointError(
-            f"non-finite gradient values in parameter indices {failed}"
+            "individual non-finite gradient values in parameter indices "
+            f"{failed}"
         )
     largest = torch.stack(
         [gradient.detach().abs().max() for gradient in gradients]
@@ -161,6 +162,11 @@ def stable_clip_grad_norm_(
         ]
     ).double()
     total_norm = largest.double() * torch.linalg.vector_norm(scaled_norms)
+    if not bool(torch.isfinite(total_norm).item()):
+        raise FloatingPointError(
+            "gradient norm reduction is non-finite although every individual "
+            "gradient value is finite"
+        )
     denominator = total_norm.clamp_min(torch.finfo(torch.float64).tiny)
     coefficient = torch.clamp(
         total_norm.new_tensor(limit) / denominator,
@@ -803,6 +809,9 @@ def chp_step_loss(
         normalizers,
         cfg,
         nodal_mask=stress_mask,
+        gate_mse_weight=float(
+            get_cfg(cfg, "loss.rollout_stress_gate_mse_weight", 0.0)
+        ),
     )
 
     diagnostics = output.energy_diagnostics
@@ -849,6 +858,7 @@ def chp_step_loss(
         "stress_base": stress_parts["stress_base"],
         "stress_peak": stress_parts["stress_peak"],
         "stress_physical": stress_parts["stress_physical"],
+        "stress_gate_mse": stress_parts["stress_gate_mse"],
         "stress_tensor_supervision": stress_parts["stress_tensor_supervision"],
         "stress_tensor_relative_rmse": stress_parts.get(
             "stress_tensor_relative_rmse", stress_loss.new_zeros(())
@@ -1333,6 +1343,8 @@ def _exact_constitutive_loss(
     target: torch.Tensor,
     normalizers: CHPNormalizers,
     cfg: dict[str, Any],
+    *,
+    gate_mse_weight: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     transformed_prediction = normalizers.stress.transform(prediction)
     transformed_target = normalizers.stress.transform(target)
@@ -1358,11 +1370,14 @@ def _exact_constitutive_loss(
     # targets its numerator under the training sampler.  Keep asinh+Huber for
     # the heavy-tailed bulk and add this term instead of replacing it.
     gate_mse = normalized_residual.square().mean()
+    effective_gate_weight = (
+        float(get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0))
+        if gate_mse_weight is None
+        else float(gate_mse_weight)
+    )
     total = transformed + float(
         get_cfg(cfg, "loss.stress_physical_weight", 0.25)
-    ) * physical + float(
-        get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0)
-    ) * gate_mse
+    ) * physical + effective_gate_weight * gate_mse
     return total, {
         "loss": total.detach(),
         "stress_transformed": transformed.detach(),
@@ -1413,6 +1428,8 @@ def _cell_tensor_constitutive_loss(
     target: torch.Tensor,
     normalizers: CHPNormalizers,
     cfg: dict[str, Any],
+    *,
+    gate_mse_weight: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Signed tensor loss with a derived, constitutively consistent VM auxiliary."""
 
@@ -1459,11 +1476,14 @@ def _cell_tensor_constitutive_loss(
         delta=huber_delta,
     )
     tensor_gate_mse = tensor_normalized_residual.square().mean()
+    effective_gate_weight = (
+        float(get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0))
+        if gate_mse_weight is None
+        else float(gate_mse_weight)
+    )
     tensor_loss = tensor_transformed + float(
         get_cfg(cfg, "loss.stress_physical_weight", 0.25)
-    ) * tensor_physical + float(
-        get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0)
-    ) * tensor_gate_mse
+    ) * tensor_physical + effective_gate_weight * tensor_gate_mse
 
     vm_prediction = prediction_vm[:, None]
     vm_target = target_vm[:, None]
@@ -1508,6 +1528,7 @@ def _supervised_constitutive_loss(
     cfg: dict[str, Any],
     *,
     nodal_mask: torch.Tensor,
+    gate_mse_weight: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Prefer complete cell tensors, with an explicit nodal-VM fallback."""
 
@@ -1517,12 +1538,14 @@ def _supervised_constitutive_loss(
             trajectory.cell_stress[int(frame)],
             normalizers,
             cfg,
+            gate_mse_weight=gate_mse_weight,
         )
     return _exact_constitutive_loss(
         nodal_prediction[nodal_mask, :1],
         trajectory.stress[int(frame), nodal_mask, :1],
         normalizers,
         cfg,
+        gate_mse_weight=gate_mse_weight,
     )
 
 
@@ -1691,7 +1714,7 @@ def train_constitutive_epoch(
             )
         except FloatingPointError as exc:
             raise FloatingPointError(
-                "non-finite constitutive pretraining gradient"
+                f"non-finite constitutive pretraining gradient: {exc}"
             ) from exc
         optimizer.step()
     averaged = {key: value / max(used_frames, 1) for key, value in totals.items()}
@@ -1811,6 +1834,9 @@ def run_constitutive_pretraining(
     history["selected_teacher_stress_label_coverage"] = best_validation.get(
         "teacher_stress_label_coverage", 0.0
     )
+    history["selected_teacher_stress_admissible_coverage"] = best_validation.get(
+        "teacher_stress_admissible_coverage", 0.0
+    )
     history["selected_validation"] = best_validation
     _save_json(output_dir / "constitutive_pretraining.json", history)
     return history
@@ -1884,6 +1910,9 @@ def exact_dynamics_loss(
         normalizers,
         cfg,
         nodal_mask=stress_mask,
+        gate_mse_weight=float(
+            get_cfg(cfg, "dynamics_pretraining.stress_gate_mse_weight", 0.0)
+        ),
     )
     projection_free = (
         (output.energy_diagnostics["integration_update_scale"] >= 1.0 - 1.0e-7)
@@ -1965,6 +1994,7 @@ def exact_dynamics_loss(
         "direction": direction_loss.detach(),
         "quiet": quiet_loss.detach(),
         "stress": stress_loss.detach(),
+        "stress_gate_mse": stress_metrics["stress_gate_mse"],
         "stress_tensor_supervision": stress_metrics[
             "stress_tensor_supervision"
         ],
@@ -2272,10 +2302,11 @@ def train_exact_dynamics_epoch(
                 parameters,
                 float(get_cfg(cfg, "dynamics_pretraining.grad_clip_norm", 1.0)),
             )
-        except FloatingPointError:
-            nonfinite_gradients += 1
-            optimizer.zero_grad(set_to_none=True)
-            continue
+        except FloatingPointError as exc:
+            raise FloatingPointError(
+                "non-finite dynamics-pretraining gradient for "
+                f"{case.case_id} at frame {start}: {exc}"
+            ) from exc
         optimizer.step()
         _accumulate(totals, metrics)
         used += 1
@@ -2547,6 +2578,11 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
 
     best_score = float("inf")
     start_epoch = 1
+    rng_provenance: dict[str, Any] = {
+        "lineage_exact": True,
+        "resume_rng_state": "fresh_seeded_run",
+        "resume_source": None,
+    }
     history = _load_json(output_dir / "history.json", default=[])
     resume = _resolve_resume(cfg, output_dir)
     if resume is None:
@@ -2573,10 +2609,16 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             selected_coverage = float(
                 pretraining.get("selected_teacher_stress_label_coverage", 0.0)
             )
+            selected_admissible_coverage = float(
+                pretraining.get(
+                    "selected_teacher_stress_admissible_coverage", 0.0
+                )
+            )
             print(
                 "constitutive pretraining selected teacher "
                 f"rRMSE={selected:.4g} source={selected_source} "
-                f"coverage={selected_coverage:.3f}"
+                f"label_coverage={selected_coverage:.3f} "
+                f"admissible_coverage={selected_admissible_coverage:.3f}"
             )
             teacher_threshold = float(
                 get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
@@ -2586,6 +2628,13 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                     cfg,
                     "validation.enforce_teacher_stress_gate",
                     True,
+                )
+            )
+            minimum_admissible_coverage = float(
+                get_cfg(
+                    cfg,
+                    "validation.teacher_stress_minimum_admissible_coverage",
+                    0.0,
                 )
             )
             _save_constitutive_gate_artifact(
@@ -2598,24 +2647,34 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
                 threshold=teacher_threshold,
                 enforced=enforce_teacher_gate,
             )
-            if (
-                enforce_teacher_gate
-                and selected >= teacher_threshold
+            if enforce_teacher_gate and (
+                selected >= teacher_threshold
+                or selected_admissible_coverage < minimum_admissible_coverage
             ):
                 failure = {
                     "stage": "constitutive_pretraining",
                     "teacher_stress_relative_rmse": selected,
                     "teacher_stress_source": selected_source,
                     "teacher_stress_label_coverage": selected_coverage,
+                    "teacher_stress_admissible_coverage": (
+                        selected_admissible_coverage
+                    ),
+                    "minimum_admissible_coverage": minimum_admissible_coverage,
                     "threshold": teacher_threshold,
-                    "action": "stop before dynamics and rollout training",
+                    "action": (
+                        "stop before dynamics and rollout training; revise "
+                        "constitutive admissibility or stress fit"
+                    ),
                 }
                 _save_json(
                     output_dir / "teacher_stress_gate_failure.json", failure
                 )
                 raise RuntimeError(
                     "pretrained teacher-forced stress gate failed: "
-                    f"{selected:.4g} >= {teacher_threshold:.4g}"
+                    f"rRMSE={selected:.4g} (threshold {teacher_threshold:.4g}), "
+                    "admissible_coverage="
+                    f"{selected_admissible_coverage:.4g} "
+                    f"(minimum {minimum_admissible_coverage:.4g})"
                 )
         dynamics_sampling_scores = build_acceleration_sampling_scores(
             train_dataset.cases,
@@ -2646,6 +2705,27 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
         scheduler.load_state_dict(checkpoint["scheduler"])
         if checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
+        saved_rng_state = checkpoint.get("rng_state")
+        if saved_rng_state is None:
+            rng_provenance = {
+                "lineage_exact": False,
+                "resume_rng_state": "legacy_checkpoint_missing",
+                "resume_source": str(resume),
+            }
+            print(
+                "warning: resume checkpoint has no RNG state; continuation "
+                "is valid but not bitwise reproducible"
+            )
+        else:
+            _restore_rng_state(saved_rng_state)
+            prior_provenance = checkpoint.get("rng_provenance", {})
+            rng_provenance = {
+                "lineage_exact": bool(
+                    prior_provenance.get("lineage_exact", True)
+                ),
+                "resume_rng_state": "restored",
+                "resume_source": str(resume),
+            }
         start_epoch = int(checkpoint["epoch"]) + 1
         best_score = float(checkpoint.get("best_score", checkpoint.get("score", best_score)))
         print(f"resumed {resume} at epoch {start_epoch - 1}")
@@ -2738,6 +2818,7 @@ def run_chp_training(cfg: dict[str, Any]) -> Path:
             rollout_metrics,
             material_dim,
             scientific_gate_status=gate_status,
+            rng_provenance=rng_provenance,
         )
         torch.save(payload, output_dir / "latest.pt")
         if (
@@ -2893,6 +2974,9 @@ def train_chp_epoch(
                         normalizers,
                         cfg,
                         nodal_mask=exact_mask,
+                        gate_mse_weight=float(
+                            get_cfg(cfg, "loss.stress_gate_mse_weight", 0.0)
+                        ),
                     )
                     step_loss = step_loss + float(
                         get_cfg(cfg, "loss.exact_constitutive", 0.5)
@@ -2921,6 +3005,9 @@ def train_chp_epoch(
                     metrics["exact_constitutive"] = exact_metrics["loss"]
                     metrics["exact_stress_physical"] = exact_metrics[
                         "stress_physical"
+                    ]
+                    metrics["exact_stress_gate_mse"] = exact_metrics[
+                        "stress_gate_mse"
                     ]
                     metrics["exact_stress_tensor_supervision"] = exact_metrics[
                         "stress_tensor_supervision"
@@ -2956,7 +3043,7 @@ def train_chp_epoch(
             except FloatingPointError as exc:
                 raise FloatingPointError(
                     f"non-finite CHP gradient values for {case.case_id} "
-                    f"at frame {start}"
+                    f"at frame {start}: {exc}"
                 ) from exc
         scaler.step(optimizer)
         scaler.update()
@@ -3708,6 +3795,7 @@ def _checkpoint_payload(
     material_dim: int,
     *,
     scientific_gate_status: str,
+    rng_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": CHPGNS.checkpoint_schema_version,
@@ -3729,6 +3817,15 @@ def _checkpoint_payload(
         "normalizers": normalizers.state_dict(),
         "material_dim": int(material_dim),
         "config": cfg,
+        "rng_state": _capture_rng_state(),
+        "rng_provenance": dict(
+            rng_provenance
+            or {
+                "lineage_exact": True,
+                "resume_rng_state": "fresh_seeded_run",
+                "resume_source": None,
+            }
+        ),
     }
 
 
@@ -3748,6 +3845,16 @@ def _save_constitutive_gate_artifact(
     selected = float(
         pretraining.get("selected_teacher_stress_relative_rmse", float("inf"))
     )
+    admissible_coverage = float(
+        pretraining.get("selected_teacher_stress_admissible_coverage", 0.0)
+    )
+    minimum_admissible_coverage = float(
+        get_cfg(
+            cfg,
+            "validation.teacher_stress_minimum_admissible_coverage",
+            0.0,
+        )
+    )
     payload = {
         # Deliberately distinct from the schema-v2 rollout checkpoint contract.
         "schema_version": 1,
@@ -3761,9 +3868,16 @@ def _save_constitutive_gate_artifact(
         "teacher_stress_label_coverage": float(
             pretraining.get("selected_teacher_stress_label_coverage", 0.0)
         ),
+        "teacher_stress_admissible_coverage": admissible_coverage,
+        "teacher_stress_minimum_admissible_coverage": (
+            minimum_admissible_coverage
+        ),
         "teacher_stress_threshold": float(threshold),
         "teacher_stress_gate_enforced": bool(enforced),
-        "teacher_stress_gate_passed": bool(selected < float(threshold)),
+        "teacher_stress_gate_passed": bool(
+            selected < float(threshold)
+            and admissible_coverage >= minimum_admissible_coverage
+        ),
         "scientific_scope": "teacher-forced constitutive audit only; no rollout claim",
         "material_dim": int(material_dim),
         "model": {
@@ -3887,9 +4001,22 @@ def _enforce_scientific_gates(
     teacher_threshold = float(
         get_cfg(cfg, "validation.teacher_stress_threshold", 0.50)
     )
+    teacher_admissible_coverage = float(
+        teacher_metrics.get("teacher_stress_admissible_coverage", 0.0)
+    )
+    minimum_admissible_coverage = float(
+        get_cfg(
+            cfg,
+            "validation.teacher_stress_minimum_admissible_coverage",
+            0.0,
+        )
+    )
     if (
         bool(get_cfg(cfg, "validation.enforce_teacher_stress_gate", True))
-        and teacher_relative >= teacher_threshold
+        and (
+            teacher_relative >= teacher_threshold
+            or teacher_admissible_coverage < minimum_admissible_coverage
+        )
     ):
         teacher_source = str(
             teacher_metrics.get("teacher_stress_source", "unavailable")
@@ -3901,6 +4028,8 @@ def _enforce_scientific_gates(
             "teacher_stress_label_coverage": teacher_metrics.get(
                 "teacher_stress_label_coverage", 0.0
             ),
+            "teacher_stress_admissible_coverage": teacher_admissible_coverage,
+            "minimum_admissible_coverage": minimum_admissible_coverage,
             "threshold": teacher_threshold,
             "action": (
                 "stop rollout curriculum and revise constitutive model/data"
@@ -3911,7 +4040,9 @@ def _enforce_scientific_gates(
         _save_json(output_dir / "teacher_stress_gate_failure.json", failure)
         raise RuntimeError(
             "teacher-forced stress gate failed: "
-            f"{teacher_relative:.4g} >= {teacher_threshold:.4g}"
+            f"rRMSE={teacher_relative:.4g} (threshold {teacher_threshold:.4g}), "
+            f"admissible_coverage={teacher_admissible_coverage:.4g} "
+            f"(minimum {minimum_admissible_coverage:.4g})"
         )
     if not bool(get_cfg(cfg, "validation.enforce_rollout_pilot_gate", False)):
         return
@@ -3978,6 +4109,41 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    """Capture every RNG stream used by sampling, noise, and neural modules."""
+
+    cuda_state = None
+    # Avoid initializing CUDA from CPU-only tests and tooling.  Production CHP
+    # training has already initialized CUDA before its first checkpoint.
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        cuda_state = [state.detach().cpu().clone() for state in torch.cuda.get_rng_state_all()]
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().detach().cpu().clone(),
+        "torch_cuda": cuda_state,
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    """Restore a checkpoint RNG snapshot immediately before the next epoch."""
+
+    required = {"python", "numpy", "torch_cpu", "torch_cuda"}
+    missing = sorted(required.difference(state))
+    if missing:
+        raise ValueError(f"checkpoint RNG state is incomplete: {missing}")
+    random.setstate(state["python"])
+    np.random.set_state(tuple(state["numpy"]))
+    torch.set_rng_state(torch.as_tensor(state["torch_cpu"]).detach().cpu())
+    cuda_state = state["torch_cuda"]
+    if cuda_state is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is unavailable")
+        torch.cuda.set_rng_state_all(
+            [torch.as_tensor(value).detach().cpu() for value in cuda_state]
+        )
 
 
 def _resolve_resume(cfg: dict[str, Any], output_dir: Path) -> Path | None:

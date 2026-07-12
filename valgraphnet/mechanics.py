@@ -458,6 +458,7 @@ class AnalyticPotential(nn.Module):
         feature_hidden_dim: int = 32,
         feature_output_dim: int = 0,
         feature_input_scales: Sequence[float] = (1.0, 1.0, 1.0),
+        feature_input_transform: str = "identity",
         feature_coefficient_init: float = 1.0e-3,
     ) -> None:
         super().__init__()
@@ -474,6 +475,7 @@ class AnalyticPotential(nn.Module):
         self.ridge_mode = str(ridge_mode).lower()
         self.feature_hidden_dim = int(feature_hidden_dim)
         self.feature_output_dim = int(feature_output_dim)
+        self.feature_input_transform = str(feature_input_transform).lower()
         if self.inversion_stiffness < 0.0:
             raise ValueError("inversion_stiffness must be non-negative")
         if self.minimum_coefficient < 0.0:
@@ -494,6 +496,10 @@ class AnalyticPotential(nn.Module):
             raise ValueError("feature_hidden_dim must be positive")
         if self.feature_output_dim < 0:
             raise ValueError("feature_output_dim must be non-negative")
+        if self.feature_input_transform not in {"identity", "asinh"}:
+            raise ValueError(
+                "feature_input_transform must be 'identity' or 'asinh'"
+            )
         if float(feature_coefficient_init) <= 0.0:
             raise ValueError("feature_coefficient_init must be strictly positive")
         ridge_scales = torch.as_tensor(list(ridge_input_scales), dtype=torch.float32)
@@ -641,7 +647,16 @@ class AnalyticPotential(nn.Module):
             raise ValueError("normalized invariants must have shape [...,3]")
         if self.feature_map is None:
             return z.new_zeros(z.shape[:-1]), torch.zeros_like(z)
-        feature, jacobian = self.feature_map.value_and_jacobian(z)
+        if self.feature_input_transform == "asinh":
+            feature_input = torch.asinh(z)
+            input_derivative = torch.rsqrt(1.0 + z.square())
+        else:
+            feature_input = z
+            input_derivative = torch.ones_like(z)
+        feature, jacobian = self.feature_map.value_and_jacobian(feature_input)
+        # ``jacobian`` is dh/dq.  Propagate dq/dz explicitly so the same
+        # scalar feature energy continues to generate the analytic stress.
+        jacobian = jacobian * input_derivative[..., None, :]
         # The reference is global for a material law.  Evaluate it once and
         # broadcast instead of materializing a redundant [*batch,K,3]
         # reference Jacobian for every tetrahedron/frame.

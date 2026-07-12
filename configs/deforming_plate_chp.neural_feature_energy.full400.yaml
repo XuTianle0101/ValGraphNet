@@ -32,6 +32,7 @@ model:
   # In particular, the I2 scale avoids the 16x amplification caused by
   # reusing the former local ridge scale.
   potential_feature_input_scales: [0.0291458, 0.2913425, 0.0121148]
+  potential_feature_input_transform: asinh
   potential_feature_coefficient_init: 1.0e-3
   fiber_order: 0
   inversion_stiffness: 10.0
@@ -64,6 +65,7 @@ loss:
   stress: 1.0
   stress_physical_weight: 0.25
   stress_gate_mse_weight: 1.0
+  rollout_stress_gate_mse_weight: 0.0
   exact_constitutive: 0.5
   work_energy: 0.1
   penetration: 1.0
@@ -109,6 +111,7 @@ dynamics_pretraining:
   active_node_fraction: 0.2
   active_threshold: 0.05
   stress_weight: 0.1
+  stress_gate_mse_weight: 0.0
   residual_weight: 1.0e-3
 
 training:
@@ -146,7 +149,7 @@ training:
   normalizer_cases: 128
   normalizer_frames: 8
   normalizer_nodes: 256
-  output_dir: outputs/deforming_plate_chp_neural_feature_energy_full400_seed42
+  output_dir: outputs/deforming_plate_chp_neural_feature_energy_full400_stable_seed42
   resume_from: auto
 
 validation:
@@ -156,6 +159,7 @@ validation:
   teacher_stress_cases: 20
   teacher_stress_frames: 16
   teacher_stress_threshold: 0.50
+  teacher_stress_minimum_admissible_coverage: 0.99
   enforce_teacher_stress_gate: true
   enforce_rollout_pilot_gate: true
   pilot_moving_relative_rmse_threshold: 0.80
