@@ -1,0 +1,40 @@
+# Frozen CHP potential force-identifiability diagnostic. This does not train a
+# graph, contact model, damping model, or residual force. Formal execution is
+# CUDA-only; mechanics remain FP32 and pooled scale fitting uses FP64 moments.
+schema_version: 1
+
+checkpoint:
+  path: outputs/deforming_plate_chp_neural_feature_energy_full400_seed42/constitutive_gate.pt
+
+data:
+  root: data/deforming_plate_cases_400
+  split_file: data/deforming_plate_cases_400/splits.json
+  train_split: train
+  val_split: val
+  test_split: test
+  expected_steps: 400
+
+diagnostic:
+  device: cuda
+  mechanics_precision: float32
+  target_semantics: single_global_semi_implicit_dt1
+  time_step: 1.0
+  output_dir: outputs/deforming_plate_chp_force_identifiability_seed42
+
+fit:
+  cases: 64
+  case_selection: even
+  frames: [0, 57, 114, 171, 227, 284, 341, 398]
+
+validation:
+  cases: 20
+  case_selection: even
+  frames: [0, 27, 53, 80, 106, 133, 159, 186, 212, 239, 265, 292, 318, 345, 371, 398]
+
+contact:
+  radius: 0.03
+
+admissibility:
+  minimum_j: 0.01
+  maximum_i1_bar: 1.0e4
+  maximum_i2_bar: 1.0e5
