@@ -302,3 +302,31 @@ def test_cuda_bf16_autocast_keeps_all_analytic_mechanics_fp32():
     loss.backward()
     assert nodes.grad is not None
     assert torch.isfinite(nodes.grad).all()
+
+
+def test_positive_material_multipliers_change_stress_but_not_reference_state():
+    potential = AnalyticPotential(order=2).eval()
+    identity = torch.eye(3).repeat(2, 1, 1)
+    multipliers = {
+        "i1": torch.tensor([[1.0, 1.0], [2.0, 1.0]]),
+        "i2": torch.ones(2, 2),
+        "j": torch.ones(2, 2),
+        "log_j": torch.ones(2, 1),
+    }
+    reference = potential(identity, coefficient_multipliers=multipliers)
+    torch.testing.assert_close(
+        reference.cauchy_stress,
+        torch.zeros_like(reference.cauchy_stress),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+
+    stretched = identity.clone()
+    stretched[:, 0, 0] = 1.2
+    response = potential(stretched, coefficient_multipliers=multipliers)
+    assert not torch.allclose(response.cauchy_stress[0], response.cauchy_stress[1])
+    with pytest.raises(ValueError, match="must be positive"):
+        potential(
+            stretched,
+            coefficient_multipliers={**multipliers, "i1": -multipliers["i1"]},
+        )

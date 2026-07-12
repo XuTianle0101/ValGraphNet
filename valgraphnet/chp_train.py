@@ -838,8 +838,8 @@ def _constitutive_parameters(model: CHPGNS) -> list[torch.nn.Parameter]:
         model.log_stress_scale,
         *model.potential.parameters(),
     ]
-    if model.material_scale is not None:
-        parameters.extend(model.material_scale.parameters())
+    if model.material_potential is not None:
+        parameters.extend(model.material_potential.parameters())
     return parameters
 
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -353,7 +353,10 @@ def _polynomial_energy_and_derivative(
         raise ValueError("exponent_stride must be positive")
     energy = torch.zeros_like(value)
     derivative = torch.zeros_like(value)
-    for index, coefficient in enumerate(coefficients):
+    if coefficients.ndim < 1:
+        raise ValueError("coefficients must have a final polynomial-order dimension")
+    for index in range(coefficients.shape[-1]):
+        coefficient = coefficients[..., index]
         exponent = exponent_stride * (index + 1)
         energy = energy + coefficient * value.pow(exponent)
         derivative = derivative + coefficient * exponent * value.pow(exponent - 1)
@@ -460,17 +463,23 @@ class AnalyticPotential(nn.Module):
         self,
         deformation: torch.Tensor,
         fiber_direction: torch.Tensor | None = None,
+        coefficient_multipliers: Mapping[str, torch.Tensor] | None = None,
     ) -> ConstitutiveResponse:
         """Evaluate the closed-form potential outside neural AMP."""
 
         tensor = torch.as_tensor(deformation)
         with _disable_autocast(tensor):
-            return self._forward_impl(tensor, fiber_direction=fiber_direction)
+            return self._forward_impl(
+                tensor,
+                fiber_direction=fiber_direction,
+                coefficient_multipliers=coefficient_multipliers,
+            )
 
     def _forward_impl(
         self,
         deformation: torch.Tensor,
         fiber_direction: torch.Tensor | None = None,
+        coefficient_multipliers: Mapping[str, torch.Tensor] | None = None,
     ) -> ConstitutiveResponse:
         deformation = torch.as_tensor(deformation)
         if deformation.shape[-2:] != (3, 3):
@@ -490,14 +499,24 @@ class AnalyticPotential(nn.Module):
         x1 = state.i1_bar - 3.0
         x2 = state.i2_bar - 3.0
         xj = state.j - 1.0
+        multipliers = coefficient_multipliers or {}
+        i1_coefficients = self._conditioned_coefficients(
+            self.i1_coefficients, multipliers.get("i1"), "i1", work_f
+        )
+        i2_coefficients = self._conditioned_coefficients(
+            self.i2_coefficients, multipliers.get("i2"), "i2", work_f
+        )
+        j_coefficients = self._conditioned_coefficients(
+            self.j_coefficients, multipliers.get("j"), "j", work_f
+        )
         energy_i1, derivative_i1 = _polynomial_energy_and_derivative(
-            x1, self.i1_coefficients, exponent_stride=1
+            x1, i1_coefficients, exponent_stride=1
         )
         energy_i2, derivative_i2 = _polynomial_energy_and_derivative(
-            x2, self.i2_coefficients, exponent_stride=1
+            x2, i2_coefficients, exponent_stride=1
         )
         energy_j, derivative_j = _polynomial_energy_and_derivative(
-            xj, self.j_coefficients
+            xj, j_coefficients
         )
 
         identity = torch.eye(3, dtype=work_f.dtype, device=work_f.device)
@@ -518,9 +537,21 @@ class AnalyticPotential(nn.Module):
             * d_j_safe
         )
 
-        log_energy = self.log_j_coefficient * (-torch.log(j_safe) + j_safe - 1.0)
+        log_multiplier = multipliers.get("log_j")
+        if log_multiplier is None:
+            log_coefficient = self.log_j_coefficient
+        else:
+            log_multiplier = torch.as_tensor(
+                log_multiplier, device=work_f.device, dtype=work_f.dtype
+            )
+            if log_multiplier.shape[-1:] == (1,):
+                log_multiplier = log_multiplier[..., 0]
+            if bool(torch.any(log_multiplier <= 0.0)):
+                raise ValueError("log_j coefficient multipliers must be positive")
+            log_coefficient = self.log_j_coefficient * log_multiplier
+        log_energy = log_coefficient * (-torch.log(j_safe) + j_safe - 1.0)
         log_derivative = (
-            self.log_j_coefficient
+            log_coefficient
             * (-j_safe.reciprocal() + 1.0)
             * valid_j
         )
@@ -549,7 +580,13 @@ class AnalyticPotential(nn.Module):
             deformed_fiber = (work_f @ direction[..., None]).squeeze(-1)
             i4_minus_one = deformed_fiber.square().sum(dim=-1) - 1.0
             fiber_energy, fiber_derivative = _polynomial_energy_and_derivative(
-                i4_minus_one, self.fiber_coefficients
+                i4_minus_one,
+                self._conditioned_coefficients(
+                    self.fiber_coefficients,
+                    multipliers.get("fiber"),
+                    "fiber",
+                    work_f,
+                ),
             )
             derivative_i4 = 2.0 * (
                 deformed_fiber[..., :, None] * direction[..., None, :]
@@ -579,6 +616,24 @@ class AnalyticPotential(nn.Module):
             invariants=state,
             inversion_barrier=inversion_barrier,
         )
+
+    @staticmethod
+    def _conditioned_coefficients(
+        base: torch.Tensor,
+        multiplier: torch.Tensor | None,
+        name: str,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        if multiplier is None:
+            return base
+        value = torch.as_tensor(multiplier, device=like.device, dtype=like.dtype)
+        if value.ndim < 1 or value.shape[-1] != base.shape[0]:
+            raise ValueError(
+                f"{name} coefficient multipliers must end in {base.shape[0]}"
+            )
+        if bool(torch.any(value <= 0.0)):
+            raise ValueError(f"{name} coefficient multipliers must be positive")
+        return base * value
 
 
 def assemble_internal_force(

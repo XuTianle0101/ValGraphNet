@@ -320,7 +320,7 @@ class CHPGNS(nn.Module):
     """Hierarchical potential simulator whose stress and dynamics share mechanics."""
 
     checkpoint_schema_version = 2
-    dynamics_schema_version = 4
+    dynamics_schema_version = 5
     residual_parameterization = "acceleration_reference_v1"
     residual_gate = "local_topology_v1"
 
@@ -430,11 +430,55 @@ class CHPGNS(nn.Module):
                 model_cfg.get("potential_minimum_coefficient", 1.0e-8)
             ),
         )
-        self.material_scale = (
-            nn.Sequential(nn.Linear(self.material_dim, 32), nn.SiLU(), nn.Linear(32, 1))
-            if self.material_dim
-            else None
+        self.material_coefficient_count = (
+            3 * self.potential.order + 1 + self.potential.fiber_order
         )
+        self.material_potential = None
+        if self.material_dim:
+            final = nn.Linear(32, self.material_coefficient_count)
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+            self.material_potential = nn.Sequential(
+                nn.Linear(self.material_dim, 32),
+                nn.SiLU(),
+                final,
+            )
+
+    def material_coefficient_multipliers(
+        self, material: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Return positive per-cell multipliers for every potential basis."""
+
+        if self.material_potential is None:
+            return {}
+        material = material.float()
+        if material.ndim != 2 or material.shape[1] != self.material_dim:
+            raise ValueError(
+                f"Expected material features [M,{self.material_dim}], got "
+                f"{tuple(material.shape)}"
+            )
+        signed_log = torch.sign(material) * torch.log1p(material.abs())
+        raw = self.material_potential(signed_log)
+        positive = F.softplus(raw).float() / math.log(2.0) + 1.0e-6
+        offset = 0
+
+        def take(width: int) -> torch.Tensor:
+            nonlocal offset
+            value = positive[:, offset : offset + width]
+            offset += width
+            return value
+
+        result = {
+            "i1": take(self.potential.order),
+            "i2": take(self.potential.order),
+            "j": take(self.potential.order),
+            "log_j": take(1),
+        }
+        if self.potential.fiber_order:
+            result["fiber"] = take(self.potential.fiber_order)
+        if offset != self.material_coefficient_count:
+            raise RuntimeError("material potential coefficient partition is inconsistent")
+        return result
 
     def constitutive_fields(
         self,
@@ -454,7 +498,11 @@ class CHPGNS(nn.Module):
                 f"Expected {self.material_dim} material features, got {material.shape[1]}"
             )
         fiber = static.fiber_direction if self.potential.fiber_order else None
-        response = self.potential(deformation, fiber_direction=fiber)
+        response = self.potential(
+            deformation,
+            fiber_direction=fiber,
+            coefficient_multipliers=self.material_coefficient_multipliers(material),
+        )
         physical_modulus = self.log_stress_scale.clamp(-20.0, 30.0).exp()
         potential_scale = (
             self.potential.i1_coefficients[0].clamp_min(1.0e-12)
@@ -462,17 +510,9 @@ class CHPGNS(nn.Module):
             else physical_modulus.new_ones(())
         )
         stress_scale = physical_modulus / potential_scale
-        if self.material_scale is None:
-            scale = torch.ones(
-                (static.cells.shape[0], 1),
-                device=position.device,
-                dtype=position.dtype,
-            )
-        else:
-            scale = F.softplus(self.material_scale(material)).float() + 1.0e-6
-        first_piola = response.first_piola * scale[:, :, None] * stress_scale
-        cauchy = response.cauchy_stress * scale[:, :, None] * stress_scale
-        energy_density = response.energy_density * scale[:, 0] * stress_scale
+        first_piola = response.first_piola * stress_scale
+        cauchy = response.cauchy_stress * stress_scale
+        energy_density = response.energy_density * stress_scale
         internal = assemble_internal_force(
             first_piola,
             static.cells,
